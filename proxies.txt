@@ -1,0 +1,43 @@
+# Lumier Dynamics - Upstream Proxy Pool
+# Format: host:port:username:password
+# One proxy per line
+
+# Example Bright Data proxies (replace with your actual credentials)
+# brd.superproxy.io:22225:brd-customer-hl_12345678:abcdefgh1234
+# brd.superproxy.io:22225:brd-customer-hl_87654321:xyz9876abc
+
+# Add your proxies below:
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.212:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.132.185:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.133.183:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.132.161:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-178.171.101.172:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.184:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.218:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.132.134:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.133.81:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.132.69:bap9iupp91kd
+
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.75:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.36:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.132.195:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.101:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.68:bap9iupp91kd
+
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.133.76:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.133.6:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.46:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.132.114:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.119:bap9iupp91kd
+
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.133.251:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.132.105:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.133.162:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.133.176:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-178.171.101.23:bap9iupp91kd
+
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.132.64:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.133.23:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.89:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-203.166.132.197:bap9iupp91kd
+brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-178.171.101.20:bap9iupp91kd
