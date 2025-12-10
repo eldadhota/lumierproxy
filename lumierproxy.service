@@ -1,0 +1,23 @@
+[Unit]
+Description=Lumier Dynamics Proxy Server
+Documentation=https://github.com/eldadhota/lumierproxy
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/lumierproxy
+ExecStart=/opt/lumierproxy/lumierproxy
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening (optional but recommended)
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/lumierproxy
+
+[Install]
+WantedBy=multi-user.target
