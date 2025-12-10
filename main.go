@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -122,6 +123,17 @@ type ProxyServer struct {
 	dataFile       string
 	sessions       map[string]*Session
 	sessionMu      sync.RWMutex
+	startTime      time.Time
+	logBuffer      []LogEntry
+	logMu          sync.RWMutex
+	cpuUsage       float64
+	cpuMu          sync.RWMutex
+}
+
+type LogEntry struct {
+	Timestamp time.Time `json:"timestamp"`
+	Level     string    `json:"level"`
+	Message   string    `json:"message"`
 }
 
 type ProxyInfo struct {
@@ -213,6 +225,8 @@ func main() {
 		dashPort:    8080,
 		dataFile:    "device_data.json",
 		sessions:    make(map[string]*Session),
+		startTime:   time.Now(),
+		logBuffer:   make([]LogEntry, 0, 1000),
 		persistentData: PersistentData{
 			DeviceConfigs:   make(map[string]DeviceConfig),
 			Groups:          []string{"Default", "Floor 1", "Floor 2", "Team A", "Team B"},
@@ -245,6 +259,7 @@ func main() {
 	go collectTrafficSnapshots()
 	go cleanupExpiredSessions()
 	go proxyHealthChecker()
+	go cpuMonitor()
 	go startDashboard()
 
 	serverIP := getServerIP()
@@ -574,6 +589,82 @@ func proxyHealthChecker() {
 }
 
 // ============================================================================
+// SYSTEM MONITORING
+// ============================================================================
+
+func cpuMonitor() {
+	var lastTotal, lastIdle uint64
+	for range time.NewTicker(2 * time.Second).C {
+		total, idle := getCPUTimes()
+		if lastTotal > 0 {
+			totalDelta := total - lastTotal
+			idleDelta := idle - lastIdle
+			if totalDelta > 0 {
+				usage := 100.0 * (1.0 - float64(idleDelta)/float64(totalDelta))
+				server.cpuMu.Lock()
+				server.cpuUsage = usage
+				server.cpuMu.Unlock()
+			}
+		}
+		lastTotal, lastIdle = total, idle
+	}
+}
+
+func getCPUTimes() (total, idle uint64) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0
+	}
+	lines := strings.Split(string(data), "\n")
+	if len(lines) < 1 {
+		return 0, 0
+	}
+	fields := strings.Fields(lines[0])
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, 0
+	}
+	for i := 1; i < len(fields); i++ {
+		var val uint64
+		fmt.Sscanf(fields[i], "%d", &val)
+		total += val
+		if i == 4 {
+			idle = val
+		}
+	}
+	return total, idle
+}
+
+func (s *ProxyServer) addLog(level, message string) {
+	entry := LogEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Message:   message,
+	}
+	s.logMu.Lock()
+	s.logBuffer = append(s.logBuffer, entry)
+	// Keep only last 500 entries
+	if len(s.logBuffer) > 500 {
+		s.logBuffer = s.logBuffer[len(s.logBuffer)-500:]
+	}
+	s.logMu.Unlock()
+}
+
+func (s *ProxyServer) getLogs(limit int) []LogEntry {
+	s.logMu.RLock()
+	defer s.logMu.RUnlock()
+	if limit <= 0 || limit > len(s.logBuffer) {
+		limit = len(s.logBuffer)
+	}
+	start := len(s.logBuffer) - limit
+	if start < 0 {
+		start = 0
+	}
+	result := make([]LogEntry, limit)
+	copy(result, s.logBuffer[start:])
+	return result
+}
+
+// ============================================================================
 // PROXY HANDLING
 // ============================================================================
 
@@ -623,6 +714,7 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string) *Device {
 	}
 	s.devices[clientIP] = device
 	log.Printf("📱 New device: %s -> %s\n", clientIP, extractProxyIP(upstreamProxy))
+	s.addLog("info", fmt.Sprintf("New device connected: %s -> Proxy %s", clientIP, extractProxyIP(upstreamProxy)))
 	return device
 }
 
@@ -655,6 +747,7 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device) {
 		if proxyIndex >= 0 {
 			server.recordProxyFailure(proxyIndex, err.Error())
 		}
+		server.addLog("error", fmt.Sprintf("HTTPS proxy error for %s: %s", device.IP, err.Error()))
 		http.Error(w, "Failed to connect", http.StatusBadGateway)
 		return
 	}
@@ -798,6 +891,7 @@ func startDashboard() {
 	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
 	http.HandleFunc("/analytics", server.requireAuth(handleAnalyticsPage))
 	http.HandleFunc("/settings", server.requireAuth(handleSettingsPage))
+	http.HandleFunc("/monitoring", server.requireAuth(handleMonitoringPage))
 
 	http.HandleFunc("/api/devices", server.requireAuth(handleDevicesAPI))
 	http.HandleFunc("/api/stats", server.requireAuth(handleStatsAPI))
@@ -816,6 +910,8 @@ func startDashboard() {
 	http.HandleFunc("/api/proxy-health", server.requireAuth(handleProxyHealthAPI))
 	http.HandleFunc("/api/traffic-history", server.requireAuth(handleTrafficHistoryAPI))
 	http.HandleFunc("/api/change-password", server.requireAuth(handleChangePasswordAPI))
+	http.HandleFunc("/api/system-stats", server.requireAuth(handleSystemStatsAPI))
+	http.HandleFunc("/api/logs", server.requireAuth(handleLogsAPI))
 
 	log.Printf("📊 Dashboard on port %d\n", server.dashPort)
 	http.ListenAndServe(fmt.Sprintf(":%d", server.dashPort), nil)
@@ -1402,12 +1498,82 @@ func handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(settingsPageHTML))
 }
 
+func handleMonitoringPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(monitoringPageHTML))
+}
+
+func handleSystemStatsAPI(w http.ResponseWriter, r *http.Request) {
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	server.cpuMu.RLock()
+	cpuUsage := server.cpuUsage
+	server.cpuMu.RUnlock()
+
+	server.mu.RLock()
+	var totalBytesIn, totalBytesOut, totalRequests int64
+	activeDevices := 0
+	for _, d := range server.devices {
+		totalBytesIn += d.BytesIn
+		totalBytesOut += d.BytesOut
+		totalRequests += d.RequestCount
+		if time.Since(d.LastSeen) < 5*time.Minute {
+			activeDevices++
+		}
+	}
+	totalDevices := len(server.devices)
+	server.mu.RUnlock()
+
+	uptime := time.Since(server.startTime)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"cpu_usage":        cpuUsage,
+		"memory_used":      memStats.Alloc,
+		"memory_total":     memStats.Sys,
+		"memory_heap":      memStats.HeapAlloc,
+		"goroutines":       runtime.NumGoroutine(),
+		"uptime_seconds":   int64(uptime.Seconds()),
+		"uptime_formatted": formatUptime(uptime),
+		"total_bytes_in":   totalBytesIn,
+		"total_bytes_out":  totalBytesOut,
+		"total_requests":   totalRequests,
+		"total_devices":    totalDevices,
+		"active_devices":   activeDevices,
+		"total_proxies":    len(server.proxyPool),
+	})
+}
+
+func formatUptime(d time.Duration) string {
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	mins := int(d.Minutes()) % 60
+	secs := int(d.Seconds()) % 60
+	if days > 0 {
+		return fmt.Sprintf("%dd %dh %dm %ds", days, hours, mins, secs)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm %ds", hours, mins, secs)
+	}
+	if mins > 0 {
+		return fmt.Sprintf("%dm %ds", mins, secs)
+	}
+	return fmt.Sprintf("%ds", secs)
+}
+
+func handleLogsAPI(w http.ResponseWriter, r *http.Request) {
+	logs := server.getLogs(100)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(logs)
+}
+
 const loginPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Login</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.login-container{background:rgba(255,255,255,0.95);padding:40px;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);width:100%;max-width:400px}.logo{text-align:center;margin-bottom:30px}.logo h1{color:#667eea;font-size:2em;margin-bottom:5px}.logo p{color:#666;font-size:0.9em}.form-group{margin-bottom:20px}.form-group label{display:block;font-weight:600;color:#333;margin-bottom:8px}.form-group input{width:100%;padding:14px 16px;border:2px solid #e0e0e0;border-radius:10px;font-size:1em}.form-group input:focus{outline:none;border-color:#667eea}.login-btn{width:100%;padding:14px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:10px;font-size:1.1em;font-weight:600;cursor:pointer}.login-btn:hover{opacity:0.9}.login-btn:disabled{opacity:0.5;cursor:not-allowed}.error-msg{background:#ffebee;color:#c62828;padding:12px;border-radius:8px;margin-bottom:20px;display:none}.error-msg.show{display:block}</style></head>
 <body><div class="login-container"><div class="logo"><h1>🌐 Lumier Dynamics</h1><p>Enterprise Proxy Management v3.0</p></div><div class="error-msg" id="errorMsg"></div><form onsubmit="return handleLogin(event)"><div class="form-group"><label>Username</label><input type="text" id="username" placeholder="Enter username" required autofocus></div><div class="form-group"><label>Password</label><input type="password" id="password" placeholder="Enter password" required></div><button type="submit" class="login-btn" id="loginBtn">Sign In</button></form></div>
 <script>async function handleLogin(e){e.preventDefault();const btn=document.getElementById('loginBtn'),err=document.getElementById('errorMsg');btn.disabled=true;btn.textContent='Signing in...';err.classList.remove('show');try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});if(r.ok)window.location.href='/dashboard';else{err.textContent='Invalid username or password';err.classList.add('show');btn.disabled=false;btn.textContent='Sign In';}}catch(e){err.textContent='Connection error';err.classList.add('show');btn.disabled=false;btn.textContent='Sign In';}return false;}</script></body></html>`
 
-const navHTML = `<nav style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:15px 30px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:1.5em">🌐</span><span style="color:white;font-size:1.3em;font-weight:bold">Lumier Dynamics</span></div><div style="display:flex;gap:5px;flex-wrap:wrap"><a href="/dashboard" class="nav-link" id="nav-dashboard">📱 Devices</a><a href="/health" class="nav-link" id="nav-health">💚 Health</a><a href="/analytics" class="nav-link" id="nav-analytics">📊 Analytics</a><a href="/settings" class="nav-link" id="nav-settings">⚙️ Settings</a></div><div style="display:flex;align-items:center;gap:15px;color:white"><span id="currentUser">Admin</span><button onclick="logout()" style="background:rgba(255,255,255,0.2);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500">Logout</button></div></nav>`
+const navHTML = `<nav style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:15px 30px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:1.5em">🌐</span><span style="color:white;font-size:1.3em;font-weight:bold">Lumier Dynamics</span></div><div style="display:flex;gap:5px;flex-wrap:wrap"><a href="/dashboard" class="nav-link" id="nav-dashboard">📱 Devices</a><a href="/health" class="nav-link" id="nav-health">💚 Health</a><a href="/analytics" class="nav-link" id="nav-analytics">📊 Analytics</a><a href="/monitoring" class="nav-link" id="nav-monitoring">🖥️ Monitor</a><a href="/settings" class="nav-link" id="nav-settings">⚙️ Settings</a></div><div style="display:flex;align-items:center;gap:15px;color:white"><span id="currentUser">Admin</span><button onclick="logout()" style="background:rgba(255,255,255,0.2);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500">Logout</button></div></nav>`
 
 const baseStyles = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f7fa;min-height:100vh}.nav-link{color:rgba(255,255,255,0.85);text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:500}.nav-link:hover,.nav-link.active{background:rgba(255,255,255,0.2);color:white}.container{max-width:1600px;margin:0 auto;padding:25px}.page-header{margin-bottom:25px}.page-header h1{color:#333;font-size:1.8em;margin-bottom:5px}.page-header p{color:#666}.card{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.card h2{color:#333;font-size:1.3em;margin-bottom:15px;padding-bottom:10px;border-bottom:2px solid #f0f0f0}.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:20px;margin-bottom:25px}.stat-card{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);text-align:center;cursor:pointer;transition:transform 0.2s}.stat-card:hover{transform:translateY(-3px)}.stat-value{font-size:2.2em;font-weight:bold;color:#667eea;margin-bottom:5px}.stat-label{color:#666;font-size:0.85em;text-transform:uppercase;letter-spacing:1px}.btn{padding:10px 18px;border:none;border-radius:8px;cursor:pointer;font-size:0.95em;font-weight:600;transition:all 0.2s}.btn-primary{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white}.btn-primary:hover{opacity:0.9}.btn-secondary{background:#f5f5f5;color:#333;border:2px solid #e0e0e0}.btn-secondary:hover{background:#e8e8e8}.toast{position:fixed;bottom:30px;right:30px;background:#333;color:white;padding:15px 25px;border-radius:10px;z-index:1001;animation:slideIn 0.3s ease}.toast.success{background:#4caf50}.toast.error{background:#f44336}@keyframes slideIn{from{transform:translateX(100px);opacity:0}to{transform:translateX(0);opacity:1}}.loading{text-align:center;padding:40px;color:#666}`
 
@@ -1424,3 +1590,6 @@ const analyticsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - A
 
 const settingsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Settings</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>` + baseStyles + `.settings-section{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.settings-section h2{margin-bottom:20px;padding-bottom:10px;border-bottom:2px solid #f0f0f0}.form-group{margin-bottom:20px}.form-group label{display:block;font-weight:600;color:#333;margin-bottom:8px}.form-group input{width:100%;max-width:400px;padding:12px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.form-group input:focus{outline:none;border-color:#667eea}.form-group small{display:block;color:#666;margin-top:5px;font-size:0.85em}.success-msg{background:#e8f5e9;color:#2e7d32;padding:12px;border-radius:8px;margin-bottom:20px;display:none}.success-msg.show{display:block}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>⚙️ Settings</h1><p>Configure your Lumier Dynamics system</p></div><div class="settings-section"><h2>🔐 Change Password</h2><div class="success-msg" id="pwSuccess">Password changed successfully!</div><form onsubmit="return changePassword(event)"><div class="form-group"><label>Current Password</label><input type="password" id="oldPassword" required></div><div class="form-group"><label>New Password</label><input type="password" id="newPassword" required><small>Choose a strong password with at least 8 characters</small></div><div class="form-group"><label>Confirm New Password</label><input type="password" id="confirmPassword" required></div><button type="submit" class="btn btn-primary">Change Password</button></form></div><div class="settings-section"><h2>📱 Device Groups</h2><p style="margin-bottom:15px;color:#666">Manage device groups for better organization</p><div id="groupsList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px"><input type="text" id="newGroupName" placeholder="New group name..." style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;flex:1;max-width:300px"><button class="btn btn-primary" onclick="addGroup()">Add Group</button></div></div><div class="settings-section"><h2>🌐 Proxy Management</h2><p style="margin-bottom:15px;color:#666">Add or remove upstream SOCKS5 proxies</p><div id="proxyList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px;flex-wrap:wrap"><input type="text" id="newProxyString" placeholder="host:port:username:password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;flex:1;min-width:300px;max-width:500px"><button class="btn btn-primary" onclick="addProxy()">Add Proxy</button></div><p style="margin-top:10px;color:#888;font-size:0.85em">Format: host:port:username:password (e.g., proxy.example.com:1080:user:pass)</p></div><div class="settings-section"><h2>ℹ️ System Information</h2><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px"><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Version:</strong> 3.0.0</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Server IP:</strong> <span id="sysServerIP">...</span></div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Proxy Port:</strong> 8888</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Dashboard Port:</strong> 8080</div></div></div></div><script>` + baseJS + `document.getElementById('nav-settings').classList.add('active');fetch('/api/server-ip').then(r=>r.text()).then(ip=>document.getElementById('sysServerIP').textContent=ip);function loadGroups(){fetch('/api/groups').then(r=>r.json()).then(groups=>{document.getElementById('groupsList').innerHTML=groups.map(g=>{const isDefault=g==='Default';return'<span style="display:inline-flex;align-items:center;gap:8px;background:#e3f2fd;color:#1976d2;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">'+g+(isDefault?'':' <button onclick="deleteGroup(\''+g+'\')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center" title="Delete group">&times;</button>')+'</span>';}).join('');});}loadGroups();function deleteGroup(name){if(!confirm('Delete group "'+name+'"? Devices in this group will be moved to Default.')){return;}fetch('/api/delete-group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_name:name})}).then(r=>{if(r.ok)return r.json();throw new Error('Failed to delete');}).then(d=>{if(d.ok){showToast('Group deleted','success');loadGroups();}}).catch(()=>showToast('Failed to delete group','error'));}function addGroup(){const name=document.getElementById('newGroupName').value.trim();if(!name){showToast('Please enter a group name','error');return;}fetch('/api/add-group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_name:name})}).then(r=>r.json()).then(d=>{if(d.ok){showToast(d.added?'Group added':'Group already exists',d.added?'success':'');document.getElementById('newGroupName').value='';loadGroups();}});}function changePassword(e){e.preventDefault();const oldPw=document.getElementById('oldPassword').value;const newPw=document.getElementById('newPassword').value;const confirmPw=document.getElementById('confirmPassword').value;if(newPw!==confirmPw){showToast('Passwords do not match','error');return false;}if(newPw.length<6){showToast('Password must be at least 6 characters','error');return false;}fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_password:oldPw,new_password:newPw})}).then(r=>{if(r.ok){document.getElementById('pwSuccess').classList.add('show');document.getElementById('oldPassword').value='';document.getElementById('newPassword').value='';document.getElementById('confirmPassword').value='';setTimeout(()=>document.getElementById('pwSuccess').classList.remove('show'),3000);}else{showToast('Current password is incorrect','error');}});return false;}function loadProxies(){fetch('/api/proxies').then(r=>r.json()).then(proxies=>{document.getElementById('proxyList').innerHTML=proxies.length?proxies.map((p,i)=>{let ip=p.user&&p.user.includes('ip-')?p.user.split('ip-')[1]:p.host;return'<div style="display:inline-flex;align-items:center;gap:8px;background:#fff3e0;color:#e65100;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">#'+(i+1)+' – '+ip+' <button onclick="deleteProxy('+i+')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center" title="Delete proxy">&times;</button></div>';}).join(''):'<p style="color:#666">No proxies configured. Add your first proxy below.</p>';});}loadProxies();function addProxy(){const proxy=document.getElementById('newProxyString').value.trim();if(!proxy){showToast('Please enter a proxy string','error');return;}fetch('/api/add-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_string:proxy})}).then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error(t);});return r.json();}).then(d=>{if(d.ok){showToast(d.added?'Proxy added':'Proxy already exists',d.added?'success':'');document.getElementById('newProxyString').value='';loadProxies();}}).catch(e=>showToast(e.message||'Failed to add proxy','error'));}function deleteProxy(idx){if(!confirm('Delete this proxy? Make sure no devices are using it.')){return;}fetch('/api/delete-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_index:idx})}).then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error(t);});return r.json();}).then(d=>{if(d.ok){showToast('Proxy deleted','success');loadProxies();}}).catch(e=>showToast(e.message||'Failed to delete proxy','error'));}</script></body></html>`
+
+const monitoringPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Monitoring</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>` + baseStyles + `.monitor-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;margin-bottom:25px}.monitor-card{background:white;padding:25px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);text-align:center}.monitor-value{font-size:2.5em;font-weight:bold;margin-bottom:5px}.monitor-label{color:#666;font-size:0.9em;text-transform:uppercase;letter-spacing:1px}.monitor-sublabel{color:#999;font-size:0.8em;margin-top:5px}.progress-ring{width:120px;height:120px;margin:0 auto 15px}.progress-ring circle{fill:none;stroke-width:10;transform:rotate(-90deg);transform-origin:center}.progress-ring .bg{stroke:#e0e0e0}.progress-ring .fg{stroke:#667eea;stroke-linecap:round;transition:stroke-dashoffset 0.5s}.logs-container{background:white;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);overflow:hidden}.logs-header{background:#333;color:white;padding:15px 20px;display:flex;justify-content:space-between;align-items:center}.logs-header h2{margin:0;font-size:1.1em}.logs-content{height:400px;overflow-y:auto;font-family:'Monaco','Menlo','Ubuntu Mono',monospace;font-size:0.85em;padding:0}.log-entry{padding:8px 20px;border-bottom:1px solid #f0f0f0;display:flex;gap:15px}.log-entry:nth-child(odd){background:#fafafa}.log-time{color:#888;white-space:nowrap}.log-level{font-weight:600;text-transform:uppercase;font-size:0.8em;padding:2px 8px;border-radius:4px}.log-level.info{background:#e3f2fd;color:#1976d2}.log-level.error{background:#ffebee;color:#c62828}.log-level.warn{background:#fff3e0;color:#e65100}.log-msg{color:#333;word-break:break-word;flex:1}.auto-scroll{display:flex;align-items:center;gap:8px;font-size:0.9em}.auto-scroll input{width:18px;height:18px;cursor:pointer}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>🖥️ System Monitoring</h1><p>Real-time server performance and logs</p></div><div class="monitor-grid"><div class="monitor-card"><svg class="progress-ring" id="cpuRing"><circle class="bg" cx="60" cy="60" r="50"/><circle class="fg" id="cpuCircle" cx="60" cy="60" r="50"/></svg><div class="monitor-value" id="cpuValue">-%</div><div class="monitor-label">CPU Usage</div></div><div class="monitor-card"><svg class="progress-ring" id="memRing"><circle class="bg" cx="60" cy="60" r="50"/><circle class="fg" id="memCircle" cx="60" cy="60" r="50" style="stroke:#4caf50"/></svg><div class="monitor-value" id="memValue">-</div><div class="monitor-label">Memory Used</div><div class="monitor-sublabel" id="memTotal">of -</div></div><div class="monitor-card"><div class="monitor-value" style="color:#2196F3" id="uptimeValue">-</div><div class="monitor-label">Uptime</div></div><div class="monitor-card"><div class="monitor-value" style="color:#ff9800" id="goroutines">-</div><div class="monitor-label">Goroutines</div></div><div class="monitor-card"><div class="monitor-value" style="color:#4caf50" id="netIn">-</div><div class="monitor-label">Network In</div></div><div class="monitor-card"><div class="monitor-value" style="color:#9c27b0" id="netOut">-</div><div class="monitor-label">Network Out</div></div></div><div class="logs-container"><div class="logs-header"><h2>📋 Live Logs</h2><div style="display:flex;gap:15px;align-items:center"><button class="btn btn-secondary" onclick="loadLogs()" style="padding:6px 12px;font-size:0.85em">🔄 Refresh</button><label class="auto-scroll"><input type="checkbox" id="autoScroll" checked> Auto-scroll</label></div></div><div class="logs-content" id="logsContent"><div class="loading">Loading logs...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-monitoring').classList.add('active');const circumference=2*Math.PI*50;document.querySelectorAll('.progress-ring .fg').forEach(c=>{c.style.strokeDasharray=circumference;c.style.strokeDashoffset=circumference;});function setProgress(el,pct){const offset=circumference-(pct/100)*circumference;el.style.strokeDashoffset=offset;}function loadStats(){fetch('/api/system-stats').then(r=>r.json()).then(d=>{document.getElementById('cpuValue').textContent=d.cpu_usage.toFixed(1)+'%';setProgress(document.getElementById('cpuCircle'),d.cpu_usage);const memPct=(d.memory_used/d.memory_total)*100;document.getElementById('memValue').textContent=formatBytes(d.memory_used);document.getElementById('memTotal').textContent='of '+formatBytes(d.memory_total);setProgress(document.getElementById('memCircle'),memPct);document.getElementById('uptimeValue').textContent=d.uptime_formatted;document.getElementById('goroutines').textContent=d.goroutines;document.getElementById('netIn').textContent=formatBytes(d.total_bytes_in);document.getElementById('netOut').textContent=formatBytes(d.total_bytes_out);});}function loadLogs(){fetch('/api/logs').then(r=>r.json()).then(logs=>{const container=document.getElementById('logsContent');if(!logs||!logs.length){container.innerHTML='<div style="padding:20px;color:#666;text-align:center">No logs yet. Activity will appear here.</div>';return;}container.innerHTML=logs.map(l=>{const time=new Date(l.timestamp).toLocaleTimeString();return'<div class="log-entry"><span class="log-time">'+time+'</span><span class="log-level '+l.level+'">'+l.level+'</span><span class="log-msg">'+escapeHtml(l.message)+'</span></div>';}).join('');if(document.getElementById('autoScroll').checked){container.scrollTop=container.scrollHeight;}});}function escapeHtml(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML;}loadStats();loadLogs();setInterval(loadStats,2000);setInterval(loadLogs,3000);</script></body></html>`
