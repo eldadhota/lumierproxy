@@ -528,6 +528,24 @@ func (s *ProxyServer) recordProxySuccess(proxyIndex int, responseTime time.Durat
 }
 
 func (s *ProxyServer) recordProxyFailure(proxyIndex int, errorMsg string) {
+	// Check if this is a proxy-side/destination error (not our proxy's fault)
+	if isProxySideError(errorMsg) {
+		// Still count the request but don't penalize the proxy health
+		s.healthMu.Lock()
+		defer s.healthMu.Unlock()
+		health, exists := s.proxyHealth[proxyIndex]
+		if !exists {
+			return
+		}
+		health.TotalRequests++
+		health.SuccessCount++ // Count as success since proxy worked fine
+		if health.TotalRequests > 0 {
+			health.SuccessRate = float64(health.SuccessCount) / float64(health.TotalRequests) * 100
+		}
+		health.Status = s.calculateProxyStatus(health)
+		return
+	}
+
 	s.healthMu.Lock()
 	defer s.healthMu.Unlock()
 	health, exists := s.proxyHealth[proxyIndex]
@@ -542,6 +560,30 @@ func (s *ProxyServer) recordProxyFailure(proxyIndex int, errorMsg string) {
 		health.SuccessRate = float64(health.SuccessCount) / float64(health.TotalRequests) * 100
 	}
 	health.Status = s.calculateProxyStatus(health)
+}
+
+// isProxySideError checks if an error is caused by the destination/ruleset
+// rather than the proxy itself being unhealthy
+func isProxySideError(errMsg string) bool {
+	proxySideErrors := []string{
+		"connection not allowed by ruleset",
+		"not allowed by ruleset",
+		"host unreachable",
+		"network unreachable",
+		"connection refused",
+		"ttl expired",
+		"no route to host",
+		"address not supported",
+		"connection reset by peer",
+		"broken pipe",
+	}
+	errLower := strings.ToLower(errMsg)
+	for _, e := range proxySideErrors {
+		if strings.Contains(errLower, e) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *ProxyServer) calculateProxyStatus(health *ProxyHealth) string {
@@ -741,13 +783,17 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device) {
 
 	targetConn, err := dialThroughSOCKS5(target, device.UpstreamProxy)
 	if err != nil {
-		device.ErrorCount++
-		device.LastError = err.Error()
-		device.LastErrorTime = time.Now()
+		errMsg := err.Error()
 		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, err.Error())
+			server.recordProxyFailure(proxyIndex, errMsg)
 		}
-		server.addLog("error", fmt.Sprintf("HTTPS proxy error for %s: %s", device.IP, err.Error()))
+		// Only count as device error if it's not a proxy-side issue
+		if !isProxySideError(errMsg) {
+			device.ErrorCount++
+			device.LastError = errMsg
+			device.LastErrorTime = time.Now()
+			server.addLog("error", fmt.Sprintf("HTTPS proxy error for %s: %s", device.IP, errMsg))
+		}
 		http.Error(w, "Failed to connect", http.StatusBadGateway)
 		return
 	}
@@ -802,10 +848,13 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
 
 	targetConn, err := dialThroughSOCKS5(host, device.UpstreamProxy)
 	if err != nil {
-		device.ErrorCount++
-		device.LastError = err.Error()
+		errMsg := err.Error()
 		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, err.Error())
+			server.recordProxyFailure(proxyIndex, errMsg)
+		}
+		if !isProxySideError(errMsg) {
+			device.ErrorCount++
+			device.LastError = errMsg
 		}
 		http.Error(w, "Failed to connect", http.StatusBadGateway)
 		return
@@ -814,9 +863,12 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
 
 	r.RequestURI = ""
 	if err := r.Write(targetConn); err != nil {
-		device.ErrorCount++
+		errMsg := err.Error()
 		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, err.Error())
+			server.recordProxyFailure(proxyIndex, errMsg)
+		}
+		if !isProxySideError(errMsg) {
+			device.ErrorCount++
 		}
 		http.Error(w, "Failed to send request", http.StatusBadGateway)
 		return
@@ -824,9 +876,12 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
 
 	resp, err := http.ReadResponse(bufio.NewReader(targetConn), r)
 	if err != nil {
-		device.ErrorCount++
+		errMsg := err.Error()
 		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, err.Error())
+			server.recordProxyFailure(proxyIndex, errMsg)
+		}
+		if !isProxySideError(errMsg) {
+			device.ErrorCount++
 		}
 		http.Error(w, "Failed to read response", http.StatusBadGateway)
 		return
