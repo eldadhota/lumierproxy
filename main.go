@@ -30,7 +30,7 @@ import (
 type Device struct {
 	ID            string    `json:"id"`
 	IP            string    `json:"ip"`
-	MAC           string    `json:"mac"`
+	Username      string    `json:"username"`
 	Name          string    `json:"name"`
 	CustomName    string    `json:"custom_name"`
 	Group         string    `json:"group"`
@@ -75,7 +75,7 @@ type TrafficSnapshot struct {
 }
 
 type DeviceConfig struct {
-	MAC        string `json:"mac"`
+	Username   string `json:"username"`
 	CustomName string `json:"custom_name"`
 	Group      string `json:"group"`
 	Notes      string `json:"notes"`
@@ -111,51 +111,61 @@ type SystemSettings struct {
 }
 
 // ============================================================================
-// MAC ADDRESS LOOKUP
+// USERNAME PARSING FROM PROXY AUTH
 // ============================================================================
 
-// lookupMACAddress reads the ARP table to find MAC address for a given IP
-// Returns the MAC address or empty string if not found
-func lookupMACAddress(ip string) string {
-	file, err := os.Open("/proc/net/arp")
+// parseProxyUsername extracts the username from Proxy-Authorization header
+// The header format is: Basic base64(username:password)
+func parseProxyUsername(r *http.Request) string {
+	auth := r.Header.Get("Proxy-Authorization")
+	if auth == "" {
+		return ""
+	}
+
+	// Remove "Basic " prefix
+	if !strings.HasPrefix(auth, "Basic ") {
+		return ""
+	}
+	encoded := strings.TrimPrefix(auth, "Basic ")
+
+	// Decode base64
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return ""
 	}
-	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	// Skip header line
-	if scanner.Scan() {
-		// Header: IP address, HW type, Flags, HW address, Mask, Device
-	}
-
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) >= 4 {
-			arpIP := fields[0]
-			mac := fields[3]
-			if arpIP == ip && mac != "00:00:00:00:00:00" {
-				return strings.ToUpper(mac)
-			}
-		}
+	// Split username:password and return username
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) >= 1 && parts[0] != "" {
+		return parts[0]
 	}
 	return ""
 }
 
-// findDeviceByMAC looks up a device by its MAC address
-func (s *ProxyServer) findDeviceByMAC(mac string) *Device {
+// findDeviceByUsername looks up a device by its username (primary identifier)
+func (s *ProxyServer) findDeviceByUsername(username string) *Device {
 	for _, device := range s.devices {
-		if device.MAC == mac {
+		if device.Username == username {
 			return device
 		}
 	}
 	return nil
 }
 
-// findDeviceByIP looks up a device by its current IP (fallback)
+// findDeviceByIP looks up a device by its current IP address
 func (s *ProxyServer) findDeviceByIP(ip string) *Device {
 	for _, device := range s.devices {
 		if device.IP == ip {
+			return device
+		}
+	}
+	return nil
+}
+
+// findAnonymousDeviceByIP looks up an anonymous device (no username) by IP
+func (s *ProxyServer) findAnonymousDeviceByIP(ip string) *Device {
+	for _, device := range s.devices {
+		if device.IP == ip && device.Username == "" {
 			return device
 		}
 	}
@@ -775,45 +785,39 @@ func (s *ProxyServer) getNextProxy() string {
 	return proxy
 }
 
-func (s *ProxyServer) getOrCreateDevice(clientIP string) *Device {
+func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Device {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Look up MAC address from ARP table
-	mac := lookupMACAddress(clientIP)
-
-	// First, try to find device by MAC address (primary identifier)
-	if mac != "" {
-		if device := s.findDeviceByMAC(mac); device != nil {
+	// First, try to find device by username (primary identifier)
+	if username != "" {
+		if device := s.findDeviceByUsername(username); device != nil {
 			// Update IP if it changed (device got new IP from DHCP)
 			if device.IP != clientIP {
 				oldIP := device.IP
 				device.IP = clientIP
-				log.Printf("📱 Device %s IP changed: %s -> %s\n", mac, oldIP, clientIP)
-				s.addLog("info", fmt.Sprintf("Device %s IP changed: %s -> %s", mac, oldIP, clientIP))
+				log.Printf("📱 Device '%s' IP changed: %s -> %s\n", username, oldIP, clientIP)
+				s.addLog("info", fmt.Sprintf("Device '%s' IP changed: %s -> %s", username, oldIP, clientIP))
 			}
 			device.LastSeen = time.Now()
 			return device
 		}
 	}
 
-	// Fallback: check if device exists by IP (for backwards compatibility)
-	if device := s.findDeviceByIP(clientIP); device != nil {
-		// If we now have a MAC, update the device
-		if mac != "" && device.MAC == "" {
-			device.MAC = mac
-			log.Printf("📱 Device %s MAC discovered: %s\n", clientIP, mac)
+	// Fallback: check if device exists by IP (for anonymous connections)
+	if username == "" {
+		if device := s.findAnonymousDeviceByIP(clientIP); device != nil {
+			device.LastSeen = time.Now()
+			return device
 		}
-		device.LastSeen = time.Now()
-		return device
 	}
 
-	// Check persistent data - try by MAC first, then IP for migration
+	// Check persistent data by username first, then IP for migration
 	s.persistMu.RLock()
 	var savedConfig DeviceConfig
 	var hasSavedConfig bool
-	if mac != "" {
-		savedConfig, hasSavedConfig = s.persistentData.DeviceConfigs[mac]
+	if username != "" {
+		savedConfig, hasSavedConfig = s.persistentData.DeviceConfigs[username]
 	}
 	if !hasSavedConfig {
 		// Fallback to IP-based lookup for backwards compatibility
@@ -829,19 +833,21 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string) *Device {
 		customName, group, notes = savedConfig.CustomName, savedConfig.Group, savedConfig.Notes
 	}
 
-	// Generate device ID based on MAC if available, otherwise use counter
-	var deviceID string
-	if mac != "" {
-		deviceID = fmt.Sprintf("device-%s", strings.ReplaceAll(mac, ":", "")[:6])
+	// Generate device ID based on username if available
+	var deviceID, deviceName string
+	if username != "" {
+		deviceID = fmt.Sprintf("device-%s", username)
+		deviceName = username
 	} else {
 		deviceID = fmt.Sprintf("device-%d", len(s.devices)+1)
+		deviceName = fmt.Sprintf("Anonymous-%s", clientIP)
 	}
 
 	device := &Device{
 		ID:            deviceID,
 		IP:            clientIP,
-		MAC:           mac,
-		Name:          fmt.Sprintf("Phone-%s", clientIP),
+		Username:      username,
+		Name:          deviceName,
 		CustomName:    customName,
 		Group:         group,
 		Notes:         notes,
@@ -851,22 +857,23 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string) *Device {
 		LastSeen:      time.Now(),
 	}
 
-	// Store by MAC if available, otherwise by IP
-	if mac != "" {
-		s.devices[mac] = device
-		log.Printf("📱 New device: %s (MAC: %s) -> %s\n", clientIP, mac, extractProxyIP(upstreamProxy))
-		s.addLog("info", fmt.Sprintf("New device connected: %s (MAC: %s) -> Proxy %s", clientIP, mac, extractProxyIP(upstreamProxy)))
+	// Store by username if available, otherwise by IP
+	if username != "" {
+		s.devices[username] = device
+		log.Printf("📱 New device: '%s' (%s) -> %s\n", username, clientIP, extractProxyIP(upstreamProxy))
+		s.addLog("info", fmt.Sprintf("New device connected: '%s' (%s) -> Proxy %s", username, clientIP, extractProxyIP(upstreamProxy)))
 	} else {
 		s.devices[clientIP] = device
-		log.Printf("📱 New device: %s (no MAC) -> %s\n", clientIP, extractProxyIP(upstreamProxy))
-		s.addLog("info", fmt.Sprintf("New device connected: %s -> Proxy %s", clientIP, extractProxyIP(upstreamProxy)))
+		log.Printf("📱 New anonymous device: %s -> %s\n", clientIP, extractProxyIP(upstreamProxy))
+		s.addLog("info", fmt.Sprintf("New anonymous device: %s -> Proxy %s", clientIP, extractProxyIP(upstreamProxy)))
 	}
 	return device
 }
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
 	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-	device := server.getOrCreateDevice(clientIP)
+	username := parseProxyUsername(r)
+	device := server.getOrCreateDevice(clientIP, username)
 	device.RequestCount++
 
 	if r.Method == http.MethodConnect {
@@ -1284,14 +1291,14 @@ func handleChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 	device.LastSeen = time.Now()
 	server.mu.Unlock()
 
-	// Save config by MAC if available, otherwise by IP
+	// Save config by Username if available, otherwise by IP
 	server.persistMu.Lock()
 	configKey := device.IP
-	if device.MAC != "" {
-		configKey = device.MAC
+	if device.Username != "" {
+		configKey = device.Username
 	}
 	config := server.persistentData.DeviceConfigs[configKey]
-	config.MAC = device.MAC
+	config.Username = device.Username
 	config.ProxyIndex = req.ProxyIndex
 	server.persistentData.DeviceConfigs[configKey] = config
 	server.persistMu.Unlock()
@@ -1324,14 +1331,14 @@ func handleUpdateDeviceAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "device not found", http.StatusNotFound)
 		return
 	}
-	// Save config by MAC if available, otherwise by IP
+	// Save config by Username if available, otherwise by IP
 	server.persistMu.Lock()
 	configKey := device.IP
-	if device.MAC != "" {
-		configKey = device.MAC
+	if device.Username != "" {
+		configKey = device.Username
 	}
 	config := server.persistentData.DeviceConfigs[configKey]
-	config.MAC = device.MAC
+	config.Username = device.Username
 	config.CustomName = req.CustomName
 	config.Group = req.Group
 	config.Notes = req.Notes
@@ -1368,15 +1375,15 @@ func handleBulkChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 		if device != nil {
 			device.UpstreamProxy = newProxy
 			updated++
-			// Save config by MAC if available, otherwise by IP
+			// Save config by Username if available, otherwise by IP
 			configKey := device.IP
-			if device.MAC != "" {
-				configKey = device.MAC
+			if device.Username != "" {
+				configKey = device.Username
 			}
 			server.mu.Unlock()
 			server.persistMu.Lock()
 			config := server.persistentData.DeviceConfigs[configKey]
-			config.MAC = device.MAC
+			config.Username = device.Username
 			config.ProxyIndex = req.ProxyIndex
 			server.persistentData.DeviceConfigs[configKey] = config
 			server.persistMu.Unlock()
@@ -1597,14 +1604,14 @@ func handleDeleteDeviceAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	// Find device by IP to get the proper key (MAC or IP)
+	// Find device by IP to get the proper key (Username or IP)
 	server.mu.Lock()
 	device := server.findDeviceByIP(req.DeviceIP)
 	exists := device != nil
 	var deviceKey string
 	if device != nil {
-		if device.MAC != "" {
-			deviceKey = device.MAC
+		if device.Username != "" {
+			deviceKey = device.Username
 		} else {
 			deviceKey = device.IP
 		}
@@ -1612,10 +1619,10 @@ func handleDeleteDeviceAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	server.mu.Unlock()
 
-	// Delete from persistent data by both MAC and IP to ensure cleanup
+	// Delete from persistent data by both Username and IP to ensure cleanup
 	server.persistMu.Lock()
-	if device != nil && device.MAC != "" {
-		delete(server.persistentData.DeviceConfigs, device.MAC)
+	if device != nil && device.Username != "" {
+		delete(server.persistentData.DeviceConfigs, device.Username)
 	}
 	delete(server.persistentData.DeviceConfigs, req.DeviceIP)
 	server.persistMu.Unlock()
@@ -1774,7 +1781,7 @@ const baseStyles = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:
 const baseJS = `async function logout(){await fetch('/api/logout',{method:'POST'});window.location.href='/';}function showToast(msg,type=''){const t=document.createElement('div');t.className='toast '+type;t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),3000);}function formatBytes(b){if(!b)return"0 B";const k=1024,s=["B","KB","MB","GB","TB"];const i=Math.floor(Math.log(b)/Math.log(k));return(b/Math.pow(k,i)).toFixed(1)+" "+s[i];}function formatNumber(n){if(!n)return"0";if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"K";return n.toString();}fetch('/api/session-check').then(r=>r.json()).then(d=>{if(!d.valid)window.location.href='/';else if(document.getElementById('currentUser'))document.getElementById('currentUser').textContent=d.username;});`
 
 const dashboardPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Devices</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.toolbar{background:white;padding:15px 20px;border-radius:12px;margin-bottom:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);display:flex;flex-wrap:wrap;gap:15px;align-items:center}.search-box{flex:1;min-width:200px;position:relative}.search-box input{width:100%;padding:10px 15px 10px 40px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.search-box input:focus{outline:none;border-color:#667eea}.search-box::before{content:"🔍";position:absolute;left:12px;top:50%;transform:translateY(-50%)}.filter-group{display:flex;gap:10px;align-items:center}.filter-group label{font-weight:600;color:#555;font-size:0.9em}.filter-group select{padding:8px 12px;border:2px solid #e0e0e0;border-radius:8px}.device-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px}.device-card{background:white;border:2px solid #e8e8e8;border-radius:12px;padding:18px;transition:all 0.2s;position:relative}.device-card:hover{border-color:#667eea;box-shadow:0 5px 20px rgba(102,126,234,0.15)}.device-card.selected{border-color:#667eea;background:#f8f9ff}.device-checkbox{position:absolute;top:15px;right:15px;width:20px;height:20px;cursor:pointer}.device-name{font-size:1.15em;font-weight:bold;color:#333;margin-bottom:5px;padding-right:30px;cursor:pointer}.device-name:hover{color:#667eea}.device-group{display:inline-block;background:#e8f5e9;color:#2e7d32;padding:3px 10px;border-radius:12px;font-size:0.8em;font-weight:600;margin-bottom:10px}.device-info{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:0.9em}.info-row{display:flex;justify-content:space-between;padding:3px 0}.info-label{color:#888}.status-badge{padding:3px 10px;border-radius:12px;font-size:0.85em;font-weight:600}.status-active{background:#e8f5e9;color:#2e7d32}.status-inactive{background:#ffebee;color:#c62828}.proxy-selector{margin-top:12px;padding-top:12px;border-top:1px solid #eee;grid-column:1/-1}.proxy-selector label{display:block;font-size:0.85em;color:#666;margin-bottom:6px}.proxy-selector select{width:100%;padding:8px;border:2px solid #e0e0e0;border-radius:6px;margin-bottom:8px}.current-proxy{font-size:0.85em;color:#667eea;font-weight:600}.change-btn{width:100%;padding:8px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:6px;cursor:pointer;font-weight:600}.change-btn:hover{opacity:0.9}.pagination{display:flex;justify-content:center;align-items:center;gap:10px;margin-top:20px}.pagination button{padding:8px 16px;border:2px solid #e0e0e0;background:white;border-radius:6px;cursor:pointer;font-weight:600}.pagination button:hover:not(:disabled){border-color:#667eea;color:#667eea}.pagination button:disabled{opacity:0.5;cursor:not-allowed}.bulk-actions{display:flex;gap:10px;align-items:center}.selected-count{background:#667eea;color:white;padding:5px 12px;border-radius:20px;font-size:0.85em;font-weight:600}.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000}.modal{background:white;border-radius:15px;padding:25px;width:90%;max-width:450px}.modal h3{margin-bottom:20px;color:#333}.modal-field{margin-bottom:15px}.modal-field label{display:block;font-weight:600;color:#555;margin-bottom:5px}.modal-field input,.modal-field select,.modal-field textarea{width:100%;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.modal-field textarea{resize:vertical;min-height:80px}.modal-buttons{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}.setup-box{background:#e3f2fd;padding:12px 20px;border-radius:10px;margin-bottom:20px;border-left:4px solid #2196F3}.setup-box code{background:#fff;padding:2px 6px;border-radius:4px;font-family:monospace;color:#d32f2f;font-weight:bold}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📱 Device Management</h1><p>Monitor and manage all connected devices</p></div><div class="setup-box">📱 Phone Setup: Wi-Fi → Proxy Manual → Host: <code id="serverIP">...</code> Port: <code>8888</code></div><div class="stats-grid"><div class="stat-card" onclick="filterByStatus('all')"><div class="stat-value" id="totalDevices">-</div><div class="stat-label">Total</div></div><div class="stat-card" onclick="filterByStatus('active')"><div class="stat-value" id="activeDevices">-</div><div class="stat-label">Active</div></div><div class="stat-card" onclick="filterByStatus('inactive')"><div class="stat-value" id="inactiveDevices">-</div><div class="stat-label">Inactive</div></div><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Proxies</div></div><div class="stat-card"><div class="stat-value" id="totalRequests">-</div><div class="stat-label">Requests</div></div></div><div class="toolbar"><div class="search-box"><input type="text" id="searchInput" placeholder="Search devices..." oninput="applyFilters()"></div><div class="filter-group"><label>Group:</label><select id="groupFilter" onchange="applyFilters()"><option value="">All</option></select></div><div class="filter-group"><label>Sort:</label><select id="sortBy" onchange="applyFilters()"><option value="name">Name</option><option value="ip">IP</option><option value="lastSeen">Last Seen</option><option value="requests">Requests</option></select></div><button class="btn btn-secondary" onclick="loadData()">🔄 Refresh</button><button class="btn btn-secondary" onclick="location.href='/api/export'">📤 Export</button><div class="bulk-actions" id="bulkActions" style="display:none"><span class="selected-count"><span id="selectedCount">0</span> selected</span><select id="bulkProxySelect"></select><button class="btn btn-primary" onclick="bulkChangeProxy()">Change</button><button class="btn btn-secondary" onclick="clearSelection()">Clear</button></div></div><div class="card"><h2>Connected Devices</h2><div id="devicesList" class="device-grid"><div class="loading">Loading...</div></div><div class="pagination" id="pagination"></div></div></div><div class="modal-overlay" id="editModal" style="display:none"><div class="modal"><h3>✏️ Edit Device</h3><div class="modal-field"><label>Custom Name</label><input type="text" id="editName" placeholder="e.g., Samsung S23"></div><div class="modal-field"><label>Group</label><select id="editGroup"></select></div><div class="modal-field"><label>Notes</label><textarea id="editNotes" placeholder="Optional notes..."></textarea></div><input type="hidden" id="editDeviceIP"><div class="modal-buttons"><button class="btn btn-secondary" onclick="closeEditModal()">Cancel</button><button class="btn btn-primary" onclick="saveDeviceEdit()">Save</button></div></div></div><script>` + baseJS + `document.getElementById('nav-dashboard').classList.add('active');fetch("/api/server-ip").then(r=>r.text()).then(ip=>document.getElementById("serverIP").textContent=ip);let allDevices=[],allProxies=[],allGroups=[],filteredDevices=[],selectedDevices=new Set(),currentPage=1,statusFilter='all';const PER_PAGE=20;function getDisplayName(d){return d.custom_name||d.name||'Unknown';}function isActive(d){return(Date.now()-new Date(d.last_seen))/60000<5;}function proxyLabel(p,i){let ip=p.user&&p.user.includes('ip-')?p.user.split('ip-')[1]:'unknown';return'#'+(i+1)+' – '+ip;}function filterByStatus(s){statusFilter=s;applyFilters();}function applyFilters(){const search=document.getElementById('searchInput').value.toLowerCase();const group=document.getElementById('groupFilter').value;const sort=document.getElementById('sortBy').value;filteredDevices=allDevices.filter(d=>{if(statusFilter==='active'&&!isActive(d))return false;if(statusFilter==='inactive'&&isActive(d))return false;if(group&&d.group!==group)return false;if(search&&!getDisplayName(d).toLowerCase().includes(search)&&!d.ip.includes(search)&&!(d.mac&&d.mac.toLowerCase().includes(search)))return false;return true;});filteredDevices.sort((a,b)=>{if(sort==='name')return getDisplayName(a).localeCompare(getDisplayName(b));if(sort==='ip')return a.ip.localeCompare(b.ip);if(sort==='lastSeen')return new Date(b.last_seen)-new Date(a.last_seen);if(sort==='requests')return(b.request_count||0)-(a.request_count||0);return 0;});currentPage=1;renderDevices();}function renderDevices(){const c=document.getElementById('devicesList');if(!filteredDevices.length){c.innerHTML='<div class="loading">No devices found</div>';document.getElementById('pagination').innerHTML='';return;}const pages=Math.ceil(filteredDevices.length/PER_PAGE);const start=(currentPage-1)*PER_PAGE;const pageDevices=filteredDevices.slice(start,start+PER_PAGE);c.innerHTML=pageDevices.map(d=>{const mins=Math.floor((Date.now()-new Date(d.last_seen))/60000);const active=mins<5;const sel=selectedDevices.has(d.ip);const pIdx=allProxies.findIndex(p=>p.full===d.upstream_proxy);const opts=allProxies.map((p,i)=>'<option value="'+i+'" '+(i===pIdx?'selected':'')+'>'+proxyLabel(p,i)+'</option>').join('');const pLabel=pIdx>=0?proxyLabel(allProxies[pIdx],pIdx):'N/A';return'<div class="device-card '+(sel?'selected':'')+'"><input type="checkbox" class="device-checkbox" '+(sel?'checked':'')+' onchange="toggleSel(\''+d.ip+'\',this.checked)"><div class="device-name" onclick="openEditModal(\''+d.ip+'\')">'+escapeHtml(getDisplayName(d))+' ✏️</div><div class="device-group">'+escapeHtml(d.group||'Default')+'</div><div class="device-info"><div class="info-row"><span class="info-label">Status:</span><span class="status-badge '+(active?'status-active':'status-inactive')+'">'+(active?'● Active':'○ Inactive')+'</span></div><div class="info-row"><span class="info-label">IP:</span><span><strong>'+d.ip+'</strong></span></div><div class="info-row"><span class="info-label">MAC:</span><span style="font-family:monospace;font-size:0.85em">'+(d.mac||'<em>detecting...</em>')+'</span></div><div class="info-row"><span class="info-label">Requests:</span><span>'+formatNumber(d.request_count)+'</span></div><div class="info-row"><span class="info-label">Errors:</span><span style="color:'+(d.error_count>0?'#c62828':'#666')+'">'+(d.error_count||0)+'</span></div><div class="info-row"><span class="info-label">Data:</span><span>↓'+formatBytes(d.bytes_in)+'</span></div><div class="info-row"><span class="info-label">Last seen:</span><span>'+(mins<1?'Now':mins+' min')+'</span></div><div class="proxy-selector"><label>Proxy: <span class="current-proxy">'+pLabel+'</span></label><select id="proxy-'+d.ip+'">'+opts+'</select><button class="change-btn" onclick="changeProxy(\''+d.ip+'\')">Change Proxy</button><button class="change-btn" style="background:#ef5350;margin-top:8px" onclick="deleteDevice(\''+d.ip+'\',\''+escapeHtml(getDisplayName(d))+'\')">Delete Device</button></div></div></div>';}).join('');const pag=document.getElementById('pagination');pag.innerHTML=pages>1?'<button onclick="goPage('+(currentPage-1)+')" '+(currentPage===1?'disabled':'')+'>← Prev</button><span>Page '+currentPage+' of '+pages+'</span><button onclick="goPage('+(currentPage+1)+')" '+(currentPage===pages?'disabled':'')+'>Next →</button>':'<span>'+filteredDevices.length+' devices</span>';updateBulk();}function goPage(p){const pages=Math.ceil(filteredDevices.length/PER_PAGE);if(p>=1&&p<=pages){currentPage=p;renderDevices();}}function escapeHtml(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML;}function toggleSel(ip,checked){checked?selectedDevices.add(ip):selectedDevices.delete(ip);updateBulk();renderDevices();}function clearSelection(){selectedDevices.clear();updateBulk();renderDevices();}function updateBulk(){const b=document.getElementById('bulkActions');b.style.display=selectedDevices.size>0?'flex':'none';document.getElementById('selectedCount').textContent=selectedDevices.size;}function changeProxy(ip){const idx=parseInt(document.getElementById('proxy-'+ip).value);fetch('/api/change-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,proxy_index:idx})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Proxy changed','success');loadData();}});}function bulkChangeProxy(){const idx=parseInt(document.getElementById('bulkProxySelect').value);fetch('/api/bulk-change-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ips:Array.from(selectedDevices),proxy_index:idx})}).then(r=>r.json()).then(d=>{if(d.ok){showToast(d.updated+' devices updated','success');selectedDevices.clear();loadData();}});}function openEditModal(ip){const d=allDevices.find(x=>x.ip===ip);if(!d)return;document.getElementById('editDeviceIP').value=ip;document.getElementById('editName').value=d.custom_name||'';document.getElementById('editNotes').value=d.notes||'';document.getElementById('editGroup').innerHTML=allGroups.map(g=>'<option value="'+g+'" '+(g===d.group?'selected':'')+'>'+g+'</option>').join('');document.getElementById('editModal').style.display='flex';}function closeEditModal(){document.getElementById('editModal').style.display='none';}function saveDeviceEdit(){const ip=document.getElementById('editDeviceIP').value;fetch('/api/update-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,custom_name:document.getElementById('editName').value,group:document.getElementById('editGroup').value,notes:document.getElementById('editNotes').value})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Device updated','success');closeEditModal();loadData();}});}function loadGroups(){return fetch('/api/groups').then(r=>r.json()).then(g=>{allGroups=g;document.getElementById('groupFilter').innerHTML='<option value="">All</option>'+g.map(x=>'<option value="'+x+'">'+x+'</option>').join('');});}function loadData(){Promise.all([fetch('/api/stats').then(r=>r.json()),fetch('/api/devices').then(r=>r.json()),fetch('/api/proxies').then(r=>r.json()),loadGroups()]).then(([stats,devices,proxies])=>{document.getElementById('totalDevices').textContent=stats.total_devices||0;document.getElementById('activeDevices').textContent=stats.active_devices||0;document.getElementById('inactiveDevices').textContent=(stats.total_devices-stats.active_devices)||0;document.getElementById('totalProxies').textContent=stats.total_proxies||0;document.getElementById('totalRequests').textContent=formatNumber(stats.total_requests||0);allDevices=devices||[];allProxies=proxies||[];document.getElementById('bulkProxySelect').innerHTML=allProxies.map((p,i)=>'<option value="'+i+'">'+proxyLabel(p,i)+'</option>').join('');applyFilters();});}function deleteDevice(ip,name){if(!confirm('Delete device "'+name+'" ('+ip+')? This will remove all saved settings for this device.')){return;}fetch('/api/delete-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip})}).then(r=>{if(r.ok)return r.json();throw new Error('Failed');}).then(d=>{if(d.ok){showToast('Device deleted','success');loadData();}}).catch(()=>showToast('Failed to delete device','error'));}loadData();setInterval(loadData,15000);</script></body></html>`
+<style>` + baseStyles + `.toolbar{background:white;padding:15px 20px;border-radius:12px;margin-bottom:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);display:flex;flex-wrap:wrap;gap:15px;align-items:center}.search-box{flex:1;min-width:200px;position:relative}.search-box input{width:100%;padding:10px 15px 10px 40px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.search-box input:focus{outline:none;border-color:#667eea}.search-box::before{content:"🔍";position:absolute;left:12px;top:50%;transform:translateY(-50%)}.filter-group{display:flex;gap:10px;align-items:center}.filter-group label{font-weight:600;color:#555;font-size:0.9em}.filter-group select{padding:8px 12px;border:2px solid #e0e0e0;border-radius:8px}.device-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px}.device-card{background:white;border:2px solid #e8e8e8;border-radius:12px;padding:18px;transition:all 0.2s;position:relative}.device-card:hover{border-color:#667eea;box-shadow:0 5px 20px rgba(102,126,234,0.15)}.device-card.selected{border-color:#667eea;background:#f8f9ff}.device-checkbox{position:absolute;top:15px;right:15px;width:20px;height:20px;cursor:pointer}.device-name{font-size:1.15em;font-weight:bold;color:#333;margin-bottom:5px;padding-right:30px;cursor:pointer}.device-name:hover{color:#667eea}.device-group{display:inline-block;background:#e8f5e9;color:#2e7d32;padding:3px 10px;border-radius:12px;font-size:0.8em;font-weight:600;margin-bottom:10px}.device-info{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:0.9em}.info-row{display:flex;justify-content:space-between;padding:3px 0}.info-label{color:#888}.status-badge{padding:3px 10px;border-radius:12px;font-size:0.85em;font-weight:600}.status-active{background:#e8f5e9;color:#2e7d32}.status-inactive{background:#ffebee;color:#c62828}.proxy-selector{margin-top:12px;padding-top:12px;border-top:1px solid #eee;grid-column:1/-1}.proxy-selector label{display:block;font-size:0.85em;color:#666;margin-bottom:6px}.proxy-selector select{width:100%;padding:8px;border:2px solid #e0e0e0;border-radius:6px;margin-bottom:8px}.current-proxy{font-size:0.85em;color:#667eea;font-weight:600}.change-btn{width:100%;padding:8px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:6px;cursor:pointer;font-weight:600}.change-btn:hover{opacity:0.9}.pagination{display:flex;justify-content:center;align-items:center;gap:10px;margin-top:20px}.pagination button{padding:8px 16px;border:2px solid #e0e0e0;background:white;border-radius:6px;cursor:pointer;font-weight:600}.pagination button:hover:not(:disabled){border-color:#667eea;color:#667eea}.pagination button:disabled{opacity:0.5;cursor:not-allowed}.bulk-actions{display:flex;gap:10px;align-items:center}.selected-count{background:#667eea;color:white;padding:5px 12px;border-radius:20px;font-size:0.85em;font-weight:600}.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000}.modal{background:white;border-radius:15px;padding:25px;width:90%;max-width:450px}.modal h3{margin-bottom:20px;color:#333}.modal-field{margin-bottom:15px}.modal-field label{display:block;font-weight:600;color:#555;margin-bottom:5px}.modal-field input,.modal-field select,.modal-field textarea{width:100%;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.modal-field textarea{resize:vertical;min-height:80px}.modal-buttons{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}.setup-box{background:#e3f2fd;padding:12px 20px;border-radius:10px;margin-bottom:20px;border-left:4px solid #2196F3}.setup-box code{background:#fff;padding:2px 6px;border-radius:4px;font-family:monospace;color:#d32f2f;font-weight:bold}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📱 Device Management</h1><p>Monitor and manage all connected devices</p></div><div class="setup-box">📱 Phone Setup: Wi-Fi → Proxy Manual → Host: <code id="serverIP">...</code> Port: <code>8888</code> Username: <code>your-device-name</code> (password can be anything)</div><div class="stats-grid"><div class="stat-card" onclick="filterByStatus('all')"><div class="stat-value" id="totalDevices">-</div><div class="stat-label">Total</div></div><div class="stat-card" onclick="filterByStatus('active')"><div class="stat-value" id="activeDevices">-</div><div class="stat-label">Active</div></div><div class="stat-card" onclick="filterByStatus('inactive')"><div class="stat-value" id="inactiveDevices">-</div><div class="stat-label">Inactive</div></div><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Proxies</div></div><div class="stat-card"><div class="stat-value" id="totalRequests">-</div><div class="stat-label">Requests</div></div></div><div class="toolbar"><div class="search-box"><input type="text" id="searchInput" placeholder="Search devices..." oninput="applyFilters()"></div><div class="filter-group"><label>Group:</label><select id="groupFilter" onchange="applyFilters()"><option value="">All</option></select></div><div class="filter-group"><label>Sort:</label><select id="sortBy" onchange="applyFilters()"><option value="name">Name</option><option value="ip">IP</option><option value="lastSeen">Last Seen</option><option value="requests">Requests</option></select></div><button class="btn btn-secondary" onclick="loadData()">🔄 Refresh</button><button class="btn btn-secondary" onclick="location.href='/api/export'">📤 Export</button><div class="bulk-actions" id="bulkActions" style="display:none"><span class="selected-count"><span id="selectedCount">0</span> selected</span><select id="bulkProxySelect"></select><button class="btn btn-primary" onclick="bulkChangeProxy()">Change</button><button class="btn btn-secondary" onclick="clearSelection()">Clear</button></div></div><div class="card"><h2>Connected Devices</h2><div id="devicesList" class="device-grid"><div class="loading">Loading...</div></div><div class="pagination" id="pagination"></div></div></div><div class="modal-overlay" id="editModal" style="display:none"><div class="modal"><h3>✏️ Edit Device</h3><div class="modal-field"><label>Custom Name</label><input type="text" id="editName" placeholder="e.g., Samsung S23"></div><div class="modal-field"><label>Group</label><select id="editGroup"></select></div><div class="modal-field"><label>Notes</label><textarea id="editNotes" placeholder="Optional notes..."></textarea></div><input type="hidden" id="editDeviceIP"><div class="modal-buttons"><button class="btn btn-secondary" onclick="closeEditModal()">Cancel</button><button class="btn btn-primary" onclick="saveDeviceEdit()">Save</button></div></div></div><script>` + baseJS + `document.getElementById('nav-dashboard').classList.add('active');fetch("/api/server-ip").then(r=>r.text()).then(ip=>document.getElementById("serverIP").textContent=ip);let allDevices=[],allProxies=[],allGroups=[],filteredDevices=[],selectedDevices=new Set(),currentPage=1,statusFilter='all';const PER_PAGE=20;function getDisplayName(d){return d.custom_name||d.name||'Unknown';}function isActive(d){return(Date.now()-new Date(d.last_seen))/60000<5;}function proxyLabel(p,i){let ip=p.user&&p.user.includes('ip-')?p.user.split('ip-')[1]:'unknown';return'#'+(i+1)+' – '+ip;}function filterByStatus(s){statusFilter=s;applyFilters();}function applyFilters(){const search=document.getElementById('searchInput').value.toLowerCase();const group=document.getElementById('groupFilter').value;const sort=document.getElementById('sortBy').value;filteredDevices=allDevices.filter(d=>{if(statusFilter==='active'&&!isActive(d))return false;if(statusFilter==='inactive'&&isActive(d))return false;if(group&&d.group!==group)return false;if(search&&!getDisplayName(d).toLowerCase().includes(search)&&!d.ip.includes(search)&&!(d.username&&d.username.toLowerCase().includes(search)))return false;return true;});filteredDevices.sort((a,b)=>{if(sort==='name')return getDisplayName(a).localeCompare(getDisplayName(b));if(sort==='ip')return a.ip.localeCompare(b.ip);if(sort==='lastSeen')return new Date(b.last_seen)-new Date(a.last_seen);if(sort==='requests')return(b.request_count||0)-(a.request_count||0);return 0;});currentPage=1;renderDevices();}function renderDevices(){const c=document.getElementById('devicesList');if(!filteredDevices.length){c.innerHTML='<div class="loading">No devices found</div>';document.getElementById('pagination').innerHTML='';return;}const pages=Math.ceil(filteredDevices.length/PER_PAGE);const start=(currentPage-1)*PER_PAGE;const pageDevices=filteredDevices.slice(start,start+PER_PAGE);c.innerHTML=pageDevices.map(d=>{const mins=Math.floor((Date.now()-new Date(d.last_seen))/60000);const active=mins<5;const sel=selectedDevices.has(d.ip);const pIdx=allProxies.findIndex(p=>p.full===d.upstream_proxy);const opts=allProxies.map((p,i)=>'<option value="'+i+'" '+(i===pIdx?'selected':'')+'>'+proxyLabel(p,i)+'</option>').join('');const pLabel=pIdx>=0?proxyLabel(allProxies[pIdx],pIdx):'N/A';return'<div class="device-card '+(sel?'selected':'')+'"><input type="checkbox" class="device-checkbox" '+(sel?'checked':'')+' onchange="toggleSel(\''+d.ip+'\',this.checked)"><div class="device-name" onclick="openEditModal(\''+d.ip+'\')">'+escapeHtml(getDisplayName(d))+' ✏️</div><div class="device-group">'+escapeHtml(d.group||'Default')+'</div><div class="device-info"><div class="info-row"><span class="info-label">Status:</span><span class="status-badge '+(active?'status-active':'status-inactive')+'">'+(active?'● Active':'○ Inactive')+'</span></div><div class="info-row"><span class="info-label">IP:</span><span><strong>'+d.ip+'</strong></span></div><div class="info-row"><span class="info-label">User:</span><span style="font-weight:600;color:#667eea">'+(d.username||'<em>anonymous</em>')+'</span></div><div class="info-row"><span class="info-label">Requests:</span><span>'+formatNumber(d.request_count)+'</span></div><div class="info-row"><span class="info-label">Errors:</span><span style="color:'+(d.error_count>0?'#c62828':'#666')+'">'+(d.error_count||0)+'</span></div><div class="info-row"><span class="info-label">Data:</span><span>↓'+formatBytes(d.bytes_in)+'</span></div><div class="info-row"><span class="info-label">Last seen:</span><span>'+(mins<1?'Now':mins+' min')+'</span></div><div class="proxy-selector"><label>Proxy: <span class="current-proxy">'+pLabel+'</span></label><select id="proxy-'+d.ip+'">'+opts+'</select><button class="change-btn" onclick="changeProxy(\''+d.ip+'\')">Change Proxy</button><button class="change-btn" style="background:#ef5350;margin-top:8px" onclick="deleteDevice(\''+d.ip+'\',\''+escapeHtml(getDisplayName(d))+'\')">Delete Device</button></div></div></div>';}).join('');const pag=document.getElementById('pagination');pag.innerHTML=pages>1?'<button onclick="goPage('+(currentPage-1)+')" '+(currentPage===1?'disabled':'')+'>← Prev</button><span>Page '+currentPage+' of '+pages+'</span><button onclick="goPage('+(currentPage+1)+')" '+(currentPage===pages?'disabled':'')+'>Next →</button>':'<span>'+filteredDevices.length+' devices</span>';updateBulk();}function goPage(p){const pages=Math.ceil(filteredDevices.length/PER_PAGE);if(p>=1&&p<=pages){currentPage=p;renderDevices();}}function escapeHtml(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML;}function toggleSel(ip,checked){checked?selectedDevices.add(ip):selectedDevices.delete(ip);updateBulk();renderDevices();}function clearSelection(){selectedDevices.clear();updateBulk();renderDevices();}function updateBulk(){const b=document.getElementById('bulkActions');b.style.display=selectedDevices.size>0?'flex':'none';document.getElementById('selectedCount').textContent=selectedDevices.size;}function changeProxy(ip){const idx=parseInt(document.getElementById('proxy-'+ip).value);fetch('/api/change-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,proxy_index:idx})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Proxy changed','success');loadData();}});}function bulkChangeProxy(){const idx=parseInt(document.getElementById('bulkProxySelect').value);fetch('/api/bulk-change-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ips:Array.from(selectedDevices),proxy_index:idx})}).then(r=>r.json()).then(d=>{if(d.ok){showToast(d.updated+' devices updated','success');selectedDevices.clear();loadData();}});}function openEditModal(ip){const d=allDevices.find(x=>x.ip===ip);if(!d)return;document.getElementById('editDeviceIP').value=ip;document.getElementById('editName').value=d.custom_name||'';document.getElementById('editNotes').value=d.notes||'';document.getElementById('editGroup').innerHTML=allGroups.map(g=>'<option value="'+g+'" '+(g===d.group?'selected':'')+'>'+g+'</option>').join('');document.getElementById('editModal').style.display='flex';}function closeEditModal(){document.getElementById('editModal').style.display='none';}function saveDeviceEdit(){const ip=document.getElementById('editDeviceIP').value;fetch('/api/update-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,custom_name:document.getElementById('editName').value,group:document.getElementById('editGroup').value,notes:document.getElementById('editNotes').value})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Device updated','success');closeEditModal();loadData();}});}function loadGroups(){return fetch('/api/groups').then(r=>r.json()).then(g=>{allGroups=g;document.getElementById('groupFilter').innerHTML='<option value="">All</option>'+g.map(x=>'<option value="'+x+'">'+x+'</option>').join('');});}function loadData(){Promise.all([fetch('/api/stats').then(r=>r.json()),fetch('/api/devices').then(r=>r.json()),fetch('/api/proxies').then(r=>r.json()),loadGroups()]).then(([stats,devices,proxies])=>{document.getElementById('totalDevices').textContent=stats.total_devices||0;document.getElementById('activeDevices').textContent=stats.active_devices||0;document.getElementById('inactiveDevices').textContent=(stats.total_devices-stats.active_devices)||0;document.getElementById('totalProxies').textContent=stats.total_proxies||0;document.getElementById('totalRequests').textContent=formatNumber(stats.total_requests||0);allDevices=devices||[];allProxies=proxies||[];document.getElementById('bulkProxySelect').innerHTML=allProxies.map((p,i)=>'<option value="'+i+'">'+proxyLabel(p,i)+'</option>').join('');applyFilters();});}function deleteDevice(ip,name){if(!confirm('Delete device "'+name+'" ('+ip+')? This will remove all saved settings for this device.')){return;}fetch('/api/delete-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip})}).then(r=>{if(r.ok)return r.json();throw new Error('Failed');}).then(d=>{if(d.ok){showToast('Device deleted','success');loadData();}}).catch(()=>showToast('Failed to delete device','error'));}loadData();setInterval(loadData,15000);</script></body></html>`
 
 const healthPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Proxy Health</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>` + baseStyles + `.health-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:20px}.proxy-card{background:white;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);border-left:4px solid #ccc}.proxy-card.healthy{border-left-color:#4caf50}.proxy-card.degraded{border-left-color:#ff9800}.proxy-card.unhealthy{border-left-color:#f44336}.proxy-card.unknown{border-left-color:#9e9e9e}.proxy-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}.proxy-name{font-size:1.2em;font-weight:bold;color:#333}.proxy-status{padding:5px 12px;border-radius:20px;font-size:0.85em;font-weight:600}.proxy-status.healthy{background:#e8f5e9;color:#2e7d32}.proxy-status.degraded{background:#fff3e0;color:#e65100}.proxy-status.unhealthy{background:#ffebee;color:#c62828}.proxy-status.unknown{background:#f5f5f5;color:#666}.proxy-stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}.proxy-stat{padding:10px;background:#f8f9fa;border-radius:8px}.proxy-stat-value{font-size:1.3em;font-weight:bold;color:#667eea}.proxy-stat-label{font-size:0.8em;color:#666;text-transform:uppercase}.progress-bar{height:8px;background:#e0e0e0;border-radius:4px;overflow:hidden;margin-top:10px}.progress-fill{height:100%;border-radius:4px;transition:width 0.3s}.progress-fill.good{background:#4caf50}.progress-fill.warning{background:#ff9800}.progress-fill.bad{background:#f44336}.last-error{margin-top:10px;padding:10px;background:#ffebee;border-radius:8px;font-size:0.85em;color:#c62828;word-break:break-all}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>💚 Proxy Health Monitor</h1><p>Real-time health status of all upstream proxies</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Total Proxies</div></div><div class="stat-card"><div class="stat-value" id="healthyProxies" style="color:#4caf50">-</div><div class="stat-label">Healthy</div></div><div class="stat-card"><div class="stat-value" id="degradedProxies" style="color:#ff9800">-</div><div class="stat-label">Degraded</div></div><div class="stat-card"><div class="stat-value" id="unhealthyProxies" style="color:#f44336">-</div><div class="stat-label">Unhealthy</div></div><div class="stat-card"><div class="stat-value" id="avgSuccessRate">-</div><div class="stat-label">Avg Success</div></div></div><div class="card"><h2>Proxy Status</h2><button class="btn btn-secondary" onclick="loadHealth()" style="float:right;margin-top:-45px">🔄 Refresh</button><div id="healthGrid" class="health-grid"><div class="loading">Loading...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-health').classList.add('active');function loadHealth(){fetch('/api/proxy-health').then(r=>r.json()).then(data=>{let healthy=0,degraded=0,unhealthy=0,totalRate=0;data.forEach(p=>{if(p.status==='healthy')healthy++;else if(p.status==='degraded')degraded++;else if(p.status==='unhealthy')unhealthy++;totalRate+=p.success_rate||0;});document.getElementById('totalProxies').textContent=data.length;document.getElementById('healthyProxies').textContent=healthy;document.getElementById('degradedProxies').textContent=degraded;document.getElementById('unhealthyProxies').textContent=unhealthy;document.getElementById('avgSuccessRate').textContent=data.length?(totalRate/data.length).toFixed(1)+'%':'-';document.getElementById('healthGrid').innerHTML=data.map(p=>{const rate=p.success_rate||0;const rateClass=rate>=95?'good':rate>=80?'warning':'bad';return'<div class="proxy-card '+p.status+'"><div class="proxy-header"><span class="proxy-name">#'+(p.index+1)+' – '+p.ip_address+'</span><span class="proxy-status '+p.status+'">'+p.status.toUpperCase()+'</span></div><div class="proxy-stats"><div class="proxy-stat"><div class="proxy-stat-value">'+formatNumber(p.total_requests)+'</div><div class="proxy-stat-label">Requests</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+rate.toFixed(1)+'%</div><div class="proxy-stat-label">Success Rate</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+formatNumber(p.success_count)+'</div><div class="proxy-stat-label">Success</div></div><div class="proxy-stat"><div class="proxy-stat-value" style="color:#c62828">'+formatNumber(p.failure_count)+'</div><div class="proxy-stat-label">Failures</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+p.avg_response_time_ms+'ms</div><div class="proxy-stat-label">Avg Response</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+p.active_devices+'</div><div class="proxy-stat-label">Active Devices</div></div></div><div class="progress-bar"><div class="progress-fill '+rateClass+'" style="width:'+rate+'%"></div></div>'+(p.last_error?'<div class="last-error">Last error: '+p.last_error+'</div>':'')+'</div>';}).join('');});}loadHealth();setInterval(loadHealth,30000);</script></body></html>`
