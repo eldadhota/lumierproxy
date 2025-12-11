@@ -120,7 +120,9 @@ class ProxyVpnService : VpnService() {
             // Exclude the proxy server from VPN to avoid infinite loop
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 try {
-                    builder.excludeRoute(InetSocketAddress(serverIp, 0).address, 32)
+                    val proxyAddr = java.net.InetAddress.getByName(serverIp)
+                    val prefix = android.net.IpPrefix(proxyAddr, 32)
+                    builder.excludeRoute(prefix)
                 } catch (e: Exception) {
                     Log.w(TAG, "Could not exclude proxy route: ${e.message}")
                 }
