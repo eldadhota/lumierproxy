@@ -11,11 +11,10 @@ import android.os.ParcelFileDescriptor
 import android.util.Base64
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import java.io.FileInputStream
-import java.io.FileOutputStream
+import java.net.HttpURLConnection
 import java.net.InetSocketAddress
-import java.net.Socket
-import java.nio.ByteBuffer
+import java.net.Proxy
+import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ProxyVpnService : VpnService() {
@@ -40,7 +39,7 @@ class ProxyVpnService : VpnService() {
     private var serverPort: Int = 8080
     private var username: String = ""
     private val running = AtomicBoolean(false)
-    private var vpnThread: Thread? = null
+    private var keepAliveThread: Thread? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -56,6 +55,9 @@ class ProxyVpnService : VpnService() {
 
                 if (serverIp.isNotEmpty() && username.isNotEmpty()) {
                     startVpn()
+                } else {
+                    Log.e(TAG, "Missing server IP or username")
+                    stopSelf()
                 }
             }
             ACTION_DISCONNECT -> {
@@ -78,13 +80,14 @@ class ProxyVpnService : VpnService() {
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "VPN connection status"
+                setShowBadge(false)
             }
             val notificationManager = getSystemService(NotificationManager::class.java)
             notificationManager.createNotificationChannel(channel)
         }
     }
 
-    private fun createNotification(): Notification {
+    private fun createNotification(status: String = "Connected"): Notification {
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
@@ -94,10 +97,11 @@ class ProxyVpnService : VpnService() {
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("Lumier Proxy")
-            .setContentText("Connected as: $username")
+            .setContentText("$status as: $username")
             .setSmallIcon(R.drawable.ic_vpn)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 
@@ -107,52 +111,54 @@ class ProxyVpnService : VpnService() {
             return
         }
 
+        // Start foreground FIRST (required on Android 14+)
+        startForeground(NOTIFICATION_ID, createNotification("Connecting"))
+
         try {
-            // Build VPN interface
+            // Build a minimal VPN interface that doesn't route traffic
+            // This just establishes identity with the proxy server
             val builder = Builder()
                 .setSession("Lumier Proxy ($username)")
-                .addAddress("10.0.0.2", 32)
-                .addRoute("0.0.0.0", 0)
-                .addDnsServer("8.8.8.8")
-                .addDnsServer("8.8.4.4")
+                .addAddress("10.255.255.1", 32)
                 .setMtu(1500)
+                .setBlocking(false)
 
-            // Exclude the proxy server from VPN to avoid infinite loop
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                try {
-                    val proxyAddr = java.net.InetAddress.getByName(serverIp)
-                    val prefix = android.net.IpPrefix(proxyAddr, 32)
-                    builder.excludeRoute(prefix)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Could not exclude proxy route: ${e.message}")
-                }
-            }
+            // Don't add routes - we don't want to capture traffic
+            // The VPN is just for device registration/identification
 
-            // Allow bypass for the proxy connection
+            // Allow all apps to bypass this VPN
             builder.allowBypass()
+
+            // Exclude all traffic by not adding any routes
+            // Or add a dummy route to a non-routable address
+            builder.addRoute("10.255.255.0", 24)
 
             vpnInterface = builder.establish()
 
             if (vpnInterface == null) {
                 Log.e(TAG, "Failed to establish VPN interface")
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
                 return
             }
 
             running.set(true)
             isRunning = true
 
-            // Start foreground service with notification
-            startForeground(NOTIFICATION_ID, createNotification())
+            // Update notification
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.notify(NOTIFICATION_ID, createNotification("Connected"))
 
-            // Start the VPN processing thread
-            vpnThread = Thread { runVpnLoop() }
-            vpnThread?.start()
+            // Start keep-alive thread that registers with proxy server
+            keepAliveThread = Thread { runKeepAlive() }
+            keepAliveThread?.start()
 
             Log.i(TAG, "VPN started successfully for user: $username")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start VPN: ${e.message}", e)
-            stopVpn()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
         }
     }
 
@@ -160,8 +166,8 @@ class ProxyVpnService : VpnService() {
         running.set(false)
         isRunning = false
 
-        vpnThread?.interrupt()
-        vpnThread = null
+        keepAliveThread?.interrupt()
+        keepAliveThread = null
 
         try {
             vpnInterface?.close()
@@ -176,156 +182,51 @@ class ProxyVpnService : VpnService() {
         Log.i(TAG, "VPN stopped")
     }
 
-    private fun runVpnLoop() {
-        val vpnFd = vpnInterface?.fileDescriptor ?: return
-        val vpnInput = FileInputStream(vpnFd)
-        val vpnOutput = FileOutputStream(vpnFd)
+    private fun runKeepAlive() {
+        // Register with the proxy server immediately
+        registerWithProxy()
 
-        val packet = ByteBuffer.allocate(32767)
-
+        // Then periodically ping to keep registration alive
         try {
             while (running.get()) {
-                // Read packet from VPN interface
-                packet.clear()
-                val length = vpnInput.read(packet.array())
-
-                if (length > 0 && running.get()) {
-                    packet.limit(length)
-                    handlePacket(packet, vpnOutput)
+                Thread.sleep(30000) // Every 30 seconds
+                if (running.get()) {
+                    registerWithProxy()
                 }
-
-                // Small sleep to prevent CPU spinning
-                Thread.sleep(1)
             }
         } catch (e: InterruptedException) {
-            Log.d(TAG, "VPN loop interrupted")
-        } catch (e: Exception) {
-            Log.e(TAG, "VPN loop error: ${e.message}", e)
-        } finally {
-            try {
-                vpnInput.close()
-                vpnOutput.close()
-            } catch (e: Exception) {
-                // Ignore
-            }
+            Log.d(TAG, "Keep-alive interrupted")
         }
     }
 
-    private fun handlePacket(packet: ByteBuffer, vpnOutput: FileOutputStream) {
-        // Parse IP header to determine protocol and destination
-        if (packet.limit() < 20) return
-
-        val version = (packet.get(0).toInt() shr 4) and 0xF
-        if (version != 4) return // Only handle IPv4
-
-        val protocol = packet.get(9).toInt() and 0xFF
-        val destIp = getDestinationIp(packet)
-
-        // Skip packets destined to the proxy server itself
-        if (destIp == serverIp) {
-            return
-        }
-
-        when (protocol) {
-            6 -> handleTcpPacket(packet, vpnOutput) // TCP
-            17 -> handleUdpPacket(packet, vpnOutput) // UDP
-        }
-    }
-
-    private fun getDestinationIp(packet: ByteBuffer): String {
-        val destIp = ByteArray(4)
-        packet.position(16)
-        packet.get(destIp)
-        packet.rewind()
-        return destIp.joinToString(".") { (it.toInt() and 0xFF).toString() }
-    }
-
-    private fun handleTcpPacket(packet: ByteBuffer, vpnOutput: FileOutputStream) {
-        // For TCP connections, we would ideally tunnel through the HTTP proxy
-        // This is a simplified implementation - a full implementation would:
-        // 1. Track TCP connections
-        // 2. Use HTTP CONNECT for HTTPS traffic
-        // 3. Forward HTTP traffic through the proxy
-
-        // For this simple app, we're primarily setting up the VPN tunnel
-        // The actual proxy routing happens at the system level when the VPN is active
-        // The username is sent via the initial connection to register the device
-
+    private fun registerWithProxy() {
         try {
-            // Extract destination port
-            val ipHeaderLength = (packet.get(0).toInt() and 0xF) * 4
-            if (packet.limit() < ipHeaderLength + 4) return
+            // Make a request through the proxy to register this device
+            val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress(serverIp, serverPort))
+            val url = URL("http://lumier.local/register")
 
-            val destPort = ((packet.get(ipHeaderLength).toInt() and 0xFF) shl 8) or
-                    (packet.get(ipHeaderLength + 1).toInt() and 0xFF)
+            val connection = url.openConnection(proxy) as HttpURLConnection
+            connection.connectTimeout = 10000
+            connection.readTimeout = 10000
+            connection.requestMethod = "GET"
 
-            // For HTTP/HTTPS ports, we could implement proxy tunneling
-            // For simplicity, this demo just logs the connection attempt
-            if (destPort == 80 || destPort == 443) {
-                Log.v(TAG, "TCP packet to port $destPort")
-            }
+            // Add proxy authentication with username
+            val credentials = "$username:"
+            val encoded = Base64.encodeToString(credentials.toByteArray(), Base64.NO_WRAP)
+            connection.setRequestProperty("Proxy-Authorization", "Basic $encoded")
 
-        } catch (e: Exception) {
-            Log.e(TAG, "Error handling TCP packet: ${e.message}")
-        }
-    }
-
-    private fun handleUdpPacket(packet: ByteBuffer, vpnOutput: FileOutputStream) {
-        // UDP packets (like DNS) - in a full implementation, these would be
-        // forwarded through a SOCKS5 proxy or DNS-over-HTTPS
-        Log.v(TAG, "UDP packet received")
-    }
-
-    /**
-     * Creates the Basic auth header value for proxy authentication
-     */
-    private fun createProxyAuthHeader(): String {
-        // Format: Basic base64(username:password)
-        // We use username with empty password since our proxy only needs the username
-        val credentials = "$username:"
-        val encoded = Base64.encodeToString(credentials.toByteArray(), Base64.NO_WRAP)
-        return "Basic $encoded"
-    }
-
-    /**
-     * Connect to a remote host through the HTTP proxy using CONNECT method
-     */
-    private fun connectThroughProxy(destHost: String, destPort: Int): Socket? {
-        return try {
-            val proxySocket = Socket()
-            // Protect this socket so it doesn't go through VPN (infinite loop prevention)
-            protect(proxySocket)
-
-            proxySocket.connect(InetSocketAddress(serverIp, serverPort), 10000)
-
-            val writer = proxySocket.getOutputStream().bufferedWriter()
-            val reader = proxySocket.getInputStream().bufferedReader()
-
-            // Send CONNECT request with proxy authentication
-            writer.write("CONNECT $destHost:$destPort HTTP/1.1\r\n")
-            writer.write("Host: $destHost:$destPort\r\n")
-            writer.write("Proxy-Authorization: ${createProxyAuthHeader()}\r\n")
-            writer.write("Proxy-Connection: Keep-Alive\r\n")
-            writer.write("\r\n")
-            writer.flush()
-
-            // Read response
-            val responseLine = reader.readLine() ?: ""
-            if (responseLine.contains("200")) {
-                // Skip remaining headers
-                while (reader.readLine()?.isNotEmpty() == true) {
-                    // Continue reading until empty line
-                }
-                Log.d(TAG, "Proxy tunnel established to $destHost:$destPort")
-                proxySocket
-            } else {
-                Log.e(TAG, "Proxy CONNECT failed: $responseLine")
-                proxySocket.close()
-                null
+            try {
+                connection.connect()
+                val responseCode = connection.responseCode
+                Log.d(TAG, "Registration ping: $responseCode")
+            } catch (e: Exception) {
+                // Connection might fail but proxy still sees the auth header
+                Log.d(TAG, "Registration ping sent (response: ${e.message})")
+            } finally {
+                connection.disconnect()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to connect through proxy: ${e.message}")
-            null
+            Log.e(TAG, "Failed to register with proxy: ${e.message}")
         }
     }
 }
