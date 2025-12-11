@@ -805,12 +805,26 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 		}
 	}
 
-	// Fallback: check if device exists by IP (for anonymous connections)
-	if username == "" {
-		if device := s.findAnonymousDeviceByIP(clientIP); device != nil {
-			device.LastSeen = time.Now()
-			return device
+	// Check if device exists by IP - this catches:
+	// 1. Anonymous devices (no username set)
+	// 2. Registered devices making requests without username header (normal browsing)
+	if device := s.findDeviceByIP(clientIP); device != nil {
+		// If this request has a username and device doesn't, update the device
+		if username != "" && device.Username == "" {
+			oldKey := device.IP
+			device.Username = username
+			device.Name = username
+			device.ID = fmt.Sprintf("device-%s", username)
+			// Re-key the device from IP to username
+			delete(s.devices, oldKey)
+			s.devices[username] = device
+			log.Printf("📱 Device %s registered as '%s'\n", clientIP, username)
+			s.addLog("info", fmt.Sprintf("Device %s registered as '%s'", clientIP, username))
+			// Save updated config
+			go s.saveDeviceConfig(device)
 		}
+		device.LastSeen = time.Now()
+		return device
 	}
 
 	// Check persistent data by username first, then IP for migration
@@ -868,7 +882,42 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 		log.Printf("📱 New anonymous device: %s -> %s\n", clientIP, extractProxyIP(upstreamProxy))
 		s.addLog("info", fmt.Sprintf("New anonymous device: %s -> Proxy %s", clientIP, extractProxyIP(upstreamProxy)))
 	}
+
+	// Save new device config for persistence
+	go s.saveDeviceConfig(device)
+
 	return device
+}
+
+// saveDeviceConfig saves a device's config to persistent storage
+func (s *ProxyServer) saveDeviceConfig(device *Device) {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
+	// Determine the config key (username if set, otherwise IP)
+	configKey := device.IP
+	if device.Username != "" {
+		configKey = device.Username
+	}
+
+	// Find proxy index
+	proxyIndex := 0
+	for i, p := range s.proxyPool {
+		if p == device.UpstreamProxy {
+			proxyIndex = i
+			break
+		}
+	}
+
+	s.persistentData.DeviceConfigs[configKey] = DeviceConfig{
+		Username:   device.Username,
+		CustomName: device.CustomName,
+		Group:      device.Group,
+		Notes:      device.Notes,
+		ProxyIndex: proxyIndex,
+	}
+
+	go s.savePersistentData()
 }
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
