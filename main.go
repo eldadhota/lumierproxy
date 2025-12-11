@@ -805,26 +805,13 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 		}
 	}
 
-	// Check if device exists by IP - this catches:
-	// 1. Anonymous devices (no username set)
-	// 2. Registered devices making requests without username header (normal browsing)
-	if device := s.findDeviceByIP(clientIP); device != nil {
-		// If this request has a username and device doesn't, update the device
-		if username != "" && device.Username == "" {
-			oldKey := device.IP
-			device.Username = username
-			device.Name = username
-			device.ID = fmt.Sprintf("device-%s", username)
-			// Re-key the device from IP to username
-			delete(s.devices, oldKey)
-			s.devices[username] = device
-			log.Printf("📱 Device %s registered as '%s'\n", clientIP, username)
-			s.addLog("info", fmt.Sprintf("Device %s registered as '%s'", clientIP, username))
-			// Save updated config
-			go s.saveDeviceConfig(device)
+	// For anonymous requests (no username), only match anonymous devices
+	// Registered devices require the username header to be recognized
+	if username == "" {
+		if device := s.findAnonymousDeviceByIP(clientIP); device != nil {
+			device.LastSeen = time.Now()
+			return device
 		}
-		device.LastSeen = time.Now()
-		return device
 	}
 
 	// Check persistent data by username first, then IP for migration
@@ -1103,6 +1090,10 @@ func startDashboard() {
 	http.HandleFunc("/api/logout", handleLogoutAPI)
 	http.HandleFunc("/api/session-check", handleSessionCheckAPI)
 
+	// Public app API (no auth required)
+	http.HandleFunc("/api/app/proxies", handleAppProxiesAPI)
+	http.HandleFunc("/api/app/register", handleAppRegisterAPI)
+
 	http.HandleFunc("/dashboard", server.requireAuth(handleDashboard))
 	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
 	http.HandleFunc("/analytics", server.requireAuth(handleAnalyticsPage))
@@ -1287,6 +1278,127 @@ func handleProxiesAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(proxies)
+}
+
+// ============================================================================
+// APP API (public endpoints for mobile app)
+// ============================================================================
+
+type AppProxyInfo struct {
+	Index int    `json:"index"`
+	Name  string `json:"name"`
+}
+
+// handleAppProxiesAPI returns list of proxy names for the mobile app (no auth required)
+func handleAppProxiesAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	server.poolMu.Lock()
+	defer server.poolMu.Unlock()
+
+	proxies := make([]AppProxyInfo, 0)
+	for i := range server.proxyPool {
+		proxies = append(proxies, AppProxyInfo{
+			Index: i,
+			Name:  fmt.Sprintf("SG%d", i+1),
+		})
+	}
+	json.NewEncoder(w).Encode(proxies)
+}
+
+type AppRegisterRequest struct {
+	Username   string `json:"username"`
+	ProxyIndex int    `json:"proxy_index"`
+}
+
+type AppRegisterResponse struct {
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	Username  string `json:"username"`
+	ProxyName string `json:"proxy_name"`
+}
+
+// handleAppRegisterAPI registers a device with username and proxy selection (no auth required)
+func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+
+	var req AppRegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid request"})
+		return
+	}
+
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
+		return
+	}
+
+	// Validate proxy index
+	server.poolMu.Lock()
+	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
+		server.poolMu.Unlock()
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid proxy selection"})
+		return
+	}
+	selectedProxy := server.proxyPool[req.ProxyIndex]
+	server.poolMu.Unlock()
+
+	proxyName := fmt.Sprintf("SG%d", req.ProxyIndex+1)
+
+	// Get client IP
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	// Check if device already exists with this username
+	server.mu.Lock()
+	existingDevice := server.findDeviceByUsername(username)
+	if existingDevice != nil {
+		// Update existing device
+		existingDevice.IP = clientIP
+		existingDevice.UpstreamProxy = selectedProxy
+		existingDevice.LastSeen = time.Now()
+		server.mu.Unlock()
+		go server.saveDeviceConfig(existingDevice)
+		log.Printf("📱 App: Device '%s' updated -> %s\n", username, proxyName)
+	} else {
+		// Create new device
+		device := &Device{
+			ID:            fmt.Sprintf("device-%s", username),
+			IP:            clientIP,
+			Username:      username,
+			Name:          username,
+			Group:         "Default",
+			UpstreamProxy: selectedProxy,
+			Status:        "active",
+			FirstSeen:     time.Now(),
+			LastSeen:      time.Now(),
+		}
+		server.devices[username] = device
+		server.mu.Unlock()
+		go server.saveDeviceConfig(device)
+		log.Printf("📱 App: New device '%s' registered -> %s\n", username, proxyName)
+		server.addLog("info", fmt.Sprintf("App: Device '%s' registered with %s", username, proxyName))
+	}
+
+	json.NewEncoder(w).Encode(AppRegisterResponse{
+		Success:   true,
+		Message:   "Device registered",
+		Username:  username,
+		ProxyName: proxyName,
+	})
 }
 
 func handleProxyHealthAPI(w http.ResponseWriter, r *http.Request) {
