@@ -185,10 +185,12 @@ type ProxyServer struct {
 	dashPort        int
 	bindAddr        string
 	allowIPFallback bool
+	authRequired    bool
 	persistentData  PersistentData
 	persistMu       sync.RWMutex
 	dataFile        string
 	sessions        map[string]*Session
+	appSessions     map[string]*Session
 	sessionMu       sync.RWMutex
 	startTime       time.Time
 	logBuffer       []LogEntry
@@ -293,6 +295,7 @@ func main() {
 	proxyPort := parseEnvInt("PROXY_PORT", 8888)
 	dashPort := parseEnvInt("DASHBOARD_PORT", 8080)
 	allowIPFallback := parseEnvBool("ALLOW_IP_FALLBACK", false)
+	authRequired := parseEnvBool("AUTH_REQUIRED", false)
 
 	server = &ProxyServer{
 		devices:         make(map[string]*Device),
@@ -302,8 +305,10 @@ func main() {
 		dashPort:        dashPort,
 		bindAddr:        bindAddr,
 		allowIPFallback: allowIPFallback,
+		authRequired:    authRequired,
 		dataFile:        "device_data.json",
 		sessions:        make(map[string]*Session),
+		appSessions:     make(map[string]*Session),
 		startTime:       time.Now(),
 		logBuffer:       make([]LogEntry, 0, 1000),
 		persistentData: PersistentData{
@@ -468,6 +473,36 @@ func (s *ProxyServer) validateSession(token string) (*Session, bool) {
 	return session, true
 }
 
+func (s *ProxyServer) createAppSession(username string) *Session {
+	bytes := make([]byte, 32)
+	rand.Read(bytes)
+	token := base64.URLEncoding.EncodeToString(bytes)
+	s.sessionMu.Lock()
+	s.appSessions[token] = &Session{
+		Token:     token,
+		Username:  username,
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Duration(s.persistentData.SystemSettings.SessionTimeout) * time.Hour),
+	}
+	s.sessionMu.Unlock()
+	return s.appSessions[token]
+}
+
+func (s *ProxyServer) validateAppSession(token, username string) (*Session, bool) {
+	s.sessionMu.RLock()
+	session, ok := s.appSessions[token]
+	s.sessionMu.RUnlock()
+	if !ok || time.Now().After(session.ExpiresAt) || session.Username != username {
+		if ok {
+			s.sessionMu.Lock()
+			delete(s.appSessions, token)
+			s.sessionMu.Unlock()
+		}
+		return nil, false
+	}
+	return session, true
+}
+
 func (s *ProxyServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("session_token")
@@ -490,6 +525,11 @@ func cleanupExpiredSessions() {
 		for token, session := range server.sessions {
 			if now.After(session.ExpiresAt) {
 				delete(server.sessions, token)
+			}
+		}
+		for token, session := range server.appSessions {
+			if now.After(session.ExpiresAt) {
+				delete(server.appSessions, token)
 			}
 		}
 		server.sessionMu.Unlock()
@@ -943,6 +983,12 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	case "/api/app/change-proxy":
 		handleAppChangeProxyAPI(w, r)
 		return
+	case "/api/app/authenticate":
+		handleAppAuthenticateAPI(w, r)
+		return
+	case "/api/app/whoami":
+		handleAppWhoAmI(w, r)
+		return
 	}
 
 	username := parseProxyUsername(r)
@@ -1131,6 +1177,8 @@ func startDashboard() {
 	http.HandleFunc("/api/app/proxies", handleAppProxiesAPI)
 	http.HandleFunc("/api/app/register", handleAppRegisterAPI)
 	http.HandleFunc("/api/app/change-proxy", handleAppChangeProxyAPI)
+	http.HandleFunc("/api/app/authenticate", handleAppAuthenticateAPI)
+	http.HandleFunc("/api/app/whoami", handleAppWhoAmI)
 
 	http.HandleFunc("/dashboard", server.requireAuth(handleDashboard))
 	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
@@ -1367,6 +1415,15 @@ func handleAppProxiesAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
+	username := strings.TrimSpace(r.Header.Get("X-App-Username"))
+	if username == "" {
+		username = strings.TrimSpace(r.URL.Query().Get("username"))
+	}
+
+	if !ensureAppAuth(w, r, username) {
+		return
+	}
+
 	server.poolMu.Lock()
 	defer server.poolMu.Unlock()
 
@@ -1385,11 +1442,61 @@ type AppRegisterRequest struct {
 	ProxyIndex int    `json:"proxy_index"`
 }
 
+type AppAuthRequest struct {
+	Username string `json:"username"`
+}
+
+type AppAuthResponse struct {
+	Success    bool   `json:"success"`
+	Message    string `json:"message"`
+	Token      string `json:"token,omitempty"`
+	Username   string `json:"username,omitempty"`
+	ProxyIndex int    `json:"proxy_index,omitempty"`
+	ProxyName  string `json:"proxy_name,omitempty"`
+}
+
 type AppRegisterResponse struct {
-	Success   bool   `json:"success"`
-	Message   string `json:"message"`
-	Username  string `json:"username"`
-	ProxyName string `json:"proxy_name"`
+	Success    bool   `json:"success"`
+	Message    string `json:"message"`
+	Username   string `json:"username"`
+	ProxyName  string `json:"proxy_name"`
+	ProxyIndex int    `json:"proxy_index,omitempty"`
+	Token      string `json:"token,omitempty"`
+}
+
+// ensureAppAuth enforces the optional pre-authentication gate for app calls
+func ensureAppAuth(w http.ResponseWriter, r *http.Request, username string) bool {
+	if !server.authRequired {
+		return true
+	}
+
+	if r.Method == http.MethodOptions {
+		return true
+	}
+
+	if strings.TrimSpace(username) == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Authentication required: send username"})
+		return false
+	}
+
+	token := strings.TrimSpace(r.Header.Get("X-App-Token"))
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	if token == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Authentication required"})
+		return false
+	}
+
+	if _, ok := server.validateAppSession(token, username); !ok {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Session expired, please authenticate"})
+		return false
+	}
+
+	return true
 }
 
 // handleAppRegisterAPI registers a device with username and proxy selection (no auth required)
@@ -1399,7 +1506,7 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
 		return
 	}
 
@@ -1417,6 +1524,14 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	username := strings.TrimSpace(req.Username)
 	if username == "" {
 		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
+		return
+	}
+
+	if !ensureAppAuth(w, r, username) {
+		return
+	}
+
+	if !ensureAppAuth(w, r, username) {
 		return
 	}
 
@@ -1467,10 +1582,204 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(AppRegisterResponse{
-		Success:   true,
-		Message:   "Device registered",
-		Username:  username,
-		ProxyName: proxyName,
+		Success:    true,
+		Message:    "Device registered",
+		Username:   username,
+		ProxyName:  proxyName,
+		ProxyIndex: req.ProxyIndex,
+	})
+}
+
+// handleAppChangeProxyAPI updates a device's proxy selection (no auth required)
+func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+
+	var req AppRegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid request"})
+		return
+	}
+
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
+		return
+	}
+
+	server.poolMu.Lock()
+	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
+		server.poolMu.Unlock()
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid proxy selection"})
+		return
+	}
+	selectedProxy := server.proxyPool[req.ProxyIndex]
+	server.poolMu.Unlock()
+
+	proxyName := fmt.Sprintf("SG%d", req.ProxyIndex+1)
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	server.mu.Lock()
+	device := server.findDeviceByUsername(username)
+	if device == nil {
+		device = &Device{
+			ID:            fmt.Sprintf("device-%s", username),
+			IP:            clientIP,
+			Username:      username,
+			Name:          username,
+			Group:         "Default",
+			UpstreamProxy: selectedProxy,
+			Status:        "active",
+			FirstSeen:     time.Now(),
+			LastSeen:      time.Now(),
+		}
+		server.devices[username] = device
+	} else {
+		device.IP = clientIP
+		device.UpstreamProxy = selectedProxy
+		device.LastSeen = time.Now()
+	}
+	server.mu.Unlock()
+
+	go server.saveDeviceConfig(device)
+	server.addLog("info", fmt.Sprintf("App: Device '%s' switched to %s", username, proxyName))
+
+	json.NewEncoder(w).Encode(AppRegisterResponse{
+		Success:    true,
+		Message:    "Proxy updated",
+		Username:   username,
+		ProxyName:  proxyName,
+		ProxyIndex: req.ProxyIndex,
+	})
+}
+
+// handleAppAuthenticateAPI issues a short-lived session token keyed by username
+func handleAppAuthenticateAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+
+	var req AppAuthRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Invalid request"})
+		return
+	}
+
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Username required"})
+		return
+	}
+
+	server.poolMu.Lock()
+	if len(server.proxyPool) == 0 {
+		server.poolMu.Unlock()
+		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "No upstream proxies configured"})
+		return
+	}
+	server.poolMu.Unlock()
+
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	server.persistMu.RLock()
+	cfg, hasCfg := server.persistentData.DeviceConfigs[username]
+	server.persistMu.RUnlock()
+
+	proxyIndex := 0
+	if hasCfg && cfg.ProxyIndex >= 0 {
+		proxyIndex = cfg.ProxyIndex
+	}
+
+	server.poolMu.Lock()
+	if proxyIndex >= len(server.proxyPool) {
+		proxyIndex = 0
+	}
+	selectedProxy := server.proxyPool[proxyIndex]
+	proxyName := fmt.Sprintf("SG%d", proxyIndex+1)
+	server.poolMu.Unlock()
+
+	server.mu.Lock()
+	device := server.findDeviceByUsername(username)
+	if device == nil {
+		device = &Device{
+			ID:            fmt.Sprintf("device-%s", username),
+			IP:            clientIP,
+			Username:      username,
+			Name:          username,
+			Group:         "Default",
+			UpstreamProxy: selectedProxy,
+			Status:        "active",
+			FirstSeen:     time.Now(),
+			LastSeen:      time.Now(),
+		}
+		server.devices[username] = device
+	} else {
+		device.IP = clientIP
+		if device.UpstreamProxy == "" {
+			device.UpstreamProxy = selectedProxy
+		}
+		device.LastSeen = time.Now()
+	}
+	server.mu.Unlock()
+
+	go server.saveDeviceConfig(device)
+	session := server.createAppSession(username)
+
+	json.NewEncoder(w).Encode(AppAuthResponse{
+		Success:    true,
+		Message:    "Authenticated",
+		Token:      session.Token,
+		Username:   username,
+		ProxyIndex: proxyIndex,
+		ProxyName:  proxyName,
+	})
+}
+
+// handleAppWhoAmI reports the observed client IP (and optionally country)
+func handleAppWhoAmI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
+		return
+	}
+
+	username := strings.TrimSpace(r.Header.Get("X-App-Username"))
+	if username == "" {
+		username = strings.TrimSpace(r.URL.Query().Get("username"))
+	}
+
+	if !ensureAppAuth(w, r, username) {
+		return
+	}
+
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+	json.NewEncoder(w).Encode(map[string]string{
+		"ip":      clientIP,
+		"country": "",
 	})
 }
 

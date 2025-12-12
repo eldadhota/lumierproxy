@@ -24,6 +24,8 @@ Once `Test-NetConnection` succeeds on your server, configure the Android device 
    - The app API endpoints also respond on the proxy listener (8888) so even if the dashboard port is blocked, the **Refresh proxies** / **Register** buttons can still reach the server without timing out.
    - When you register a username and proxy, the server saves that pairing by **username**. Devices that reconnect with the same username keep the same profile/proxy even if their IP changes. IP-only fallback is disabled by default; set `ALLOW_IP_FALLBACK=true` if you want the old behavior of matching by IP when no username is sent.
    - Use the new **Change Proxy** button in the Android app (or `POST /api/app/change-proxy` with `username` and `proxy_index`) to switch a device to another upstream proxy without deleting/re-registering it.
+   - To force in-app authentication before any calls, set `AUTH_REQUIRED=true`. The app will first hit `/api/app/authenticate` to obtain a short-lived token (stored on the device) and will reuse the same profile/proxy on reconnects. Tokens expire based on `session_timeout_hours`.
+   - The app can show the proxy-presented public IP via the **Check IP** button (`GET /api/app/whoami`), which returns the server-observed IP and optional country when enabled server-side.
 
 If the app still fails, verify that:
 - Windows Defender Firewall (or any upstream firewall/router) allows inbound TCP on port 8888 to the Go server.
