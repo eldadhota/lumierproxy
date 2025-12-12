@@ -66,7 +66,7 @@ class MainActivity : AppCompatActivity() {
     private fun loadSavedSettings() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         etServerIp.setText(prefs.getString(KEY_SERVER_IP, "192.168.50.60"))
-        etServerPort.setText(prefs.getString(KEY_SERVER_PORT, "8888"))
+        etServerPort.setText(prefs.getString(KEY_SERVER_PORT, "8080"))
         etUsername.setText(prefs.getString(KEY_USERNAME, ""))
     }
 
@@ -82,7 +82,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun getServerUrl(): String {
         val ip = etServerIp.text.toString().trim()
-        val port = etServerPort.text.toString().trim().ifEmpty { "8081" }
+        val port = etServerPort.text.toString().trim().ifEmpty { "8080" }
         return "http://$ip:$port"
     }
 
