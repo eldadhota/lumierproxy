@@ -16,6 +16,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -182,6 +183,7 @@ type ProxyServer struct {
 	poolMu         sync.Mutex
 	proxyPort      int
 	dashPort       int
+	bindAddr       string
 	persistentData PersistentData
 	persistMu      sync.RWMutex
 	dataFile       string
@@ -282,12 +284,21 @@ func main() {
 	log.Println("    Enterprise Edition v3.0")
 	log.Println("===========================================")
 
+	bindAddr := strings.TrimSpace(os.Getenv("BIND_ADDR"))
+	if bindAddr == "" {
+		bindAddr = "0.0.0.0"
+	}
+
+	proxyPort := parseEnvInt("PROXY_PORT", 8888)
+	dashPort := parseEnvInt("DASHBOARD_PORT", 8080)
+
 	server = &ProxyServer{
 		devices:     make(map[string]*Device),
 		proxyPool:   loadProxyPool(),
 		proxyHealth: make(map[int]*ProxyHealth),
-		proxyPort:   8888,
-		dashPort:    8080,
+		proxyPort:   proxyPort,
+		dashPort:    dashPort,
+		bindAddr:    bindAddr,
 		dataFile:    "device_data.json",
 		sessions:    make(map[string]*Session),
 		startTime:   time.Now(),
@@ -333,7 +344,7 @@ func main() {
 	log.Println("🔐 Default login: admin / admin123")
 	log.Printf("📱 Phone setup: Proxy %s:%d\n", serverIP, server.proxyPort)
 
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", server.proxyPort), http.HandlerFunc(handleProxy)); err != nil {
+	if err := http.ListenAndServe(fmt.Sprintf("%s:%d", server.bindAddr, server.proxyPort), http.HandlerFunc(handleProxy)); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -909,6 +920,20 @@ func (s *ProxyServer) saveDeviceConfig(device *Device) {
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
 	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	// Allow the mobile app to hit its API on the proxy port (e.g., if the user
+	// enters 8888 instead of the dashboard port). This avoids forwarding the
+	// app's own control calls through an upstream proxy, which would hang or
+	// fail.
+	switch r.URL.Path {
+	case "/api/app/proxies":
+		handleAppProxiesAPI(w, r)
+		return
+	case "/api/app/register":
+		handleAppRegisterAPI(w, r)
+		return
+	}
+
 	username := parseProxyUsername(r)
 	device := server.getOrCreateDevice(clientIP, username)
 	device.RequestCount++
@@ -1080,6 +1105,7 @@ func cleanupInactiveDevices() {
 		server.mu.Unlock()
 	}
 }
+
 // ============================================================================
 // DASHBOARD SERVER
 // ============================================================================
@@ -1121,7 +1147,25 @@ func startDashboard() {
 	http.HandleFunc("/api/logs", server.requireAuth(handleLogsAPI))
 
 	log.Printf("📊 Dashboard on port %d\n", server.dashPort)
-	http.ListenAndServe(fmt.Sprintf(":%d", server.dashPort), nil)
+	addr := fmt.Sprintf("%s:%d", server.bindAddr, server.dashPort)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatalf("failed to start dashboard on %s: %v", addr, err)
+	}
+}
+
+func parseEnvInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		log.Printf("⚠️  Invalid %s value '%s', using default %d\n", key, value, fallback)
+		return fallback
+	}
+
+	return parsed
 }
 
 func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
@@ -1865,6 +1909,7 @@ func handleExportAPI(w http.ResponseWriter, r *http.Request) {
 		"proxy_health": healthData,
 	})
 }
+
 // ============================================================================
 // HTML PAGE HANDLERS AND TEMPLATES
 // ============================================================================
