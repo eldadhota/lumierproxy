@@ -1783,6 +1783,79 @@ func handleAppWhoAmI(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAppChangeProxyAPI updates a device's proxy selection (no auth required)
+func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+
+	var req AppRegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid request"})
+		return
+	}
+
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
+		return
+	}
+
+	server.poolMu.Lock()
+	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
+		server.poolMu.Unlock()
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid proxy selection"})
+		return
+	}
+	selectedProxy := server.proxyPool[req.ProxyIndex]
+	server.poolMu.Unlock()
+
+	proxyName := fmt.Sprintf("SG%d", req.ProxyIndex+1)
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	server.mu.Lock()
+	device := server.findDeviceByUsername(username)
+	if device == nil {
+		device = &Device{
+			ID:            fmt.Sprintf("device-%s", username),
+			IP:            clientIP,
+			Username:      username,
+			Name:          username,
+			Group:         "Default",
+			UpstreamProxy: selectedProxy,
+			Status:        "active",
+			FirstSeen:     time.Now(),
+			LastSeen:      time.Now(),
+		}
+		server.devices[username] = device
+	} else {
+		device.IP = clientIP
+		device.UpstreamProxy = selectedProxy
+		device.LastSeen = time.Now()
+	}
+	server.mu.Unlock()
+
+	go server.saveDeviceConfig(device)
+	server.addLog("info", fmt.Sprintf("App: Device '%s' switched to %s", username, proxyName))
+
+	json.NewEncoder(w).Encode(AppRegisterResponse{
+		Success:   true,
+		Message:   "Proxy updated",
+		Username:  username,
+		ProxyName: proxyName,
+	})
+}
+
 func handleProxyHealthAPI(w http.ResponseWriter, r *http.Request) {
 	server.healthMu.RLock()
 	healthData := make([]*ProxyHealth, 0)
