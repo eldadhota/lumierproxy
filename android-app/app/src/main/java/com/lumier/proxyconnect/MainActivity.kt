@@ -32,6 +32,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var spinnerProxy: Spinner
     private lateinit var btnRefresh: Button
     private lateinit var btnRegister: Button
+    private lateinit var btnChangeProxy: Button
     private lateinit var tvStatus: TextView
 
     private val proxyList = mutableListOf<ProxyItem>()
@@ -50,12 +51,14 @@ class MainActivity : AppCompatActivity() {
         spinnerProxy = findViewById(R.id.spinnerProxy)
         btnRefresh = findViewById(R.id.btnRefresh)
         btnRegister = findViewById(R.id.btnRegister)
+        btnChangeProxy = findViewById(R.id.btnChangeProxy)
         tvStatus = findViewById(R.id.tvStatus)
 
         loadSavedSettings()
 
         btnRefresh.setOnClickListener { fetchProxies() }
         btnRegister.setOnClickListener { registerDevice() }
+        btnChangeProxy.setOnClickListener { changeProxy() }
 
         // Auto-fetch proxies if server is configured
         if (etServerIp.text.isNotEmpty()) {
@@ -218,6 +221,79 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 runOnUiThread {
                     btnRegister.isEnabled = true
+                    tvStatus.text = "Error: ${e.message?.take(40)}"
+                    tvStatus.setTextColor(getColor(R.color.status_disconnected))
+                }
+            }
+        }.start()
+    }
+
+    private fun changeProxy() {
+        val serverIp = etServerIp.text.toString().trim()
+        val username = etUsername.text.toString().trim()
+
+        if (serverIp.isEmpty()) {
+            Toast.makeText(this, "Enter server IP", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (username.isEmpty()) {
+            Toast.makeText(this, "Enter username", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (proxyList.isEmpty()) {
+            Toast.makeText(this, "Fetch proxies first", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val selectedProxy = spinnerProxy.selectedItem as? ProxyItem
+        if (selectedProxy == null) {
+            Toast.makeText(this, "Select a proxy", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        saveSettings()
+
+        tvStatus.text = "Updating proxy..."
+        tvStatus.setTextColor(getColor(R.color.text_secondary))
+        btnChangeProxy.isEnabled = false
+
+        Thread {
+            try {
+                val url = URL("${getServerUrl()}/api/app/change-proxy")
+                val connection = url.openConnection() as HttpURLConnection
+                connection.connectTimeout = 10000
+                connection.readTimeout = 10000
+                connection.requestMethod = "POST"
+                connection.setRequestProperty("Content-Type", "application/json")
+                connection.doOutput = true
+
+                val json = JSONObject().apply {
+                    put("username", username)
+                    put("proxy_index", selectedProxy.index)
+                }
+
+                connection.outputStream.bufferedWriter().use { it.write(json.toString()) }
+
+                val response = connection.inputStream.bufferedReader().use(BufferedReader::readText)
+                val result = JSONObject(response)
+                connection.disconnect()
+
+                runOnUiThread {
+                    btnChangeProxy.isEnabled = true
+                    if (result.optBoolean("success", false)) {
+                        val proxyName = result.optString("proxy_name", selectedProxy.name)
+                        tvStatus.text = "Proxy updated: $username -> $proxyName"
+                        tvStatus.setTextColor(getColor(R.color.status_connected))
+                        Toast.makeText(this, "Proxy changed!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        val message = result.optString("message", "Update failed")
+                        tvStatus.text = "Error: $message"
+                        tvStatus.setTextColor(getColor(R.color.status_disconnected))
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    btnChangeProxy.isEnabled = true
                     tvStatus.text = "Error: ${e.message?.take(40)}"
                     tvStatus.setTextColor(getColor(R.color.status_disconnected))
                 }

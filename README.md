@@ -22,6 +22,8 @@ Once `Test-NetConnection` succeeds on your server, configure the Android device 
    - **Type:** HTTP (Android forwards both HTTP/HTTPS through it)
 3. Open the Lumier Android app and tap **Refresh proxies**. It should now connect through the server on 8888 to reach your upstream SOCKS5 proxies.
    - The app API endpoints also respond on the proxy listener (8888) so even if the dashboard port is blocked, the **Refresh proxies** / **Register** buttons can still reach the server without timing out.
+   - When you register a username and proxy, the server saves that pairing by **username and IP**. If the device later connects without proxy-auth headers, it is still matched back to the saved username profile and receives the same proxy.
+   - Use the new **Change Proxy** button in the Android app (or `POST /api/app/change-proxy` with `username` and `proxy_index`) to switch a device to another upstream proxy without deleting/re-registering it.
 
 If the app still fails, verify that:
 - Windows Defender Firewall (or any upstream firewall/router) allows inbound TCP on port 8888 to the Go server.

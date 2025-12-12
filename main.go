@@ -798,6 +798,17 @@ func (s *ProxyServer) getNextProxy() string {
 }
 
 func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Device {
+	// If the client didn't send proxy auth, try to recover the username from
+	// the last saved config for this IP so the device stays tied to its
+	// profile.
+	if username == "" {
+		s.persistMu.RLock()
+		if cfg, ok := s.persistentData.DeviceConfigs[clientIP]; ok && cfg.Username != "" {
+			username = cfg.Username
+		}
+		s.persistMu.RUnlock()
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -816,10 +827,11 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 		}
 	}
 
-	// For anonymous requests (no username), only match anonymous devices
-	// Registered devices require the username header to be recognized
+	// For requests without username, try to match any existing device by
+	// IP (regardless of whether it has a username) before creating an
+	// anonymous entry.
 	if username == "" {
-		if device := s.findAnonymousDeviceByIP(clientIP); device != nil {
+		if device := s.findDeviceByIP(clientIP); device != nil {
 			device.LastSeen = time.Now()
 			return device
 		}
@@ -892,12 +904,6 @@ func (s *ProxyServer) saveDeviceConfig(device *Device) {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
 
-	// Determine the config key (username if set, otherwise IP)
-	configKey := device.IP
-	if device.Username != "" {
-		configKey = device.Username
-	}
-
 	// Find proxy index
 	proxyIndex := 0
 	for i, p := range s.proxyPool {
@@ -906,14 +912,20 @@ func (s *ProxyServer) saveDeviceConfig(device *Device) {
 			break
 		}
 	}
-
-	s.persistentData.DeviceConfigs[configKey] = DeviceConfig{
+	cfg := DeviceConfig{
 		Username:   device.Username,
 		CustomName: device.CustomName,
 		Group:      device.Group,
 		Notes:      device.Notes,
 		ProxyIndex: proxyIndex,
 	}
+
+	// Save by username (if present) and IP so we can recover the username
+	// when the device connects without auth headers.
+	if device.Username != "" {
+		s.persistentData.DeviceConfigs[device.Username] = cfg
+	}
+	s.persistentData.DeviceConfigs[device.IP] = cfg
 
 	go s.savePersistentData()
 }
@@ -931,6 +943,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/api/app/register":
 		handleAppRegisterAPI(w, r)
+		return
+	case "/api/app/change-proxy":
+		handleAppChangeProxyAPI(w, r)
 		return
 	}
 
@@ -1119,6 +1134,7 @@ func startDashboard() {
 	// Public app API (no auth required)
 	http.HandleFunc("/api/app/proxies", handleAppProxiesAPI)
 	http.HandleFunc("/api/app/register", handleAppRegisterAPI)
+	http.HandleFunc("/api/app/change-proxy", handleAppChangeProxyAPI)
 
 	http.HandleFunc("/dashboard", server.requireAuth(handleDashboard))
 	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
@@ -1445,6 +1461,79 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAppChangeProxyAPI updates a device's proxy selection (no auth required)
+func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+
+	var req AppRegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid request"})
+		return
+	}
+
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
+		return
+	}
+
+	server.poolMu.Lock()
+	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
+		server.poolMu.Unlock()
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid proxy selection"})
+		return
+	}
+	selectedProxy := server.proxyPool[req.ProxyIndex]
+	server.poolMu.Unlock()
+
+	proxyName := fmt.Sprintf("SG%d", req.ProxyIndex+1)
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	server.mu.Lock()
+	device := server.findDeviceByUsername(username)
+	if device == nil {
+		device = &Device{
+			ID:            fmt.Sprintf("device-%s", username),
+			IP:            clientIP,
+			Username:      username,
+			Name:          username,
+			Group:         "Default",
+			UpstreamProxy: selectedProxy,
+			Status:        "active",
+			FirstSeen:     time.Now(),
+			LastSeen:      time.Now(),
+		}
+		server.devices[username] = device
+	} else {
+		device.IP = clientIP
+		device.UpstreamProxy = selectedProxy
+		device.LastSeen = time.Now()
+	}
+	server.mu.Unlock()
+
+	go server.saveDeviceConfig(device)
+	server.addLog("info", fmt.Sprintf("App: Device '%s' switched to %s", username, proxyName))
+
+	json.NewEncoder(w).Encode(AppRegisterResponse{
+		Success:   true,
+		Message:   "Proxy updated",
+		Username:  username,
+		ProxyName: proxyName,
+	})
+}
+
 func handleProxyHealthAPI(w http.ResponseWriter, r *http.Request) {
 	server.healthMu.RLock()
 	healthData := make([]*ProxyHealth, 0)
@@ -1497,18 +1586,7 @@ func handleChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 	device.LastSeen = time.Now()
 	server.mu.Unlock()
 
-	// Save config by Username if available, otherwise by IP
-	server.persistMu.Lock()
-	configKey := device.IP
-	if device.Username != "" {
-		configKey = device.Username
-	}
-	config := server.persistentData.DeviceConfigs[configKey]
-	config.Username = device.Username
-	config.ProxyIndex = req.ProxyIndex
-	server.persistentData.DeviceConfigs[configKey] = config
-	server.persistMu.Unlock()
-	go server.savePersistentData()
+	go server.saveDeviceConfig(device)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
@@ -1569,27 +1647,14 @@ func handleUpdateDeviceAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	server.mu.Unlock()
 
-	// Update persistent data
+	// Update persistent data for both username and IP
 	server.persistMu.Lock()
-	// Delete old config if username changed
 	if usernameChanged {
 		delete(server.persistentData.DeviceConfigs, oldKey)
 	}
-
-	// Save with new key
-	newConfigKey := device.IP
-	if device.Username != "" {
-		newConfigKey = device.Username
-	}
-	config := server.persistentData.DeviceConfigs[newConfigKey]
-	config.Username = device.Username
-	config.CustomName = req.CustomName
-	config.Group = req.Group
-	config.Notes = req.Notes
-	server.persistentData.DeviceConfigs[newConfigKey] = config
 	server.persistMu.Unlock()
 
-	go server.savePersistentData()
+	go server.saveDeviceConfig(device)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
 }
@@ -1620,23 +1685,12 @@ func handleBulkChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 		if device != nil {
 			device.UpstreamProxy = newProxy
 			updated++
-			// Save config by Username if available, otherwise by IP
-			configKey := device.IP
-			if device.Username != "" {
-				configKey = device.Username
-			}
 			server.mu.Unlock()
-			server.persistMu.Lock()
-			config := server.persistentData.DeviceConfigs[configKey]
-			config.Username = device.Username
-			config.ProxyIndex = req.ProxyIndex
-			server.persistentData.DeviceConfigs[configKey] = config
-			server.persistMu.Unlock()
+			go server.saveDeviceConfig(device)
 		} else {
 			server.mu.Unlock()
 		}
 	}
-	go server.savePersistentData()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "updated": updated})
 }
