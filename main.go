@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -297,6 +298,7 @@ func main() {
 	dashPort := parseEnvInt("DASHBOARD_PORT", 8080)
 	allowIPFallback := parseEnvBool("ALLOW_IP_FALLBACK", false)
 	authRequired := parseEnvBool("AUTH_REQUIRED", false)
+	requireRegister := parseEnvBool("REQUIRE_REGISTER", true) // Default: require app registration
 
 	server = &ProxyServer{
 		devices:         make(map[string]*Device),
@@ -307,6 +309,7 @@ func main() {
 		bindAddr:        bindAddr,
 		allowIPFallback: allowIPFallback,
 		authRequired:    authRequired,
+		requireRegister: requireRegister,
 		dataFile:        "device_data.json",
 		sessions:        make(map[string]*Session),
 		appSessions:     make(map[string]*Session),
@@ -720,6 +723,8 @@ func (s *ProxyServer) calculateProxyStatus(health *ProxyHealth) string {
 }
 
 func (s *ProxyServer) getProxyIndexByString(proxyStr string) int {
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
 	for i, p := range s.proxyPool {
 		if p == proxyStr {
 			return i
@@ -955,36 +960,48 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) (*Devi
 
 // saveDeviceConfig saves a device's config to persistent storage
 func (s *ProxyServer) saveDeviceConfig(device *Device) {
-	s.persistMu.Lock()
-	defer s.persistMu.Unlock()
+	// Read device fields under lock to avoid race conditions
+	s.mu.RLock()
+	upstreamProxy := device.UpstreamProxy
+	username := device.Username
+	customName := device.CustomName
+	group := device.Group
+	notes := device.Notes
+	deviceIP := device.IP
+	s.mu.RUnlock()
 
-	// Find proxy index
+	// Find proxy index under pool lock
+	s.poolMu.Lock()
 	proxyIndex := 0
 	for i, p := range s.proxyPool {
-		if p == device.UpstreamProxy {
+		if p == upstreamProxy {
 			proxyIndex = i
 			break
 		}
 	}
+	s.poolMu.Unlock()
+
 	cfg := DeviceConfig{
-		Username:   device.Username,
-		CustomName: device.CustomName,
-		Group:      device.Group,
-		Notes:      device.Notes,
+		Username:   username,
+		CustomName: customName,
+		Group:      group,
+		Notes:      notes,
 		ProxyIndex: proxyIndex,
 	}
 
+	s.persistMu.Lock()
 	// Persist profiles by username as the primary key. When IP-based
 	// fallback is enabled, also store the latest IP as an alias so that
 	// proxy requests that arrive without auth headers can still be bound
 	// to the correct username/profile instead of creating anonymous
 	// devices for the same phone.
-	if device.Username != "" {
-		s.persistentData.DeviceConfigs[device.Username] = cfg
-		if s.allowIPFallback && device.IP != "" {
-			s.persistentData.DeviceConfigs[device.IP] = cfg
+	if username != "" {
+		s.persistentData.DeviceConfigs[username] = cfg
+		if s.allowIPFallback && deviceIP != "" {
+			s.persistentData.DeviceConfigs[deviceIP] = cfg
 		}
 	}
+	s.persistMu.Unlock()
 
 	go s.savePersistentData()
 }
@@ -1020,7 +1037,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Registration required: please authenticate in the app", http.StatusProxyAuthRequired)
 		return
 	}
-	device.RequestCount++
+	atomic.AddInt64(&device.RequestCount, 1)
 
 	if r.Method == http.MethodConnect {
 		handleHTTPS(w, r, device)
@@ -1046,9 +1063,11 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device) {
 		}
 		// Only count as device error if it's not a proxy-side issue
 		if !isProxySideError(errMsg) {
-			device.ErrorCount++
+			atomic.AddInt64(&device.ErrorCount, 1)
+			server.mu.Lock()
 			device.LastError = errMsg
 			device.LastErrorTime = time.Now()
+			server.mu.Unlock()
 			server.addLog("error", fmt.Sprintf("HTTPS proxy error for %s: %s", device.IP, errMsg))
 		}
 		http.Error(w, "Failed to connect", http.StatusBadGateway)
@@ -1077,14 +1096,14 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device) {
 	go func() {
 		n, _ := io.Copy(targetConn, clientConn)
 		bytesOut = n
-		device.BytesOut += n
+		atomic.AddInt64(&device.BytesOut, n)
 		done <- true
 	}()
 
 	go func() {
 		n, _ := io.Copy(clientConn, targetConn)
 		bytesIn = n
-		device.BytesIn += n
+		atomic.AddInt64(&device.BytesIn, n)
 		done <- true
 	}()
 
@@ -1110,8 +1129,10 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
 			server.recordProxyFailure(proxyIndex, errMsg)
 		}
 		if !isProxySideError(errMsg) {
-			device.ErrorCount++
+			atomic.AddInt64(&device.ErrorCount, 1)
+			server.mu.Lock()
 			device.LastError = errMsg
+			server.mu.Unlock()
 		}
 		http.Error(w, "Failed to connect", http.StatusBadGateway)
 		return
@@ -1125,7 +1146,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
 			server.recordProxyFailure(proxyIndex, errMsg)
 		}
 		if !isProxySideError(errMsg) {
-			device.ErrorCount++
+			atomic.AddInt64(&device.ErrorCount, 1)
 		}
 		http.Error(w, "Failed to send request", http.StatusBadGateway)
 		return
@@ -1138,7 +1159,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
 			server.recordProxyFailure(proxyIndex, errMsg)
 		}
 		if !isProxySideError(errMsg) {
-			device.ErrorCount++
+			atomic.AddInt64(&device.ErrorCount, 1)
 		}
 		http.Error(w, "Failed to read response", http.StatusBadGateway)
 		return
@@ -1152,7 +1173,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	n, _ := io.Copy(w, resp.Body)
-	device.BytesIn += n
+	atomic.AddInt64(&device.BytesIn, n)
 
 	if proxyIndex >= 0 {
 		server.recordProxySuccess(proxyIndex, time.Since(startTime), n, 0)
@@ -1779,7 +1800,61 @@ func handleAppAuthenticateAPI(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleAppWhoAmI reports the observed client IP (and optionally country)
+// fetchPublicIPThroughProxy fetches the public IP by making a request through the SOCKS5 proxy
+func fetchPublicIPThroughProxy(proxyStr string) (string, error) {
+	if proxyStr == "" {
+		return "", fmt.Errorf("no proxy configured")
+	}
+
+	parts := strings.Split(proxyStr, ":")
+	if len(parts) < 4 {
+		return "", fmt.Errorf("invalid proxy format")
+	}
+
+	auth := &proxy.Auth{User: parts[2], Password: strings.Join(parts[3:], ":")}
+	dialer, err := proxy.SOCKS5("tcp", parts[0]+":"+parts[1], auth, &net.Dialer{Timeout: 10 * time.Second})
+	if err != nil {
+		return "", fmt.Errorf("failed to create SOCKS5 dialer: %v", err)
+	}
+
+	// Create HTTP client with SOCKS5 transport
+	transport := &http.Transport{
+		Dial: dialer.Dial,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   15 * time.Second,
+	}
+
+	// Try multiple IP check services
+	ipServices := []string{
+		"https://api.ipify.org",
+		"https://icanhazip.com",
+		"https://ifconfig.me/ip",
+	}
+
+	for _, service := range ipServices {
+		resp, err := client.Get(service)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			continue
+		}
+
+		ip := strings.TrimSpace(string(body))
+		if ip != "" && net.ParseIP(ip) != nil {
+			return ip, nil
+		}
+	}
+
+	return "", fmt.Errorf("failed to fetch public IP from all services")
+}
+
+// handleAppWhoAmI reports the public IP as seen through the device's assigned proxy
 func handleAppWhoAmI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1799,9 +1874,37 @@ func handleAppWhoAmI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+	// Look up the device to get its assigned proxy
+	server.mu.RLock()
+	device := server.findDeviceByUsername(username)
+	var proxyStr string
+	if device != nil {
+		proxyStr = device.UpstreamProxy
+	}
+	server.mu.RUnlock()
+
+	if proxyStr == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ip":      "",
+			"country": "",
+			"error":   "No proxy assigned - please register first",
+		})
+		return
+	}
+
+	// Fetch public IP through the proxy
+	publicIP, err := fetchPublicIPThroughProxy(proxyStr)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ip":      "",
+			"country": "",
+			"error":   fmt.Sprintf("Failed to check IP: %v", err),
+		})
+		return
+	}
+
 	json.NewEncoder(w).Encode(map[string]string{
-		"ip":      clientIP,
+		"ip":      publicIP,
 		"country": "",
 	})
 }
