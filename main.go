@@ -295,9 +295,8 @@ func main() {
 
 	proxyPort := parseEnvInt("PROXY_PORT", 8888)
 	dashPort := parseEnvInt("DASHBOARD_PORT", 8080)
-	allowIPFallback := parseEnvBool("ALLOW_IP_FALLBACK", true)
+	allowIPFallback := parseEnvBool("ALLOW_IP_FALLBACK", false)
 	authRequired := parseEnvBool("AUTH_REQUIRED", false)
-	requireRegister := parseEnvBool("REQUIRE_REGISTRATION", true)
 
 	server = &ProxyServer{
 		devices:         make(map[string]*Device),
@@ -308,7 +307,6 @@ func main() {
 		bindAddr:        bindAddr,
 		allowIPFallback: allowIPFallback,
 		authRequired:    authRequired,
-		requireRegister: requireRegister,
 		dataFile:        "device_data.json",
 		sessions:        make(map[string]*Session),
 		appSessions:     make(map[string]*Session),
