@@ -82,6 +82,7 @@ type DeviceConfig struct {
 	Group      string `json:"group"`
 	Notes      string `json:"notes"`
 	ProxyIndex int    `json:"proxy_index"`
+	LastIP     string `json:"last_ip,omitempty"` // Last known IP for IP-based device lookup
 }
 
 type UserCredentials struct {
@@ -330,6 +331,7 @@ func main() {
 	}
 
 	server.loadPersistentData()
+	server.restoreDevicesFromConfig() // Restore devices so IP-based lookup works after restart
 	server.initializeProxyHealth()
 
 	if len(server.persistentData.Users) == 0 {
@@ -558,6 +560,56 @@ func (s *ProxyServer) loadPersistentData() {
 	}
 	if s.persistentData.ProxyHealthData == nil {
 		s.persistentData.ProxyHealthData = make(map[int]*ProxyHealth)
+	}
+}
+
+// restoreDevicesFromConfig recreates device objects from saved configs so that
+// IP-based lookup works immediately after a server restart. Without this,
+// registered devices would be blocked until they re-register because the
+// in-memory devices map would be empty.
+func (s *ProxyServer) restoreDevicesFromConfig() {
+	s.persistMu.RLock()
+	defer s.persistMu.RUnlock()
+
+	count := 0
+	for username, cfg := range s.persistentData.DeviceConfigs {
+		// Skip IP-keyed entries (used for allowIPFallback mode)
+		if cfg.Username == "" || cfg.Username != username {
+			continue
+		}
+
+		// Determine upstream proxy
+		var upstreamProxy string
+		s.poolMu.Lock()
+		if cfg.ProxyIndex >= 0 && cfg.ProxyIndex < len(s.proxyPool) {
+			upstreamProxy = s.proxyPool[cfg.ProxyIndex]
+		} else if len(s.proxyPool) > 0 {
+			upstreamProxy = s.proxyPool[0]
+		}
+		s.poolMu.Unlock()
+
+		device := &Device{
+			ID:            fmt.Sprintf("device-%s", username),
+			IP:            cfg.LastIP, // Restore last known IP
+			Username:      username,
+			Name:          username,
+			CustomName:    cfg.CustomName,
+			Group:         cfg.Group,
+			Notes:         cfg.Notes,
+			UpstreamProxy: upstreamProxy,
+			Status:        "active",
+			FirstSeen:     time.Now(),
+			LastSeen:      time.Now(),
+		}
+
+		s.mu.Lock()
+		s.devices[username] = device
+		s.mu.Unlock()
+		count++
+	}
+
+	if count > 0 {
+		log.Printf("📱 Restored %d registered devices from config\n", count)
 	}
 }
 
@@ -857,9 +909,21 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) (*Devi
 		s.persistMu.RUnlock()
 	}
 
-	// If registration is required, deny requests that did not present a username
-	// and have no known mapping.
+	// When no username is provided (e.g., Android WiFi proxy which can't send
+	// Proxy-Authorization headers), look up if there's a registered device with
+	// this IP. This allows registered devices to use the proxy without needing
+	// to send credentials with every request.
 	if username == "" && s.requireRegister {
+		s.mu.RLock()
+		existingDevice := s.findDeviceByIP(clientIP)
+		if existingDevice != nil && existingDevice.Username != "" {
+			// Found a registered device with this IP - use it directly
+			existingDevice.LastSeen = time.Now()
+			s.mu.RUnlock()
+			return existingDevice, nil
+		}
+		s.mu.RUnlock()
+		// No registered device found for this IP
 		return nil, fmt.Errorf("registration required: no username presented")
 	}
 
@@ -987,6 +1051,7 @@ func (s *ProxyServer) saveDeviceConfig(device *Device) {
 		Group:      group,
 		Notes:      notes,
 		ProxyIndex: proxyIndex,
+		LastIP:     deviceIP,
 	}
 
 	s.persistMu.Lock()
