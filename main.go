@@ -1609,7 +1609,8 @@ func handleAppProxiesAPI(w http.ResponseWriter, r *http.Request) {
 type AppRegisterRequest struct {
 	Username   string `json:"username"`
 	ProxyIndex int    `json:"proxy_index"`
-	Password   string `json:"password,omitempty"` // Required for registration
+	Password   string `json:"password,omitempty"`   // Required for registration
+	Supervisor string `json:"supervisor,omitempty"` // Supervisor name for change-proxy logging
 }
 
 // Registration password - devices must provide this to register
@@ -1833,9 +1834,13 @@ func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 
 	go server.saveDeviceConfig(device)
 
-	// Log proxy change
-	log.Printf("📱 App: Device '%s' proxy changed: %s -> %s (IP: %s)\n", username, oldProxyName, proxyName, clientIP)
-	server.addLog("info", fmt.Sprintf("App: Device '%s' proxy changed: %s -> %s (IP: %s)", username, oldProxyName, proxyName, clientIP))
+	// Log proxy change with supervisor name if provided
+	supervisorInfo := ""
+	if req.Supervisor != "" {
+		supervisorInfo = fmt.Sprintf(" by Supervisor %s", req.Supervisor)
+	}
+	log.Printf("📱 App: Device '%s' proxy changed: %s -> %s%s (IP: %s)\n", username, oldProxyName, proxyName, supervisorInfo, clientIP)
+	server.addLog("info", fmt.Sprintf("App: Device '%s' proxy changed: %s -> %s%s (IP: %s)", username, oldProxyName, proxyName, supervisorInfo, clientIP))
 
 	json.NewEncoder(w).Encode(AppRegisterResponse{
 		Success:    true,

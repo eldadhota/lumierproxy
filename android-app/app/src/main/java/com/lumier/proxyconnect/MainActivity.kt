@@ -33,7 +33,14 @@ class MainActivity : AppCompatActivity() {
 
         // Passwords
         const val ADMIN_PASSWORD = "Drnda123"
-        const val SUPERVISOR_PASSWORD = "DobroJeMirko321a"
+
+        // Supervisor passwords - maps password to supervisor name for logging
+        val SUPERVISOR_PASSWORDS = mapOf(
+            "DobroJeMirko321a" to "Mirko",
+            "SupervisorAna123" to "Ana",
+            "SupervisorMarko456" to "Marko",
+            "SupervisorIvan789" to "Ivan"
+        )
     }
 
     private lateinit var etServerIp: EditText
@@ -99,16 +106,34 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyRolloutMode() {
         if (isRolloutMode) {
-            // Lock username and proxy selection in rollout mode
+            // Lock all settings in rollout mode - only Connect and Check IP available to users
+            etServerIp.isEnabled = false
+            etServerPort.isEnabled = false
             etUsername.isEnabled = false
             spinnerProxy.isEnabled = false
             btnRefresh.visibility = View.GONE
             tvStatus.text = "Rollout Mode - Settings locked"
             tvStatus.setTextColor(getColor(R.color.primary))
         } else {
+            etServerIp.isEnabled = true
+            etServerPort.isEnabled = true
             etUsername.isEnabled = true
             spinnerProxy.isEnabled = true
             btnRefresh.visibility = View.VISIBLE
+        }
+    }
+
+    private fun temporarilyUnlockForSupervisor() {
+        // Temporarily unlock proxy selection for supervisor to make changes
+        spinnerProxy.isEnabled = true
+        btnRefresh.visibility = View.VISIBLE
+    }
+
+    private fun relockAfterSupervisorChange() {
+        // Re-lock fields after supervisor makes changes (if in rollout mode)
+        if (isRolloutMode) {
+            spinnerProxy.isEnabled = false
+            btnRefresh.visibility = View.GONE
         }
     }
 
@@ -503,17 +528,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val selectedProxy = spinnerProxy.selectedItem as? ProxyItem
-        if (selectedProxy == null) {
-            Toast.makeText(this, "Select a proxy", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        // Show supervisor password dialog
-        showSupervisorPasswordDialog(username, selectedProxy)
+        // Show supervisor password dialog first
+        showSupervisorPasswordDialog(username)
     }
 
-    private fun showSupervisorPasswordDialog(username: String, selectedProxy: ProxyItem) {
+    private fun showSupervisorPasswordDialog(username: String) {
         val passwordInput = EditText(this).apply {
             hint = "Enter supervisor password"
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -522,25 +541,61 @@ class MainActivity : AppCompatActivity() {
 
         AlertDialog.Builder(this)
             .setTitle("Supervisor Access")
-            .setMessage("Enter supervisor password to change proxy")
+            .setMessage("Enter your supervisor password to change proxy settings")
             .setView(passwordInput)
-            .setPositiveButton("Change Proxy") { _, _ ->
+            .setPositiveButton("Authenticate") { _, _ ->
                 val password = passwordInput.text.toString()
                 if (password.isEmpty()) {
                     Toast.makeText(this, "Password is required", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
-                if (password != SUPERVISOR_PASSWORD) {
+
+                // Check if password matches any supervisor
+                val supervisorName = SUPERVISOR_PASSWORDS[password]
+                if (supervisorName == null) {
                     Toast.makeText(this, "Invalid supervisor password", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
-                performChangeProxy(username, selectedProxy)
+
+                // Supervisor authenticated - unlock fields and show proxy selection dialog
+                temporarilyUnlockForSupervisor()
+                Toast.makeText(this, "Welcome, $supervisorName!", Toast.LENGTH_SHORT).show()
+                showProxySelectionDialog(username, supervisorName)
             }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun performChangeProxy(username: String, selectedProxy: ProxyItem) {
+    private fun showProxySelectionDialog(username: String, supervisorName: String) {
+        // Create a dialog to select new proxy
+        val proxyNames = proxyList.map { it.name }.toTypedArray()
+        var selectedIndex = spinnerProxy.selectedItemPosition
+
+        AlertDialog.Builder(this)
+            .setTitle("Select New Proxy")
+            .setMessage("Supervisor: $supervisorName\nChanging proxy for: $username")
+            .setSingleChoiceItems(proxyNames, selectedIndex) { _, which ->
+                selectedIndex = which
+            }
+            .setPositiveButton("Change Proxy") { _, _ ->
+                if (selectedIndex >= 0 && selectedIndex < proxyList.size) {
+                    val selectedProxy = proxyList[selectedIndex]
+                    spinnerProxy.setSelection(selectedIndex)
+                    performChangeProxy(username, selectedProxy, supervisorName)
+                }
+            }
+            .setNegativeButton("Cancel") { _, _ ->
+                // Re-lock if cancelled
+                relockAfterSupervisorChange()
+            }
+            .setOnCancelListener {
+                // Re-lock if dismissed
+                relockAfterSupervisorChange()
+            }
+            .show()
+    }
+
+    private fun performChangeProxy(username: String, selectedProxy: ProxyItem, supervisorName: String) {
         saveSettings()
 
         tvStatus.text = "Updating proxy..."
@@ -563,6 +618,7 @@ class MainActivity : AppCompatActivity() {
                     val json = JSONObject().apply {
                         put("username", username)
                         put("proxy_index", selectedProxy.index)
+                        put("supervisor", supervisorName)  // Send supervisor name for logging
                     }
 
                     connection.outputStream.bufferedWriter().use { it.write(json.toString()) }
@@ -582,11 +638,12 @@ class MainActivity : AppCompatActivity() {
 
                     runOnUiThread {
                         btnChangeProxy.isEnabled = true
+                        relockAfterSupervisorChange()  // Re-lock after change
                         if (result.optBoolean("success", false)) {
                             val proxyName = result.optString("proxy_name", selectedProxy.name)
-                            tvStatus.text = "Proxy updated: $username -> $proxyName"
+                            tvStatus.text = "Proxy updated by $supervisorName: $username -> $proxyName"
                             tvStatus.setTextColor(getColor(R.color.status_connected))
-                            Toast.makeText(this, "Proxy changed!", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this, "Proxy changed by $supervisorName!", Toast.LENGTH_SHORT).show()
                             // Trigger IP check to verify the change
                             checkWhoAmI()
                         } else {
@@ -600,6 +657,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 runOnUiThread {
                     btnChangeProxy.isEnabled = true
+                    relockAfterSupervisorChange()
                     tvStatus.text = "Error: ${e.message?.take(40)}"
                     tvStatus.setTextColor(getColor(R.color.status_disconnected))
                 }
