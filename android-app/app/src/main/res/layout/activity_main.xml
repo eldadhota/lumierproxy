@@ -147,28 +147,42 @@
             android:textColorHint="@color/text_hint"
             android:layout_marginBottom="24dp" />
 
-        <!-- Register Button -->
+        <!-- Connect Button -->
+        <Button
+            android:id="@+id/btnConnect"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Connect"
+            android:textSize="18sp"
+            android:textColor="@android:color/white"
+            android:background="@drawable/button_connect"
+            android:padding="18dp" />
+
+        <!-- Register Button (Admin Only) -->
         <Button
             android:id="@+id/btnRegister"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Register Device"
-            android:textSize="16sp"
+            android:text="Register Device (Admin)"
+            android:textSize="14sp"
             android:textColor="@android:color/white"
-            android:background="@drawable/button_connect"
-            android:padding="16dp" />
+            android:background="@drawable/button_secondary"
+            android:padding="14dp"
+            android:layout_marginTop="12dp"
+            android:alpha="0.7" />
 
-        <!-- Change Proxy Button -->
+        <!-- Change Proxy Button (Supervisor Only) -->
         <Button
             android:id="@+id/btnChangeProxy"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Change Proxy"
-            android:textSize="16sp"
+            android:text="Change Proxy (Supervisor)"
+            android:textSize="14sp"
             android:textColor="@android:color/white"
-            android:background="@drawable/button_connect"
-            android:padding="16dp"
-            android:layout_marginTop="12dp" />
+            android:background="@drawable/button_secondary"
+            android:padding="14dp"
+            android:layout_marginTop="8dp"
+            android:alpha="0.7" />
 
         <!-- Check public IP -->
         <LinearLayout
