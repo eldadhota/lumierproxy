@@ -8,6 +8,7 @@ import android.widget.EditText
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.edit
 import org.json.JSONArray
@@ -295,6 +296,33 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // Show password dialog
+        showRegistrationPasswordDialog(username, selectedProxy)
+    }
+
+    private fun showRegistrationPasswordDialog(username: String, selectedProxy: ProxyItem) {
+        val passwordInput = EditText(this).apply {
+            hint = "Enter registration password"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Registration Password")
+            .setMessage("Enter the registration password to register this device")
+            .setView(passwordInput)
+            .setPositiveButton("Register") { _, _ ->
+                val password = passwordInput.text.toString()
+                if (password.isEmpty()) {
+                    Toast.makeText(this, "Password is required", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                performRegistration(username, selectedProxy, password)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun performRegistration(username: String, selectedProxy: ProxyItem, password: String) {
         saveSettings()
 
         tvStatus.text = "Registering..."
@@ -317,6 +345,7 @@ class MainActivity : AppCompatActivity() {
                     val json = JSONObject().apply {
                         put("username", username)
                         put("proxy_index", selectedProxy.index)
+                        put("password", password)
                     }
 
                     connection.outputStream.bufferedWriter().use { it.write(json.toString()) }
@@ -484,7 +513,9 @@ class MainActivity : AppCompatActivity() {
                         val result = JSONObject(response)
                         val ip = result.optString("ip", "?")
                         val country = result.optString("country", "")
-                        val display = if (country.isNotEmpty()) "$ip ($country)" else ip
+                        val city = result.optString("city", "")
+                        val location = listOf(city, country).filter { it.isNotEmpty() }.joinToString(", ")
+                        val display = if (location.isNotEmpty()) "$ip ($location)" else ip
                         runOnUiThread { tvWhoAmI.text = display }
                     } else {
                         val message = try {

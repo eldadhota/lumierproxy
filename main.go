@@ -1553,7 +1553,11 @@ func handleAppProxiesAPI(w http.ResponseWriter, r *http.Request) {
 type AppRegisterRequest struct {
 	Username   string `json:"username"`
 	ProxyIndex int    `json:"proxy_index"`
+	Password   string `json:"password,omitempty"` // Required for registration
 }
+
+// Registration password - devices must provide this to register
+const registrationPassword = "Drnda123"
 
 type AppAuthRequest struct {
 	Username string `json:"username"`
@@ -1612,7 +1616,7 @@ func ensureAppAuth(w http.ResponseWriter, r *http.Request, username string) bool
 	return true
 }
 
-// handleAppRegisterAPI registers a device with username and proxy selection (no auth required)
+// handleAppRegisterAPI registers a device with username and proxy selection (password protected)
 func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1637,6 +1641,15 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	username := strings.TrimSpace(req.Username)
 	if username == "" {
 		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
+		return
+	}
+
+	// Validate registration password
+	if req.Password != registrationPassword {
+		clientIP := strings.Split(r.RemoteAddr, ":")[0]
+		log.Printf("⚠️ App: Registration denied - invalid password for username '%s' (IP: %s)\n", username, clientIP)
+		server.addLog("warning", fmt.Sprintf("App: Registration denied - invalid password for '%s' (IP: %s)", username, clientIP))
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid registration password"})
 		return
 	}
 
@@ -1699,7 +1712,7 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleAppChangeProxyAPI updates a device's proxy selection (no auth required)
+// handleAppChangeProxyAPI updates a device's proxy selection (only for existing registered devices)
 func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1739,30 +1752,34 @@ func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 	proxyName := fmt.Sprintf("SG%d", req.ProxyIndex+1)
 	clientIP := strings.Split(r.RemoteAddr, ":")[0]
 
+	// Only allow changing proxy for existing registered devices
 	server.mu.Lock()
 	device := server.findDeviceByUsername(username)
 	if device == nil {
-		device = &Device{
-			ID:            fmt.Sprintf("device-%s", username),
-			IP:            clientIP,
-			Username:      username,
-			Name:          username,
-			Group:         "Default",
-			UpstreamProxy: selectedProxy,
-			Status:        "active",
-			FirstSeen:     time.Now(),
-			LastSeen:      time.Now(),
-		}
-		server.devices[username] = device
-	} else {
-		device.IP = clientIP
-		device.UpstreamProxy = selectedProxy
-		device.LastSeen = time.Now()
+		server.mu.Unlock()
+		log.Printf("⚠️ App: Change proxy failed - username '%s' not registered\n", username)
+		server.addLog("warning", fmt.Sprintf("App: Change proxy denied - username '%s' not registered (IP: %s)", username, clientIP))
+		json.NewEncoder(w).Encode(AppRegisterResponse{
+			Success: false,
+			Message: "Username not registered. Please register first using the Register button.",
+		})
+		return
 	}
+
+	// Log the proxy change with old and new proxy info
+	oldProxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
+	oldProxyName := fmt.Sprintf("SG%d", oldProxyIndex+1)
+
+	device.IP = clientIP
+	device.UpstreamProxy = selectedProxy
+	device.LastSeen = time.Now()
 	server.mu.Unlock()
 
 	go server.saveDeviceConfig(device)
-	server.addLog("info", fmt.Sprintf("App: Device '%s' switched to %s", username, proxyName))
+
+	// Log proxy change
+	log.Printf("📱 App: Device '%s' proxy changed: %s -> %s (IP: %s)\n", username, oldProxyName, proxyName, clientIP)
+	server.addLog("info", fmt.Sprintf("App: Device '%s' proxy changed: %s -> %s (IP: %s)", username, oldProxyName, proxyName, clientIP))
 
 	json.NewEncoder(w).Encode(AppRegisterResponse{
 		Success:    true,
@@ -1919,6 +1936,99 @@ func fetchPublicIPThroughProxy(proxyStr string) (string, error) {
 	return "", fmt.Errorf("failed to fetch public IP from all services")
 }
 
+// fetchPublicIPAndGeoThroughProxy fetches the public IP and geolocation through the SOCKS5 proxy
+func fetchPublicIPAndGeoThroughProxy(proxyStr string) (ip, country, city string, err error) {
+	if proxyStr == "" {
+		return "", "", "", fmt.Errorf("no proxy configured")
+	}
+
+	parts := strings.Split(proxyStr, ":")
+	if len(parts) < 4 {
+		return "", "", "", fmt.Errorf("invalid proxy format")
+	}
+
+	auth := &proxy.Auth{User: parts[2], Password: strings.Join(parts[3:], ":")}
+	dialer, err := proxy.SOCKS5("tcp", parts[0]+":"+parts[1], auth, &net.Dialer{Timeout: 10 * time.Second})
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to create SOCKS5 dialer: %v", err)
+	}
+
+	transport := &http.Transport{Dial: dialer.Dial}
+	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
+
+	// Try ip-api.com first for IP + geolocation in one request
+	resp, err := client.Get("http://ip-api.com/json/?fields=status,message,country,city,query")
+	if err == nil {
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err == nil {
+			var result struct {
+				Status  string `json:"status"`
+				Message string `json:"message"`
+				Country string `json:"country"`
+				City    string `json:"city"`
+				Query   string `json:"query"` // This is the IP
+			}
+			if json.Unmarshal(body, &result) == nil && result.Status == "success" {
+				return result.Query, result.Country, result.City, nil
+			}
+		}
+	}
+
+	// Fallback: get IP from simple services, then lookup geo separately
+	ipServices := []string{
+		"https://api.ipify.org",
+		"https://icanhazip.com",
+		"https://ifconfig.me/ip",
+	}
+
+	for _, service := range ipServices {
+		resp, err := client.Get(service)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			continue
+		}
+
+		fetchedIP := strings.TrimSpace(string(body))
+		if fetchedIP != "" && net.ParseIP(fetchedIP) != nil {
+			// Try to get geolocation for this IP
+			geoCountry, geoCity := fetchGeoForIP(client, fetchedIP)
+			return fetchedIP, geoCountry, geoCity, nil
+		}
+	}
+
+	return "", "", "", fmt.Errorf("failed to fetch public IP from all services")
+}
+
+// fetchGeoForIP looks up geolocation for an IP address
+func fetchGeoForIP(client *http.Client, ip string) (country, city string) {
+	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=status,country,city", ip))
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", ""
+	}
+
+	var result struct {
+		Status  string `json:"status"`
+		Country string `json:"country"`
+		City    string `json:"city"`
+	}
+	if json.Unmarshal(body, &result) == nil && result.Status == "success" {
+		return result.Country, result.City
+	}
+	return "", ""
+}
+
 // handleAppWhoAmI reports the public IP as seen through the device's assigned proxy
 func handleAppWhoAmI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1957,12 +2067,13 @@ func handleAppWhoAmI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch public IP through the proxy
-	publicIP, err := fetchPublicIPThroughProxy(proxyStr)
+	// Fetch public IP and geolocation through the proxy
+	publicIP, country, city, err := fetchPublicIPAndGeoThroughProxy(proxyStr)
 	if err != nil {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"ip":      "",
 			"country": "",
+			"city":    "",
 			"error":   fmt.Sprintf("Failed to check IP: %v", err),
 		})
 		return
@@ -1970,7 +2081,8 @@ func handleAppWhoAmI(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(map[string]string{
 		"ip":      publicIP,
-		"country": "",
+		"country": country,
+		"city":    city,
 	})
 }
 
