@@ -8,6 +8,7 @@ import android.widget.EditText
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.edit
 import org.json.JSONArray
@@ -295,6 +296,33 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // Show password dialog
+        showRegistrationPasswordDialog(username, selectedProxy)
+    }
+
+    private fun showRegistrationPasswordDialog(username: String, selectedProxy: ProxyItem) {
+        val passwordInput = EditText(this).apply {
+            hint = "Enter registration password"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Registration Password")
+            .setMessage("Enter the registration password to register this device")
+            .setView(passwordInput)
+            .setPositiveButton("Register") { _, _ ->
+                val password = passwordInput.text.toString()
+                if (password.isEmpty()) {
+                    Toast.makeText(this, "Password is required", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                performRegistration(username, selectedProxy, password)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun performRegistration(username: String, selectedProxy: ProxyItem, password: String) {
         saveSettings()
 
         tvStatus.text = "Registering..."
@@ -317,6 +345,7 @@ class MainActivity : AppCompatActivity() {
                     val json = JSONObject().apply {
                         put("username", username)
                         put("proxy_index", selectedProxy.index)
+                        put("password", password)
                     }
 
                     connection.outputStream.bufferedWriter().use { it.write(json.toString()) }
@@ -447,59 +476,100 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkWhoAmI() {
-        val serverIp = etServerIp.text.toString().trim()
-        val username = etUsername.text.toString().trim()
-        if (serverIp.isEmpty()) {
-            Toast.makeText(this, "Enter server IP", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (username.isEmpty()) {
-            Toast.makeText(this, "Enter username", Toast.LENGTH_SHORT).show()
-            return
-        }
+        tvWhoAmI.text = "Checking IP..."
+        tvWhoAmI.setTextColor(getColor(R.color.text_secondary))
 
-        tvWhoAmI.text = "Checking..."
         Thread {
             try {
-                var attemptedAuth = false
-                while (true) {
-                    val url = URL("${getServerUrl()}/api/app/whoami")
-                    val connection = url.openConnection() as HttpURLConnection
-                    connection.connectTimeout = 10000
-                    connection.readTimeout = 10000
-                    connection.requestMethod = "GET"
-                    addAppHeaders(connection, username)
+                // Step 1: Get public IP directly from external service (device's actual IP)
+                val ipApiUrl = URL("http://ip-api.com/json/?fields=status,query,country,city")
+                val ipConnection = ipApiUrl.openConnection() as HttpURLConnection
+                ipConnection.connectTimeout = 15000
+                ipConnection.readTimeout = 15000
+                ipConnection.requestMethod = "GET"
 
-                    val responseCode = connection.responseCode
-                    val response = readResponse(connection)
+                val ipResponse = readResponse(ipConnection)
+                ipConnection.disconnect()
 
-                    if (responseCode == 401 && !attemptedAuth) {
-                        attemptedAuth = true
-                        if (authenticate()) {
-                            continue
-                        }
+                val ipResult = JSONObject(ipResponse)
+                if (ipResult.optString("status") != "success") {
+                    runOnUiThread {
+                        tvWhoAmI.text = "Failed to check IP"
+                        tvWhoAmI.setTextColor(getColor(R.color.status_disconnected))
                     }
-
-                    if (responseCode == 200) {
-                        val result = JSONObject(response)
-                        val ip = result.optString("ip", "?")
-                        val country = result.optString("country", "")
-                        val display = if (country.isNotEmpty()) "$ip ($country)" else ip
-                        runOnUiThread { tvWhoAmI.text = display }
-                    } else {
-                        val message = try {
-                            JSONObject(response).optString("message", "Error $responseCode")
-                        } catch (e: Exception) {
-                            "Error $responseCode"
-                        }
-                        runOnUiThread { tvWhoAmI.text = message }
-                    }
-                    connection.disconnect()
-                    break
+                    return@Thread
                 }
+
+                val publicIP = ipResult.optString("query", "?")
+                val country = ipResult.optString("country", "")
+                val city = ipResult.optString("city", "")
+                val location = listOf(city, country).filter { it.isNotEmpty() }.joinToString(", ")
+
+                // Step 2: Check with server which proxy this IP belongs to
+                val serverIp = etServerIp.text.toString().trim()
+                var proxyInfo = ""
+                var isMatched = false
+                var warningMsg = ""
+
+                if (serverIp.isNotEmpty()) {
+                    try {
+                        val checkUrl = URL("${getServerUrl()}/api/app/check-ip?ip=$publicIP")
+                        val checkConnection = checkUrl.openConnection() as HttpURLConnection
+                        checkConnection.connectTimeout = 10000
+                        checkConnection.readTimeout = 10000
+                        checkConnection.requestMethod = "GET"
+
+                        val checkResponse = readResponse(checkConnection)
+                        checkConnection.disconnect()
+
+                        val checkResult = JSONObject(checkResponse)
+                        isMatched = checkResult.optBoolean("matched", false)
+                        if (isMatched) {
+                            proxyInfo = checkResult.optString("proxy_name", "")
+                        } else {
+                            warningMsg = checkResult.optString("message", "IP not in proxy list")
+                        }
+                    } catch (e: Exception) {
+                        // Server check failed, just show IP without proxy info
+                    }
+                }
+
+                // Build display string
+                val displayBuilder = StringBuilder()
+                displayBuilder.append(publicIP)
+                if (location.isNotEmpty()) {
+                    displayBuilder.append(" ($location)")
+                }
+                if (proxyInfo.isNotEmpty()) {
+                    displayBuilder.append("\n✓ $proxyInfo")
+                }
+
+                runOnUiThread {
+                    if (isMatched) {
+                        tvWhoAmI.text = displayBuilder.toString()
+                        tvWhoAmI.setTextColor(getColor(R.color.status_connected))
+                    } else if (warningMsg.isNotEmpty()) {
+                        tvWhoAmI.text = "$displayBuilder\n⚠ $warningMsg"
+                        tvWhoAmI.setTextColor(getColor(R.color.status_disconnected))
+                    } else {
+                        tvWhoAmI.text = displayBuilder.toString()
+                        tvWhoAmI.setTextColor(getColor(R.color.text_secondary))
+                    }
+                }
+
             } catch (e: Exception) {
-                runOnUiThread { tvWhoAmI.text = "Error: ${e.message?.take(30)}" }
+                runOnUiThread {
+                    tvWhoAmI.text = "Error: ${e.message?.take(40)}"
+                    tvWhoAmI.setTextColor(getColor(R.color.status_disconnected))
+                }
             }
         }.start()
+    }
+
+    // Auto-check IP when app resumes
+    override fun onResume() {
+        super.onResume()
+        // Auto-check IP after a short delay to let UI settle
+        tvWhoAmI.postDelayed({ checkWhoAmI() }, 500)
     }
 }
