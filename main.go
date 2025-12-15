@@ -106,6 +106,13 @@ type PersistentData struct {
 	TrafficHistory  []TrafficSnapshot       `json:"traffic_history"`
 	ProxyHealthData map[int]*ProxyHealth    `json:"proxy_health_data"`
 	SystemSettings  SystemSettings          `json:"system_settings"`
+	Supervisors     []Supervisor            `json:"supervisors"`
+	AdminPassword   string                  `json:"admin_password"`
+}
+
+type Supervisor struct {
+	Name     string `json:"name"`
+	Password string `json:"password"`
 }
 
 type SystemSettings struct {
@@ -561,6 +568,19 @@ func (s *ProxyServer) loadPersistentData() {
 	}
 	if s.persistentData.ProxyHealthData == nil {
 		s.persistentData.ProxyHealthData = make(map[int]*ProxyHealth)
+	}
+	// Initialize default supervisors if empty
+	if len(s.persistentData.Supervisors) == 0 {
+		s.persistentData.Supervisors = []Supervisor{
+			{Name: "Mirko", Password: "DobroJeMirko321a"},
+			{Name: "Ana", Password: "SupervisorAna123"},
+			{Name: "Marko", Password: "SupervisorMarko456"},
+			{Name: "Ivan", Password: "SupervisorIvan789"},
+		}
+	}
+	// Initialize default admin password if empty
+	if s.persistentData.AdminPassword == "" {
+		s.persistentData.AdminPassword = "Drnda123"
 	}
 }
 
@@ -1297,6 +1317,7 @@ func startDashboard() {
 	http.HandleFunc("/api/app/authenticate", handleAppAuthenticateAPI)
 	http.HandleFunc("/api/app/whoami", handleAppWhoAmI)
 	http.HandleFunc("/api/app/check-ip", handleAppCheckIP)
+	http.HandleFunc("/api/app/validate-password", handleAppValidatePassword)
 
 	http.HandleFunc("/dashboard", server.requireAuth(handleDashboard))
 	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
@@ -1324,6 +1345,11 @@ func startDashboard() {
 	http.HandleFunc("/api/change-password", server.requireAuth(handleChangePasswordAPI))
 	http.HandleFunc("/api/system-stats", server.requireAuth(handleSystemStatsAPI))
 	http.HandleFunc("/api/logs", server.requireAuth(handleLogsAPI))
+	http.HandleFunc("/api/supervisors", server.requireAuth(handleSupervisorsAPI))
+	http.HandleFunc("/api/add-supervisor", server.requireAuth(handleAddSupervisorAPI))
+	http.HandleFunc("/api/update-supervisor", server.requireAuth(handleUpdateSupervisorAPI))
+	http.HandleFunc("/api/delete-supervisor", server.requireAuth(handleDeleteSupervisorAPI))
+	http.HandleFunc("/api/admin-password", server.requireAuth(handleAdminPasswordAPI))
 
 	log.Printf("📊 Dashboard on port %d\n", server.dashPort)
 	addr := fmt.Sprintf("%s:%d", server.bindAddr, server.dashPort)
@@ -2221,6 +2247,73 @@ func handleAppCheckIP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleAppValidatePassword validates admin or supervisor password from the Android app
+func handleAppValidatePassword(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"valid":   false,
+			"message": "Method not allowed",
+		})
+		return
+	}
+
+	var req struct {
+		Password string `json:"password"`
+		Type     string `json:"type"` // "admin" or "supervisor"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"valid":   false,
+			"message": "Invalid request",
+		})
+		return
+	}
+
+	server.persistMu.RLock()
+	defer server.persistMu.RUnlock()
+
+	if req.Type == "admin" {
+		// Validate admin password
+		if req.Password == server.persistentData.AdminPassword {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"valid": true,
+				"name":  "Admin",
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"valid":   false,
+				"message": "Invalid admin password",
+			})
+		}
+		return
+	}
+
+	// Validate supervisor password
+	for _, s := range server.persistentData.Supervisors {
+		if s.Password == req.Password {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"valid": true,
+				"name":  s.Name,
+			})
+			return
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"valid":   false,
+		"message": "Invalid supervisor password",
+	})
+}
+
 // handleBulkImportProxiesAPI imports multiple proxies at once
 func handleBulkImportProxiesAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -2833,6 +2926,149 @@ func handleLogsAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(logs)
 }
 
+func handleSupervisorsAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	server.persistMu.RLock()
+	supervisors := server.persistentData.Supervisors
+	adminPassword := server.persistentData.AdminPassword
+	server.persistMu.RUnlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"supervisors":    supervisors,
+		"admin_password": adminPassword,
+	})
+}
+
+func handleAddSupervisorAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req Supervisor
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" || req.Password == "" {
+		http.Error(w, "name and password required", http.StatusBadRequest)
+		return
+	}
+	server.persistMu.Lock()
+	// Check if name already exists
+	for _, s := range server.persistentData.Supervisors {
+		if s.Name == req.Name {
+			server.persistMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "message": "Supervisor name already exists"})
+			return
+		}
+	}
+	server.persistentData.Supervisors = append(server.persistentData.Supervisors, req)
+	server.persistMu.Unlock()
+	server.savePersistentData()
+	log.Printf("👤 Added supervisor: %s\n", req.Name)
+	server.addLog("info", fmt.Sprintf("Added supervisor: %s", req.Name))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
+
+func handleUpdateSupervisorAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		OldName  string `json:"old_name"`
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	server.persistMu.Lock()
+	found := false
+	for i, s := range server.persistentData.Supervisors {
+		if s.Name == req.OldName {
+			server.persistentData.Supervisors[i] = Supervisor{Name: req.Name, Password: req.Password}
+			found = true
+			break
+		}
+	}
+	server.persistMu.Unlock()
+	if !found {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "message": "Supervisor not found"})
+		return
+	}
+	server.savePersistentData()
+	log.Printf("👤 Updated supervisor: %s -> %s\n", req.OldName, req.Name)
+	server.addLog("info", fmt.Sprintf("Updated supervisor: %s -> %s", req.OldName, req.Name))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
+
+func handleDeleteSupervisorAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	server.persistMu.Lock()
+	found := false
+	newList := []Supervisor{}
+	for _, s := range server.persistentData.Supervisors {
+		if s.Name == req.Name {
+			found = true
+		} else {
+			newList = append(newList, s)
+		}
+	}
+	server.persistentData.Supervisors = newList
+	server.persistMu.Unlock()
+	if !found {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "message": "Supervisor not found"})
+		return
+	}
+	server.savePersistentData()
+	log.Printf("👤 Deleted supervisor: %s\n", req.Name)
+	server.addLog("info", fmt.Sprintf("Deleted supervisor: %s", req.Name))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
+
+func handleAdminPasswordAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if req.Password == "" {
+		http.Error(w, "password required", http.StatusBadRequest)
+		return
+	}
+	server.persistMu.Lock()
+	server.persistentData.AdminPassword = req.Password
+	server.persistMu.Unlock()
+	server.savePersistentData()
+	log.Printf("🔐 Admin password updated\n")
+	server.addLog("info", "Admin password updated")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
+
 const loginPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Login</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.login-container{background:rgba(255,255,255,0.95);padding:40px;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);width:100%;max-width:400px}.logo{text-align:center;margin-bottom:30px}.logo h1{color:#667eea;font-size:2em;margin-bottom:5px}.logo p{color:#666;font-size:0.9em}.form-group{margin-bottom:20px}.form-group label{display:block;font-weight:600;color:#333;margin-bottom:8px}.form-group input{width:100%;padding:14px 16px;border:2px solid #e0e0e0;border-radius:10px;font-size:1em}.form-group input:focus{outline:none;border-color:#667eea}.login-btn{width:100%;padding:14px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:10px;font-size:1.1em;font-weight:600;cursor:pointer}.login-btn:hover{opacity:0.9}.login-btn:disabled{opacity:0.5;cursor:not-allowed}.error-msg{background:#ffebee;color:#c62828;padding:12px;border-radius:8px;margin-bottom:20px;display:none}.error-msg.show{display:block}</style></head>
 <body><div class="login-container"><div class="logo"><h1>🌐 Lumier Dynamics</h1><p>Enterprise Proxy Management v3.0</p></div><div class="error-msg" id="errorMsg"></div><form onsubmit="return handleLogin(event)"><div class="form-group"><label>Username</label><input type="text" id="username" placeholder="Enter username" required autofocus></div><div class="form-group"><label>Password</label><input type="password" id="password" placeholder="Enter password" required></div><button type="submit" class="login-btn" id="loginBtn">Sign In</button></form></div>
@@ -2854,7 +3090,7 @@ const analyticsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - A
 <style>` + baseStyles + `.chart-container{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.chart-container h2{margin-bottom:20px}.chart{width:100%;height:300px;position:relative}.chart-bars{display:flex;align-items:flex-end;height:250px;gap:4px;padding:0 10px;border-bottom:2px solid #e0e0e0}.chart-bar{flex:1;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);border-radius:4px 4px 0 0;min-width:8px;position:relative;transition:height 0.3s}.chart-bar:hover{opacity:0.8}.chart-bar .tooltip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:#333;color:white;padding:5px 10px;border-radius:4px;font-size:0.8em;white-space:nowrap;opacity:0;transition:opacity 0.2s;pointer-events:none}.chart-bar:hover .tooltip{opacity:1}.chart-labels{display:flex;gap:4px;padding:10px 10px 0}.chart-label{flex:1;text-align:center;font-size:0.7em;color:#666}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📊 Traffic Analytics</h1><p>Historical traffic data and trends</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalData">-</div><div class="stat-label">Total Data</div></div><div class="stat-card"><div class="stat-value" id="totalReqs">-</div><div class="stat-label">Total Requests</div></div><div class="stat-card"><div class="stat-value" id="peakDevices">-</div><div class="stat-label">Peak Devices</div></div><div class="stat-card"><div class="stat-value" id="errorRate">-</div><div class="stat-label">Error Rate</div></div></div><div class="chart-container"><h2>📈 Traffic Over Time</h2><button class="btn btn-secondary" onclick="loadAnalytics()" style="float:right;margin-top:-45px">🔄 Refresh</button><div class="chart"><div class="chart-bars" id="trafficBars"></div><div class="chart-labels" id="trafficLabels"></div></div></div><div class="chart-container"><h2>📊 Active Devices Over Time</h2><div class="chart"><div class="chart-bars" id="deviceBars"></div><div class="chart-labels" id="deviceLabels"></div></div></div></div><script>` + baseJS + `document.getElementById('nav-analytics').classList.add('active');function loadAnalytics(){fetch('/api/traffic-history').then(r=>r.json()).then(data=>{if(!data||!data.length){document.getElementById('trafficBars').innerHTML='<div class="loading">No data yet. Traffic data is collected every 5 minutes.</div>';return;}const totalBytes=data.reduce((a,d)=>a+(d.total_bytes_in||0)+(d.total_bytes_out||0),0);const totalReqs=data.length>0?data[data.length-1].total_requests:0;const peakDevices=Math.max(...data.map(d=>d.active_devices||0));const totalErrors=data.length>0?data[data.length-1].error_count:0;const errorRate=totalReqs>0?((totalErrors/totalReqs)*100).toFixed(2)+'%':'0%';document.getElementById('totalData').textContent=formatBytes(totalBytes);document.getElementById('totalReqs').textContent=formatNumber(totalReqs);document.getElementById('peakDevices').textContent=peakDevices;document.getElementById('errorRate').textContent=errorRate;const maxBytes=Math.max(...data.map(d=>(d.total_bytes_in||0)+(d.total_bytes_out||0)));const maxDevices=Math.max(...data.map(d=>d.active_devices||0));document.getElementById('trafficBars').innerHTML=data.map(d=>{const bytes=(d.total_bytes_in||0)+(d.total_bytes_out||0);const h=maxBytes>0?(bytes/maxBytes*230):5;return'<div class="chart-bar" style="height:'+h+'px"><span class="tooltip">'+formatBytes(bytes)+'</span></div>';}).join('');document.getElementById('trafficLabels').innerHTML=data.map((d,i)=>{if(i%Math.ceil(data.length/8)===0){return'<div class="chart-label">'+new Date(d.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div>';}return'<div class="chart-label"></div>';}).join('');document.getElementById('deviceBars').innerHTML=data.map(d=>{const h=maxDevices>0?(d.active_devices/maxDevices*230):5;return'<div class="chart-bar" style="height:'+h+'px;background:linear-gradient(135deg,#4caf50 0%,#2e7d32 100%)"><span class="tooltip">'+d.active_devices+' devices</span></div>';}).join('');document.getElementById('deviceLabels').innerHTML=data.map((d,i)=>{if(i%Math.ceil(data.length/8)===0){return'<div class="chart-label">'+new Date(d.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div>';}return'<div class="chart-label"></div>';}).join('');});}loadAnalytics();setInterval(loadAnalytics,60000);</script></body></html>`
 
 const settingsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Settings</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.settings-section{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.settings-section h2{margin-bottom:20px;padding-bottom:10px;border-bottom:2px solid #f0f0f0}.form-group{margin-bottom:20px}.form-group label{display:block;font-weight:600;color:#333;margin-bottom:8px}.form-group input{width:100%;max-width:400px;padding:12px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.form-group input:focus{outline:none;border-color:#667eea}.form-group small{display:block;color:#666;margin-top:5px;font-size:0.85em}.success-msg{background:#e8f5e9;color:#2e7d32;padding:12px;border-radius:8px;margin-bottom:20px;display:none}.success-msg.show{display:block}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>⚙️ Settings</h1><p>Configure your Lumier Dynamics system</p></div><div class="settings-section"><h2>🔐 Change Password</h2><div class="success-msg" id="pwSuccess">Password changed successfully!</div><form onsubmit="return changePassword(event)"><div class="form-group"><label>Current Password</label><input type="password" id="oldPassword" required></div><div class="form-group"><label>New Password</label><input type="password" id="newPassword" required><small>Choose a strong password with at least 8 characters</small></div><div class="form-group"><label>Confirm New Password</label><input type="password" id="confirmPassword" required></div><button type="submit" class="btn btn-primary">Change Password</button></form></div><div class="settings-section"><h2>📱 Device Groups</h2><p style="margin-bottom:15px;color:#666">Manage device groups for better organization</p><div id="groupsList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px"><input type="text" id="newGroupName" placeholder="New group name..." style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;flex:1;max-width:300px"><button class="btn btn-primary" onclick="addGroup()">Add Group</button></div></div><div class="settings-section"><h2>🌐 Proxy Management</h2><p style="margin-bottom:15px;color:#666">Add or remove upstream SOCKS5 proxies</p><div id="proxyList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px;flex-wrap:wrap"><input type="text" id="newProxyString" placeholder="host:port:username:password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;flex:1;min-width:300px;max-width:500px"><button class="btn btn-primary" onclick="addProxy()">Add Proxy</button></div><p style="margin-top:10px;color:#888;font-size:0.85em">Format: host:port:username:password (e.g., proxy.example.com:1080:user:pass)</p><div style="margin-top:20px;padding-top:20px;border-top:1px solid #eee"><h3 style="margin-bottom:15px;font-size:1.1em">📥 Bulk Import Proxies</h3><p style="margin-bottom:10px;color:#666;font-size:0.9em">Paste multiple proxies (one per line) in format: host:port:username:password</p><textarea id="bulkProxies" placeholder="brd.superproxy.io:22228:brd-customer-xxx-ip-1.2.3.4:password&#10;brd.superproxy.io:22228:brd-customer-xxx-ip-5.6.7.8:password&#10;..." style="width:100%;height:150px;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-family:monospace;font-size:0.9em"></textarea><div style="margin-top:10px;display:flex;gap:10px;align-items:center"><button class="btn btn-primary" onclick="bulkImportProxies()">Import Proxies</button><span id="bulkImportResult" style="color:#666;font-size:0.9em"></span></div></div></div><div class="settings-section"><h2>ℹ️ System Information</h2><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px"><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Version:</strong> 3.0.0</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Server IP:</strong> <span id="sysServerIP">...</span></div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Proxy Port:</strong> 8888</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Dashboard Port:</strong> 8080</div></div></div></div><script>` + baseJS + `document.getElementById('nav-settings').classList.add('active');fetch('/api/server-ip').then(r=>r.text()).then(ip=>document.getElementById('sysServerIP').textContent=ip);function loadGroups(){fetch('/api/groups').then(r=>r.json()).then(groups=>{document.getElementById('groupsList').innerHTML=groups.map(g=>{const isDefault=g==='Default';return'<span style="display:inline-flex;align-items:center;gap:8px;background:#e3f2fd;color:#1976d2;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">'+g+(isDefault?'':' <button onclick="deleteGroup(\''+g+'\')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center" title="Delete group">&times;</button>')+'</span>';}).join('');});}loadGroups();function deleteGroup(name){if(!confirm('Delete group "'+name+'"? Devices in this group will be moved to Default.')){return;}fetch('/api/delete-group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_name:name})}).then(r=>{if(r.ok)return r.json();throw new Error('Failed to delete');}).then(d=>{if(d.ok){showToast('Group deleted','success');loadGroups();}}).catch(()=>showToast('Failed to delete group','error'));}function addGroup(){const name=document.getElementById('newGroupName').value.trim();if(!name){showToast('Please enter a group name','error');return;}fetch('/api/add-group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_name:name})}).then(r=>r.json()).then(d=>{if(d.ok){showToast(d.added?'Group added':'Group already exists',d.added?'success':'');document.getElementById('newGroupName').value='';loadGroups();}});}function changePassword(e){e.preventDefault();const oldPw=document.getElementById('oldPassword').value;const newPw=document.getElementById('newPassword').value;const confirmPw=document.getElementById('confirmPassword').value;if(newPw!==confirmPw){showToast('Passwords do not match','error');return false;}if(newPw.length<6){showToast('Password must be at least 6 characters','error');return false;}fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_password:oldPw,new_password:newPw})}).then(r=>{if(r.ok){document.getElementById('pwSuccess').classList.add('show');document.getElementById('oldPassword').value='';document.getElementById('newPassword').value='';document.getElementById('confirmPassword').value='';setTimeout(()=>document.getElementById('pwSuccess').classList.remove('show'),3000);}else{showToast('Current password is incorrect','error');}});return false;}function loadProxies(){fetch('/api/proxies').then(r=>r.json()).then(proxies=>{document.getElementById('proxyList').innerHTML=proxies.length?proxies.map((p,i)=>{let ip=p.user&&p.user.includes('ip-')?p.user.split('ip-')[1]:p.host;return'<div style="display:inline-flex;align-items:center;gap:8px;background:#fff3e0;color:#e65100;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">#'+(i+1)+' – '+ip+' <button onclick="deleteProxy('+i+')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center" title="Delete proxy">&times;</button></div>';}).join(''):'<p style="color:#666">No proxies configured. Add your first proxy below.</p>';});}loadProxies();function addProxy(){const proxy=document.getElementById('newProxyString').value.trim();if(!proxy){showToast('Please enter a proxy string','error');return;}fetch('/api/add-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_string:proxy})}).then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error(t);});return r.json();}).then(d=>{if(d.ok){showToast(d.added?'Proxy added':'Proxy already exists',d.added?'success':'');document.getElementById('newProxyString').value='';loadProxies();}}).catch(e=>showToast(e.message||'Failed to add proxy','error'));}function deleteProxy(idx){if(!confirm('Delete this proxy? Make sure no devices are using it.')){return;}fetch('/api/delete-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_index:idx})}).then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error(t);});return r.json();}).then(d=>{if(d.ok){showToast('Proxy deleted','success');loadProxies();}}).catch(e=>showToast(e.message||'Failed to delete proxy','error'));}function bulkImportProxies(){const proxies=document.getElementById('bulkProxies').value.trim();if(!proxies){showToast('Please paste proxy strings','error');return;}document.getElementById('bulkImportResult').textContent='Importing...';fetch('/api/bulk-import-proxies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxies:proxies})}).then(r=>r.json()).then(d=>{if(d.success){const msg='Added '+d.added+' proxies'+(d.skipped>0?', skipped '+d.skipped:'');document.getElementById('bulkImportResult').innerHTML='<span style="color:#4caf50">✓ '+msg+'</span>';showToast(msg,'success');document.getElementById('bulkProxies').value='';loadProxies();}else{document.getElementById('bulkImportResult').innerHTML='<span style="color:#c62828">✗ Import failed</span>';showToast('Import failed','error');}}).catch(e=>{document.getElementById('bulkImportResult').innerHTML='<span style="color:#c62828">✗ Error</span>';showToast('Import error','error');});}</script></body></html>`
+<style>` + baseStyles + `.settings-section{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.settings-section h2{margin-bottom:20px;padding-bottom:10px;border-bottom:2px solid #f0f0f0}.form-group{margin-bottom:20px}.form-group label{display:block;font-weight:600;color:#333;margin-bottom:8px}.form-group input{width:100%;max-width:400px;padding:12px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.form-group input:focus{outline:none;border-color:#667eea}.form-group small{display:block;color:#666;margin-top:5px;font-size:0.85em}.success-msg{background:#e8f5e9;color:#2e7d32;padding:12px;border-radius:8px;margin-bottom:20px;display:none}.success-msg.show{display:block}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>⚙️ Settings</h1><p>Configure your Lumier Dynamics system</p></div><div class="settings-section"><h2>🔐 Change Password</h2><div class="success-msg" id="pwSuccess">Password changed successfully!</div><form onsubmit="return changePassword(event)"><div class="form-group"><label>Current Password</label><input type="password" id="oldPassword" required></div><div class="form-group"><label>New Password</label><input type="password" id="newPassword" required><small>Choose a strong password with at least 8 characters</small></div><div class="form-group"><label>Confirm New Password</label><input type="password" id="confirmPassword" required></div><button type="submit" class="btn btn-primary">Change Password</button></form></div><div class="settings-section"><h2>📱 Device Groups</h2><p style="margin-bottom:15px;color:#666">Manage device groups for better organization</p><div id="groupsList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px"><input type="text" id="newGroupName" placeholder="New group name..." style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;flex:1;max-width:300px"><button class="btn btn-primary" onclick="addGroup()">Add Group</button></div></div><div class="settings-section"><h2>🌐 Proxy Management</h2><p style="margin-bottom:15px;color:#666">Add or remove upstream SOCKS5 proxies</p><div id="proxyList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px;flex-wrap:wrap"><input type="text" id="newProxyString" placeholder="host:port:username:password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;flex:1;min-width:300px;max-width:500px"><button class="btn btn-primary" onclick="addProxy()">Add Proxy</button></div><p style="margin-top:10px;color:#888;font-size:0.85em">Format: host:port:username:password (e.g., proxy.example.com:1080:user:pass)</p><div style="margin-top:20px;padding-top:20px;border-top:1px solid #eee"><h3 style="margin-bottom:15px;font-size:1.1em">📥 Bulk Import Proxies</h3><p style="margin-bottom:10px;color:#666;font-size:0.9em">Paste multiple proxies (one per line) in format: host:port:username:password</p><textarea id="bulkProxies" placeholder="brd.superproxy.io:22228:brd-customer-xxx-ip-1.2.3.4:password&#10;brd.superproxy.io:22228:brd-customer-xxx-ip-5.6.7.8:password&#10;..." style="width:100%;height:150px;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-family:monospace;font-size:0.9em"></textarea><div style="margin-top:10px;display:flex;gap:10px;align-items:center"><button class="btn btn-primary" onclick="bulkImportProxies()">Import Proxies</button><span id="bulkImportResult" style="color:#666;font-size:0.9em"></span></div></div></div><div class="settings-section"><h2>👤 Supervisor Management</h2><p style="margin-bottom:15px;color:#666">Manage supervisor accounts for the Android app (used for Change Proxy authentication)</p><div style="margin-bottom:20px"><h3 style="font-size:1em;margin-bottom:10px">🔐 Admin Password (for Register Device)</h3><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><input type="password" id="adminPassword" placeholder="Admin password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:250px"><button class="btn btn-primary" onclick="updateAdminPassword()">Update Admin Password</button><button class="btn btn-secondary" onclick="togglePasswordVisibility('adminPassword')" style="padding:10px">👁️</button></div></div><div style="margin-bottom:15px"><h3 style="font-size:1em;margin-bottom:10px">👥 Supervisors (for Change Proxy)</h3><div id="supervisorsList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px;flex-wrap:wrap"><input type="text" id="newSupervisorName" placeholder="Name" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:150px"><input type="password" id="newSupervisorPassword" placeholder="Password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:200px"><button class="btn btn-primary" onclick="addSupervisor()">Add Supervisor</button></div></div></div><div class="settings-section"><h2>ℹ️ System Information</h2><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px"><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Version:</strong> 3.0.0</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Server IP:</strong> <span id="sysServerIP">...</span></div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Proxy Port:</strong> 8888</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Dashboard Port:</strong> 8080</div></div></div></div><script>` + baseJS + `document.getElementById('nav-settings').classList.add('active');fetch('/api/server-ip').then(r=>r.text()).then(ip=>document.getElementById('sysServerIP').textContent=ip);function loadGroups(){fetch('/api/groups').then(r=>r.json()).then(groups=>{document.getElementById('groupsList').innerHTML=groups.map(g=>{const isDefault=g==='Default';return'<span style="display:inline-flex;align-items:center;gap:8px;background:#e3f2fd;color:#1976d2;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">'+g+(isDefault?'':' <button onclick="deleteGroup(\''+g+'\')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center" title="Delete group">&times;</button>')+'</span>';}).join('');});}loadGroups();function deleteGroup(name){if(!confirm('Delete group "'+name+'"? Devices in this group will be moved to Default.')){return;}fetch('/api/delete-group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_name:name})}).then(r=>{if(r.ok)return r.json();throw new Error('Failed to delete');}).then(d=>{if(d.ok){showToast('Group deleted','success');loadGroups();}}).catch(()=>showToast('Failed to delete group','error'));}function addGroup(){const name=document.getElementById('newGroupName').value.trim();if(!name){showToast('Please enter a group name','error');return;}fetch('/api/add-group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_name:name})}).then(r=>r.json()).then(d=>{if(d.ok){showToast(d.added?'Group added':'Group already exists',d.added?'success':'');document.getElementById('newGroupName').value='';loadGroups();}});}function changePassword(e){e.preventDefault();const oldPw=document.getElementById('oldPassword').value;const newPw=document.getElementById('newPassword').value;const confirmPw=document.getElementById('confirmPassword').value;if(newPw!==confirmPw){showToast('Passwords do not match','error');return false;}if(newPw.length<6){showToast('Password must be at least 6 characters','error');return false;}fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_password:oldPw,new_password:newPw})}).then(r=>{if(r.ok){document.getElementById('pwSuccess').classList.add('show');document.getElementById('oldPassword').value='';document.getElementById('newPassword').value='';document.getElementById('confirmPassword').value='';setTimeout(()=>document.getElementById('pwSuccess').classList.remove('show'),3000);}else{showToast('Current password is incorrect','error');}});return false;}function loadProxies(){fetch('/api/proxies').then(r=>r.json()).then(proxies=>{document.getElementById('proxyList').innerHTML=proxies.length?proxies.map((p,i)=>{let ip=p.user&&p.user.includes('ip-')?p.user.split('ip-')[1]:p.host;return'<div style="display:inline-flex;align-items:center;gap:8px;background:#fff3e0;color:#e65100;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">#'+(i+1)+' – '+ip+' <button onclick="deleteProxy('+i+')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center" title="Delete proxy">&times;</button></div>';}).join(''):'<p style="color:#666">No proxies configured. Add your first proxy below.</p>';});}loadProxies();function addProxy(){const proxy=document.getElementById('newProxyString').value.trim();if(!proxy){showToast('Please enter a proxy string','error');return;}fetch('/api/add-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_string:proxy})}).then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error(t);});return r.json();}).then(d=>{if(d.ok){showToast(d.added?'Proxy added':'Proxy already exists',d.added?'success':'');document.getElementById('newProxyString').value='';loadProxies();}}).catch(e=>showToast(e.message||'Failed to add proxy','error'));}function deleteProxy(idx){if(!confirm('Delete this proxy? Make sure no devices are using it.')){return;}fetch('/api/delete-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_index:idx})}).then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error(t);});return r.json();}).then(d=>{if(d.ok){showToast('Proxy deleted','success');loadProxies();}}).catch(e=>showToast(e.message||'Failed to delete proxy','error'));}function bulkImportProxies(){const proxies=document.getElementById('bulkProxies').value.trim();if(!proxies){showToast('Please paste proxy strings','error');return;}document.getElementById('bulkImportResult').textContent='Importing...';fetch('/api/bulk-import-proxies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxies:proxies})}).then(r=>r.json()).then(d=>{if(d.success){const msg='Added '+d.added+' proxies'+(d.skipped>0?', skipped '+d.skipped:'');document.getElementById('bulkImportResult').innerHTML='<span style="color:#4caf50">✓ '+msg+'</span>';showToast(msg,'success');document.getElementById('bulkProxies').value='';loadProxies();}else{document.getElementById('bulkImportResult').innerHTML='<span style="color:#c62828">✗ Import failed</span>';showToast('Import failed','error');}}).catch(e=>{document.getElementById('bulkImportResult').innerHTML='<span style="color:#c62828">✗ Error</span>';showToast('Import error','error');});}function loadSupervisors(){fetch('/api/supervisors').then(r=>r.json()).then(data=>{document.getElementById('adminPassword').value=data.admin_password||'';const list=document.getElementById('supervisorsList');if(!data.supervisors||!data.supervisors.length){list.innerHTML='<p style="color:#666">No supervisors configured.</p>';return;}list.innerHTML=data.supervisors.map(s=>'<div style="display:inline-flex;align-items:center;gap:8px;background:#e8f5e9;color:#2e7d32;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">'+s.name+' <button onclick="editSupervisor(\''+s.name+'\',\''+s.password+'\')" style="background:#1976d2;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:12px" title="Edit">✎</button> <button onclick="deleteSupervisor(\''+s.name+'\')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1" title="Delete">&times;</button></div>').join('');});}loadSupervisors();function togglePasswordVisibility(id){const input=document.getElementById(id);input.type=input.type==='password'?'text':'password';}function updateAdminPassword(){const pw=document.getElementById('adminPassword').value.trim();if(!pw){showToast('Please enter a password','error');return;}fetch('/api/admin-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Admin password updated','success');}else{showToast('Failed to update','error');}});}function addSupervisor(){const name=document.getElementById('newSupervisorName').value.trim();const pw=document.getElementById('newSupervisorPassword').value.trim();if(!name||!pw){showToast('Name and password required','error');return;}fetch('/api/add-supervisor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,password:pw})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Supervisor added','success');document.getElementById('newSupervisorName').value='';document.getElementById('newSupervisorPassword').value='';loadSupervisors();}else{showToast(d.message||'Failed to add','error');}});}function editSupervisor(name,pw){const newName=prompt('Supervisor name:',name);if(!newName)return;const newPw=prompt('Password:',pw);if(!newPw)return;fetch('/api/update-supervisor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_name:name,name:newName,password:newPw})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Supervisor updated','success');loadSupervisors();}else{showToast(d.message||'Failed to update','error');}});}function deleteSupervisor(name){if(!confirm('Delete supervisor "'+name+'"?'))return;fetch('/api/delete-supervisor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Supervisor deleted','success');loadSupervisors();}else{showToast(d.message||'Failed to delete','error');}});}</script></body></html>`
 
 const monitoringPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Monitoring</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>` + baseStyles + `.monitor-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;margin-bottom:25px}.monitor-card{background:white;padding:25px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);text-align:center}.monitor-value{font-size:2.5em;font-weight:bold;margin-bottom:5px}.monitor-label{color:#666;font-size:0.9em;text-transform:uppercase;letter-spacing:1px}.monitor-sublabel{color:#999;font-size:0.8em;margin-top:5px}.progress-ring{width:120px;height:120px;margin:0 auto 15px}.progress-ring circle{fill:none;stroke-width:10;transform:rotate(-90deg);transform-origin:center}.progress-ring .bg{stroke:#e0e0e0}.progress-ring .fg{stroke:#667eea;stroke-linecap:round;transition:stroke-dashoffset 0.5s}.logs-container{background:white;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);overflow:hidden}.logs-header{background:#333;color:white;padding:15px 20px;display:flex;justify-content:space-between;align-items:center}.logs-header h2{margin:0;font-size:1.1em}.logs-content{height:400px;overflow-y:auto;font-family:'Monaco','Menlo','Ubuntu Mono',monospace;font-size:0.85em;padding:0}.log-entry{padding:8px 20px;border-bottom:1px solid #f0f0f0;display:flex;gap:15px}.log-entry:nth-child(odd){background:#fafafa}.log-time{color:#888;white-space:nowrap}.log-level{font-weight:600;text-transform:uppercase;font-size:0.8em;padding:2px 8px;border-radius:4px}.log-level.info{background:#e3f2fd;color:#1976d2}.log-level.error{background:#ffebee;color:#c62828}.log-level.warn{background:#fff3e0;color:#e65100}.log-msg{color:#333;word-break:break-word;flex:1}.auto-scroll{display:flex;align-items:center;gap:8px;font-size:0.9em}.auto-scroll input{width:18px;height:18px;cursor:pointer}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>🖥️ System Monitoring</h1><p>Real-time server performance and logs</p></div><div class="monitor-grid"><div class="monitor-card"><svg class="progress-ring" id="cpuRing"><circle class="bg" cx="60" cy="60" r="50"/><circle class="fg" id="cpuCircle" cx="60" cy="60" r="50"/></svg><div class="monitor-value" id="cpuValue">-%</div><div class="monitor-label">CPU Usage</div></div><div class="monitor-card"><svg class="progress-ring" id="memRing"><circle class="bg" cx="60" cy="60" r="50"/><circle class="fg" id="memCircle" cx="60" cy="60" r="50" style="stroke:#4caf50"/></svg><div class="monitor-value" id="memValue">-</div><div class="monitor-label">Memory Used</div><div class="monitor-sublabel" id="memTotal">of -</div></div><div class="monitor-card"><div class="monitor-value" style="color:#2196F3" id="uptimeValue">-</div><div class="monitor-label">Uptime</div></div><div class="monitor-card"><div class="monitor-value" style="color:#ff9800" id="goroutines">-</div><div class="monitor-label">Goroutines</div></div><div class="monitor-card"><div class="monitor-value" style="color:#4caf50" id="netIn">-</div><div class="monitor-label">Network In</div></div><div class="monitor-card"><div class="monitor-value" style="color:#9c27b0" id="netOut">-</div><div class="monitor-label">Network Out</div></div></div><div class="logs-container"><div class="logs-header"><h2>📋 Live Logs</h2><div style="display:flex;gap:15px;align-items:center"><button class="btn btn-secondary" onclick="loadLogs()" style="padding:6px 12px;font-size:0.85em">🔄 Refresh</button><label class="auto-scroll"><input type="checkbox" id="autoScroll" checked> Auto-scroll</label></div></div><div class="logs-content" id="logsContent"><div class="loading">Loading logs...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-monitoring').classList.add('active');const circumference=2*Math.PI*50;document.querySelectorAll('.progress-ring .fg').forEach(c=>{c.style.strokeDasharray=circumference;c.style.strokeDashoffset=circumference;});function setProgress(el,pct){const offset=circumference-(pct/100)*circumference;el.style.strokeDashoffset=offset;}function loadStats(){fetch('/api/system-stats').then(r=>r.json()).then(d=>{document.getElementById('cpuValue').textContent=d.cpu_usage.toFixed(1)+'%';setProgress(document.getElementById('cpuCircle'),d.cpu_usage);const memPct=(d.memory_used/d.memory_total)*100;document.getElementById('memValue').textContent=formatBytes(d.memory_used);document.getElementById('memTotal').textContent='of '+formatBytes(d.memory_total);setProgress(document.getElementById('memCircle'),memPct);document.getElementById('uptimeValue').textContent=d.uptime_formatted;document.getElementById('goroutines').textContent=d.goroutines;document.getElementById('netIn').textContent=formatBytes(d.total_bytes_in);document.getElementById('netOut').textContent=formatBytes(d.total_bytes_out);});}function loadLogs(){fetch('/api/logs').then(r=>r.json()).then(logs=>{const container=document.getElementById('logsContent');if(!logs||!logs.length){container.innerHTML='<div style="padding:20px;color:#666;text-align:center">No logs yet. Activity will appear here.</div>';return;}container.innerHTML=logs.map(l=>{const time=new Date(l.timestamp).toLocaleTimeString();return'<div class="log-entry"><span class="log-time">'+time+'</span><span class="log-level '+l.level+'">'+l.level+'</span><span class="log-msg">'+escapeHtml(l.message)+'</span></div>';}).join('');if(document.getElementById('autoScroll').checked){container.scrollTop=container.scrollHeight;}});}function escapeHtml(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML;}loadStats();loadLogs();setInterval(loadStats,2000);setInterval(loadLogs,3000);</script></body></html>`

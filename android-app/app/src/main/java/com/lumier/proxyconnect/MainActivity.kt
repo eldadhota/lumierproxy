@@ -31,11 +31,9 @@ class MainActivity : AppCompatActivity() {
         const val KEY_SESSION_TOKEN = "session_token"
         const val KEY_ROLLOUT_MODE = "rollout_mode"  // Locks username and proxy selection
 
-        // Passwords
-        const val ADMIN_PASSWORD = "Drnda123"
-
-        // Supervisor passwords - maps password to supervisor name for logging
-        val SUPERVISOR_PASSWORDS = mapOf(
+        // Fallback passwords (used if server is unreachable)
+        const val FALLBACK_ADMIN_PASSWORD = "Drnda123"
+        val FALLBACK_SUPERVISOR_PASSWORDS = mapOf(
             "DobroJeMirko321a" to "Mirko",
             "SupervisorAna123" to "Ana",
             "SupervisorMarko456" to "Marko",
@@ -172,6 +170,42 @@ class MainActivity : AppCompatActivity() {
     private fun readResponse(connection: HttpURLConnection): String {
         val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
         return stream?.bufferedReader()?.use(BufferedReader::readText) ?: ""
+    }
+
+    // Validates password against server API, returns supervisor name if valid, null if invalid
+    // Uses fallback passwords if server is unreachable
+    private fun validatePassword(password: String, type: String): String? {
+        return try {
+            val url = URL("${getServerUrl()}/api/app/validate-password")
+            val connection = url.openConnection() as HttpURLConnection
+            connection.connectTimeout = 5000
+            connection.readTimeout = 5000
+            connection.requestMethod = "POST"
+            connection.setRequestProperty("Content-Type", "application/json")
+            connection.doOutput = true
+
+            val json = JSONObject().apply {
+                put("password", password)
+                put("type", type)
+            }
+            connection.outputStream.write(json.toString().toByteArray())
+
+            val response = readResponse(connection)
+            val jsonResponse = JSONObject(response)
+
+            if (jsonResponse.optBoolean("valid", false)) {
+                jsonResponse.optString("name", "Unknown")
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            // Server unreachable - use fallback passwords
+            if (type == "admin") {
+                if (password == FALLBACK_ADMIN_PASSWORD) "Admin" else null
+            } else {
+                FALLBACK_SUPERVISOR_PASSWORDS[password]
+            }
+        }
     }
 
     private fun authenticate(): Boolean {
@@ -424,12 +458,21 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this, "Password is required", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
-                if (password != ADMIN_PASSWORD) {
-                    Toast.makeText(this, "Invalid admin password", Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
                 val enableRollout = rolloutCheckbox.isChecked
-                performRegistration(username, selectedProxy, password, enableRollout)
+
+                // Validate password in background thread
+                tvStatus.text = "Validating password..."
+                Thread {
+                    val adminName = validatePassword(password, "admin")
+                    runOnUiThread {
+                        if (adminName != null) {
+                            performRegistration(username, selectedProxy, password, enableRollout)
+                        } else {
+                            tvStatus.text = "Ready"
+                            Toast.makeText(this, "Invalid admin password", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }.start()
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -550,34 +593,53 @@ class MainActivity : AppCompatActivity() {
                     return@setPositiveButton
                 }
 
-                // Check if password matches any supervisor
-                val supervisorName = SUPERVISOR_PASSWORDS[password]
-                if (supervisorName == null) {
-                    Toast.makeText(this, "Invalid supervisor password", Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
-
-                // Supervisor authenticated - unlock fields and show proxy selection dialog
-                temporarilyUnlockForSupervisor()
-                Toast.makeText(this, "Welcome, $supervisorName!", Toast.LENGTH_SHORT).show()
-                showProxySelectionDialog(username, supervisorName)
+                // Validate password in background thread
+                tvStatus.text = "Validating password..."
+                Thread {
+                    val supervisorName = validatePassword(password, "supervisor")
+                    runOnUiThread {
+                        tvStatus.text = if (isRolloutMode) "Rollout Mode - Settings locked" else "Ready"
+                        if (supervisorName != null) {
+                            // Supervisor authenticated - unlock fields and show proxy selection dialog
+                            temporarilyUnlockForSupervisor()
+                            Toast.makeText(this, "Welcome, $supervisorName!", Toast.LENGTH_SHORT).show()
+                            showProxySelectionDialog(username, supervisorName)
+                        } else {
+                            Toast.makeText(this, "Invalid supervisor password", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }.start()
             }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
     private fun showProxySelectionDialog(username: String, supervisorName: String) {
-        // Create a dialog to select new proxy
-        val proxyNames = proxyList.map { it.name }.toTypedArray()
-        var selectedIndex = spinnerProxy.selectedItemPosition
+        // Create a custom layout with a Spinner for proxy selection
+        val layout = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(50, 30, 50, 30)
+        }
+
+        val infoText = android.widget.TextView(this).apply {
+            text = "Supervisor: $supervisorName\nChanging proxy for: $username"
+            setPadding(0, 0, 0, 30)
+        }
+        layout.addView(infoText)
+
+        val proxySpinner = android.widget.Spinner(this)
+        val proxyNames = proxyList.map { it.name }
+        val adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_spinner_item, proxyNames)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        proxySpinner.adapter = adapter
+        proxySpinner.setSelection(spinnerProxy.selectedItemPosition.coerceIn(0, proxyList.size - 1))
+        layout.addView(proxySpinner)
 
         AlertDialog.Builder(this)
             .setTitle("Select New Proxy")
-            .setMessage("Supervisor: $supervisorName\nChanging proxy for: $username")
-            .setSingleChoiceItems(proxyNames, selectedIndex) { _, which ->
-                selectedIndex = which
-            }
+            .setView(layout)
             .setPositiveButton("Change Proxy") { _, _ ->
+                val selectedIndex = proxySpinner.selectedItemPosition
                 if (selectedIndex >= 0 && selectedIndex < proxyList.size) {
                     val selectedProxy = proxyList[selectedIndex]
                     spinnerProxy.setSelection(selectedIndex)
