@@ -294,7 +294,7 @@ func main() {
 
 	proxyPort := parseEnvInt("PROXY_PORT", 8888)
 	dashPort := parseEnvInt("DASHBOARD_PORT", 8080)
-	allowIPFallback := parseEnvBool("ALLOW_IP_FALLBACK", true)
+	allowIPFallback := parseEnvBool("ALLOW_IP_FALLBACK", false)
 	authRequired := parseEnvBool("AUTH_REQUIRED", false)
 
 	server = &ProxyServer{
@@ -957,16 +957,10 @@ func (s *ProxyServer) saveDeviceConfig(device *Device) {
 		ProxyIndex: proxyIndex,
 	}
 
-	// Persist profiles by username as the primary key. When IP-based
-	// fallback is enabled, also store the latest IP as an alias so that
-	// proxy requests that arrive without auth headers can still be bound
-	// to the correct username/profile instead of creating anonymous
-	// devices for the same phone.
+	// Persist profiles by username only; IP-based recovery is optional and
+	// disabled by default.
 	if device.Username != "" {
 		s.persistentData.DeviceConfigs[device.Username] = cfg
-		if s.allowIPFallback && device.IP != "" {
-			s.persistentData.DeviceConfigs[device.IP] = cfg
-		}
 	}
 
 	go s.savePersistentData()
