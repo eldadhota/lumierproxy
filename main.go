@@ -186,6 +186,7 @@ type ProxyServer struct {
 	bindAddr        string
 	allowIPFallback bool
 	authRequired    bool
+	requireRegister bool
 	persistentData  PersistentData
 	persistMu       sync.RWMutex
 	dataFile        string
@@ -840,7 +841,7 @@ func (s *ProxyServer) getNextProxy() string {
 	return proxy
 }
 
-func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Device {
+func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) (*Device, error) {
 	// Optionally recover the username from the last saved config for this IP if
 	// IP-based fallback is explicitly allowed.
 	if username == "" && s.allowIPFallback {
@@ -849,6 +850,25 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 			username = cfg.Username
 		}
 		s.persistMu.RUnlock()
+	}
+
+	// If registration is required, deny requests that did not present a username
+	// and have no known mapping.
+	if username == "" && s.requireRegister {
+		return nil, fmt.Errorf("registration required: no username presented")
+	}
+
+	// Check persistence for a registered profile when required.
+	s.persistMu.RLock()
+	var savedConfig DeviceConfig
+	var hasSavedConfig bool
+	if username != "" {
+		savedConfig, hasSavedConfig = s.persistentData.DeviceConfigs[username]
+	}
+	s.persistMu.RUnlock()
+
+	if username != "" && s.requireRegister && !hasSavedConfig {
+		return nil, fmt.Errorf("registration required: unknown username '%s'", username)
 	}
 
 	s.mu.Lock()
@@ -865,7 +885,7 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 				s.addLog("info", fmt.Sprintf("Device '%s' IP changed: %s -> %s", username, oldIP, clientIP))
 			}
 			device.LastSeen = time.Now()
-			return device
+			return device, nil
 		}
 	}
 
@@ -874,18 +894,9 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 	if username == "" && s.allowIPFallback {
 		if device := s.findDeviceByIP(clientIP); device != nil {
 			device.LastSeen = time.Now()
-			return device
+			return device, nil
 		}
 	}
-
-	// Check persistent data by username only (profiles are username-bound)
-	s.persistMu.RLock()
-	var savedConfig DeviceConfig
-	var hasSavedConfig bool
-	if username != "" {
-		savedConfig, hasSavedConfig = s.persistentData.DeviceConfigs[username]
-	}
-	s.persistMu.RUnlock()
 
 	var upstreamProxy, customName, group, notes string = s.getNextProxy(), "", "Default", ""
 	if hasSavedConfig {
@@ -893,6 +904,12 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 			upstreamProxy = s.proxyPool[savedConfig.ProxyIndex]
 		}
 		customName, group, notes = savedConfig.CustomName, savedConfig.Group, savedConfig.Notes
+	}
+
+	// If registration is required and there is still no username, deny the
+	// request instead of creating an anonymous device.
+	if username == "" && s.requireRegister {
+		return nil, fmt.Errorf("registration required: no username mapping found")
 	}
 
 	// Generate device ID based on username if available
@@ -933,7 +950,7 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 	// Save new device config for persistence
 	go s.saveDeviceConfig(device)
 
-	return device
+	return device, nil
 }
 
 // saveDeviceConfig saves a device's config to persistent storage
@@ -957,10 +974,16 @@ func (s *ProxyServer) saveDeviceConfig(device *Device) {
 		ProxyIndex: proxyIndex,
 	}
 
-	// Persist profiles by username only; IP-based recovery is optional and
-	// disabled by default.
+	// Persist profiles by username as the primary key. When IP-based
+	// fallback is enabled, also store the latest IP as an alias so that
+	// proxy requests that arrive without auth headers can still be bound
+	// to the correct username/profile instead of creating anonymous
+	// devices for the same phone.
 	if device.Username != "" {
 		s.persistentData.DeviceConfigs[device.Username] = cfg
+		if s.allowIPFallback && device.IP != "" {
+			s.persistentData.DeviceConfigs[device.IP] = cfg
+		}
 	}
 
 	go s.savePersistentData()
@@ -992,7 +1015,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	username := parseProxyUsername(r)
-	device := server.getOrCreateDevice(clientIP, username)
+	device, err := server.getOrCreateDevice(clientIP, username)
+	if err != nil {
+		http.Error(w, "Registration required: please authenticate in the app", http.StatusProxyAuthRequired)
+		return
+	}
 	device.RequestCount++
 
 	if r.Method == http.MethodConnect {
