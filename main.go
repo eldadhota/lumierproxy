@@ -16,6 +16,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -173,25 +174,30 @@ func (s *ProxyServer) findAnonymousDeviceByIP(ip string) *Device {
 }
 
 type ProxyServer struct {
-	devices        map[string]*Device
-	mu             sync.RWMutex
-	proxyPool      []string
-	proxyHealth    map[int]*ProxyHealth
-	healthMu       sync.RWMutex
-	poolIndex      int
-	poolMu         sync.Mutex
-	proxyPort      int
-	dashPort       int
-	persistentData PersistentData
-	persistMu      sync.RWMutex
-	dataFile       string
-	sessions       map[string]*Session
-	sessionMu      sync.RWMutex
-	startTime      time.Time
-	logBuffer      []LogEntry
-	logMu          sync.RWMutex
-	cpuUsage       float64
-	cpuMu          sync.RWMutex
+	devices         map[string]*Device
+	mu              sync.RWMutex
+	proxyPool       []string
+	proxyHealth     map[int]*ProxyHealth
+	healthMu        sync.RWMutex
+	poolIndex       int
+	poolMu          sync.Mutex
+	proxyPort       int
+	dashPort        int
+	bindAddr        string
+	allowIPFallback bool
+	authRequired    bool
+	requireRegister bool
+	persistentData  PersistentData
+	persistMu       sync.RWMutex
+	dataFile        string
+	sessions        map[string]*Session
+	appSessions     map[string]*Session
+	sessionMu       sync.RWMutex
+	startTime       time.Time
+	logBuffer       []LogEntry
+	logMu           sync.RWMutex
+	cpuUsage        float64
+	cpuMu           sync.RWMutex
 }
 
 type LogEntry struct {
@@ -282,16 +288,32 @@ func main() {
 	log.Println("    Enterprise Edition v3.0")
 	log.Println("===========================================")
 
+	bindAddr := strings.TrimSpace(os.Getenv("BIND_ADDR"))
+	if bindAddr == "" {
+		bindAddr = "0.0.0.0"
+	}
+
+	proxyPort := parseEnvInt("PROXY_PORT", 8888)
+	dashPort := parseEnvInt("DASHBOARD_PORT", 8080)
+	allowIPFallback := parseEnvBool("ALLOW_IP_FALLBACK", true)
+	authRequired := parseEnvBool("AUTH_REQUIRED", false)
+	requireRegister := parseEnvBool("REQUIRE_REGISTRATION", true)
+
 	server = &ProxyServer{
-		devices:     make(map[string]*Device),
-		proxyPool:   loadProxyPool(),
-		proxyHealth: make(map[int]*ProxyHealth),
-		proxyPort:   8888,
-		dashPort:    8080,
-		dataFile:    "device_data.json",
-		sessions:    make(map[string]*Session),
-		startTime:   time.Now(),
-		logBuffer:   make([]LogEntry, 0, 1000),
+		devices:         make(map[string]*Device),
+		proxyPool:       loadProxyPool(),
+		proxyHealth:     make(map[int]*ProxyHealth),
+		proxyPort:       proxyPort,
+		dashPort:        dashPort,
+		bindAddr:        bindAddr,
+		allowIPFallback: allowIPFallback,
+		authRequired:    authRequired,
+		requireRegister: requireRegister,
+		dataFile:        "device_data.json",
+		sessions:        make(map[string]*Session),
+		appSessions:     make(map[string]*Session),
+		startTime:       time.Now(),
+		logBuffer:       make([]LogEntry, 0, 1000),
 		persistentData: PersistentData{
 			DeviceConfigs:   make(map[string]DeviceConfig),
 			Groups:          []string{"Default", "Floor 1", "Floor 2", "Team A", "Team B"},
@@ -333,7 +355,7 @@ func main() {
 	log.Println("🔐 Default login: admin / admin123")
 	log.Printf("📱 Phone setup: Proxy %s:%d\n", serverIP, server.proxyPort)
 
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", server.proxyPort), http.HandlerFunc(handleProxy)); err != nil {
+	if err := http.ListenAndServe(fmt.Sprintf("%s:%d", server.bindAddr, server.proxyPort), http.HandlerFunc(handleProxy)); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -454,6 +476,36 @@ func (s *ProxyServer) validateSession(token string) (*Session, bool) {
 	return session, true
 }
 
+func (s *ProxyServer) createAppSession(username string) *Session {
+	bytes := make([]byte, 32)
+	rand.Read(bytes)
+	token := base64.URLEncoding.EncodeToString(bytes)
+	s.sessionMu.Lock()
+	s.appSessions[token] = &Session{
+		Token:     token,
+		Username:  username,
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Duration(s.persistentData.SystemSettings.SessionTimeout) * time.Hour),
+	}
+	s.sessionMu.Unlock()
+	return s.appSessions[token]
+}
+
+func (s *ProxyServer) validateAppSession(token, username string) (*Session, bool) {
+	s.sessionMu.RLock()
+	session, ok := s.appSessions[token]
+	s.sessionMu.RUnlock()
+	if !ok || time.Now().After(session.ExpiresAt) || session.Username != username {
+		if ok {
+			s.sessionMu.Lock()
+			delete(s.appSessions, token)
+			s.sessionMu.Unlock()
+		}
+		return nil, false
+	}
+	return session, true
+}
+
 func (s *ProxyServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("session_token")
@@ -476,6 +528,11 @@ func cleanupExpiredSessions() {
 		for token, session := range server.sessions {
 			if now.After(session.ExpiresAt) {
 				delete(server.sessions, token)
+			}
+		}
+		for token, session := range server.appSessions {
+			if now.After(session.ExpiresAt) {
+				delete(server.appSessions, token)
 			}
 		}
 		server.sessionMu.Unlock()
@@ -786,7 +843,36 @@ func (s *ProxyServer) getNextProxy() string {
 	return proxy
 }
 
-func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Device {
+func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) (*Device, error) {
+	// Optionally recover the username from the last saved config for this IP if
+	// IP-based fallback is explicitly allowed.
+	if username == "" && s.allowIPFallback {
+		s.persistMu.RLock()
+		if cfg, ok := s.persistentData.DeviceConfigs[clientIP]; ok && cfg.Username != "" {
+			username = cfg.Username
+		}
+		s.persistMu.RUnlock()
+	}
+
+	// If registration is required, deny requests that did not present a username
+	// and have no known mapping.
+	if username == "" && s.requireRegister {
+		return nil, fmt.Errorf("registration required: no username presented")
+	}
+
+	// Check persistence for a registered profile when required.
+	s.persistMu.RLock()
+	var savedConfig DeviceConfig
+	var hasSavedConfig bool
+	if username != "" {
+		savedConfig, hasSavedConfig = s.persistentData.DeviceConfigs[username]
+	}
+	s.persistMu.RUnlock()
+
+	if username != "" && s.requireRegister && !hasSavedConfig {
+		return nil, fmt.Errorf("registration required: unknown username '%s'", username)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -801,31 +887,18 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 				s.addLog("info", fmt.Sprintf("Device '%s' IP changed: %s -> %s", username, oldIP, clientIP))
 			}
 			device.LastSeen = time.Now()
-			return device
+			return device, nil
 		}
 	}
 
-	// For anonymous requests (no username), only match anonymous devices
-	// Registered devices require the username header to be recognized
-	if username == "" {
-		if device := s.findAnonymousDeviceByIP(clientIP); device != nil {
+	// For requests without username, optionally allow IP-based reuse for
+	// backwards compatibility when explicitly enabled.
+	if username == "" && s.allowIPFallback {
+		if device := s.findDeviceByIP(clientIP); device != nil {
 			device.LastSeen = time.Now()
-			return device
+			return device, nil
 		}
 	}
-
-	// Check persistent data by username first, then IP for migration
-	s.persistMu.RLock()
-	var savedConfig DeviceConfig
-	var hasSavedConfig bool
-	if username != "" {
-		savedConfig, hasSavedConfig = s.persistentData.DeviceConfigs[username]
-	}
-	if !hasSavedConfig {
-		// Fallback to IP-based lookup for backwards compatibility
-		savedConfig, hasSavedConfig = s.persistentData.DeviceConfigs[clientIP]
-	}
-	s.persistMu.RUnlock()
 
 	var upstreamProxy, customName, group, notes string = s.getNextProxy(), "", "Default", ""
 	if hasSavedConfig {
@@ -833,6 +906,12 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 			upstreamProxy = s.proxyPool[savedConfig.ProxyIndex]
 		}
 		customName, group, notes = savedConfig.CustomName, savedConfig.Group, savedConfig.Notes
+	}
+
+	// If registration is required and there is still no username, deny the
+	// request instead of creating an anonymous device.
+	if username == "" && s.requireRegister {
+		return nil, fmt.Errorf("registration required: no username mapping found")
 	}
 
 	// Generate device ID based on username if available
@@ -873,19 +952,13 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) *Devic
 	// Save new device config for persistence
 	go s.saveDeviceConfig(device)
 
-	return device
+	return device, nil
 }
 
 // saveDeviceConfig saves a device's config to persistent storage
 func (s *ProxyServer) saveDeviceConfig(device *Device) {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-
-	// Determine the config key (username if set, otherwise IP)
-	configKey := device.IP
-	if device.Username != "" {
-		configKey = device.Username
-	}
 
 	// Find proxy index
 	proxyIndex := 0
@@ -895,8 +968,7 @@ func (s *ProxyServer) saveDeviceConfig(device *Device) {
 			break
 		}
 	}
-
-	s.persistentData.DeviceConfigs[configKey] = DeviceConfig{
+	cfg := DeviceConfig{
 		Username:   device.Username,
 		CustomName: device.CustomName,
 		Group:      device.Group,
@@ -904,13 +976,52 @@ func (s *ProxyServer) saveDeviceConfig(device *Device) {
 		ProxyIndex: proxyIndex,
 	}
 
+	// Persist profiles by username as the primary key. When IP-based
+	// fallback is enabled, also store the latest IP as an alias so that
+	// proxy requests that arrive without auth headers can still be bound
+	// to the correct username/profile instead of creating anonymous
+	// devices for the same phone.
+	if device.Username != "" {
+		s.persistentData.DeviceConfigs[device.Username] = cfg
+		if s.allowIPFallback && device.IP != "" {
+			s.persistentData.DeviceConfigs[device.IP] = cfg
+		}
+	}
+
 	go s.savePersistentData()
 }
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
 	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	// Allow the mobile app to hit its API on the proxy port (e.g., if the user
+	// enters 8888 instead of the dashboard port). This avoids forwarding the
+	// app's own control calls through an upstream proxy, which would hang or
+	// fail.
+	switch r.URL.Path {
+	case "/api/app/proxies":
+		handleAppProxiesAPI(w, r)
+		return
+	case "/api/app/register":
+		handleAppRegisterAPI(w, r)
+		return
+	case "/api/app/change-proxy":
+		handleAppChangeProxyAPI(w, r)
+		return
+	case "/api/app/authenticate":
+		handleAppAuthenticateAPI(w, r)
+		return
+	case "/api/app/whoami":
+		handleAppWhoAmI(w, r)
+		return
+	}
+
 	username := parseProxyUsername(r)
-	device := server.getOrCreateDevice(clientIP, username)
+	device, err := server.getOrCreateDevice(clientIP, username)
+	if err != nil {
+		http.Error(w, "Registration required: please authenticate in the app", http.StatusProxyAuthRequired)
+		return
+	}
 	device.RequestCount++
 
 	if r.Method == http.MethodConnect {
@@ -1080,6 +1191,7 @@ func cleanupInactiveDevices() {
 		server.mu.Unlock()
 	}
 }
+
 // ============================================================================
 // DASHBOARD SERVER
 // ============================================================================
@@ -1093,6 +1205,9 @@ func startDashboard() {
 	// Public app API (no auth required)
 	http.HandleFunc("/api/app/proxies", handleAppProxiesAPI)
 	http.HandleFunc("/api/app/register", handleAppRegisterAPI)
+	http.HandleFunc("/api/app/change-proxy", handleAppChangeProxyAPI)
+	http.HandleFunc("/api/app/authenticate", handleAppAuthenticateAPI)
+	http.HandleFunc("/api/app/whoami", handleAppWhoAmI)
 
 	http.HandleFunc("/dashboard", server.requireAuth(handleDashboard))
 	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
@@ -1121,7 +1236,42 @@ func startDashboard() {
 	http.HandleFunc("/api/logs", server.requireAuth(handleLogsAPI))
 
 	log.Printf("📊 Dashboard on port %d\n", server.dashPort)
-	http.ListenAndServe(fmt.Sprintf(":%d", server.dashPort), nil)
+	addr := fmt.Sprintf("%s:%d", server.bindAddr, server.dashPort)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatalf("failed to start dashboard on %s: %v", addr, err)
+	}
+}
+
+func parseEnvInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		log.Printf("⚠️  Invalid %s value '%s', using default %d\n", key, value, fallback)
+		return fallback
+	}
+
+	return parsed
+}
+
+func parseEnvBool(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		log.Printf("⚠️  Invalid %s value '%s', using default %t\n", key, value, fallback)
+		return fallback
+	}
 }
 
 func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
@@ -1294,6 +1444,15 @@ func handleAppProxiesAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
+	username := strings.TrimSpace(r.Header.Get("X-App-Username"))
+	if username == "" {
+		username = strings.TrimSpace(r.URL.Query().Get("username"))
+	}
+
+	if !ensureAppAuth(w, r, username) {
+		return
+	}
+
 	server.poolMu.Lock()
 	defer server.poolMu.Unlock()
 
@@ -1312,11 +1471,61 @@ type AppRegisterRequest struct {
 	ProxyIndex int    `json:"proxy_index"`
 }
 
+type AppAuthRequest struct {
+	Username string `json:"username"`
+}
+
+type AppAuthResponse struct {
+	Success    bool   `json:"success"`
+	Message    string `json:"message"`
+	Token      string `json:"token,omitempty"`
+	Username   string `json:"username,omitempty"`
+	ProxyIndex int    `json:"proxy_index,omitempty"`
+	ProxyName  string `json:"proxy_name,omitempty"`
+}
+
 type AppRegisterResponse struct {
-	Success   bool   `json:"success"`
-	Message   string `json:"message"`
-	Username  string `json:"username"`
-	ProxyName string `json:"proxy_name"`
+	Success    bool   `json:"success"`
+	Message    string `json:"message"`
+	Username   string `json:"username"`
+	ProxyName  string `json:"proxy_name"`
+	ProxyIndex int    `json:"proxy_index,omitempty"`
+	Token      string `json:"token,omitempty"`
+}
+
+// ensureAppAuth enforces the optional pre-authentication gate for app calls
+func ensureAppAuth(w http.ResponseWriter, r *http.Request, username string) bool {
+	if !server.authRequired {
+		return true
+	}
+
+	if r.Method == http.MethodOptions {
+		return true
+	}
+
+	if strings.TrimSpace(username) == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Authentication required: send username"})
+		return false
+	}
+
+	token := strings.TrimSpace(r.Header.Get("X-App-Token"))
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	if token == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Authentication required"})
+		return false
+	}
+
+	if _, ok := server.validateAppSession(token, username); !ok {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Session expired, please authenticate"})
+		return false
+	}
+
+	return true
 }
 
 // handleAppRegisterAPI registers a device with username and proxy selection (no auth required)
@@ -1326,7 +1535,7 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
 		return
 	}
 
@@ -1344,6 +1553,10 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	username := strings.TrimSpace(req.Username)
 	if username == "" {
 		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
+		return
+	}
+
+	if !ensureAppAuth(w, r, username) {
 		return
 	}
 
@@ -1394,10 +1607,204 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(AppRegisterResponse{
-		Success:   true,
-		Message:   "Device registered",
-		Username:  username,
-		ProxyName: proxyName,
+		Success:    true,
+		Message:    "Device registered",
+		Username:   username,
+		ProxyName:  proxyName,
+		ProxyIndex: req.ProxyIndex,
+	})
+}
+
+// handleAppChangeProxyAPI updates a device's proxy selection (no auth required)
+func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+
+	var req AppRegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid request"})
+		return
+	}
+
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
+		return
+	}
+
+	server.poolMu.Lock()
+	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
+		server.poolMu.Unlock()
+		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid proxy selection"})
+		return
+	}
+	selectedProxy := server.proxyPool[req.ProxyIndex]
+	server.poolMu.Unlock()
+
+	proxyName := fmt.Sprintf("SG%d", req.ProxyIndex+1)
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	server.mu.Lock()
+	device := server.findDeviceByUsername(username)
+	if device == nil {
+		device = &Device{
+			ID:            fmt.Sprintf("device-%s", username),
+			IP:            clientIP,
+			Username:      username,
+			Name:          username,
+			Group:         "Default",
+			UpstreamProxy: selectedProxy,
+			Status:        "active",
+			FirstSeen:     time.Now(),
+			LastSeen:      time.Now(),
+		}
+		server.devices[username] = device
+	} else {
+		device.IP = clientIP
+		device.UpstreamProxy = selectedProxy
+		device.LastSeen = time.Now()
+	}
+	server.mu.Unlock()
+
+	go server.saveDeviceConfig(device)
+	server.addLog("info", fmt.Sprintf("App: Device '%s' switched to %s", username, proxyName))
+
+	json.NewEncoder(w).Encode(AppRegisterResponse{
+		Success:    true,
+		Message:    "Proxy updated",
+		Username:   username,
+		ProxyName:  proxyName,
+		ProxyIndex: req.ProxyIndex,
+	})
+}
+
+// handleAppAuthenticateAPI issues a short-lived session token keyed by username
+func handleAppAuthenticateAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+
+	var req AppAuthRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Invalid request"})
+		return
+	}
+
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Username required"})
+		return
+	}
+
+	server.poolMu.Lock()
+	if len(server.proxyPool) == 0 {
+		server.poolMu.Unlock()
+		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "No upstream proxies configured"})
+		return
+	}
+	server.poolMu.Unlock()
+
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	server.persistMu.RLock()
+	cfg, hasCfg := server.persistentData.DeviceConfigs[username]
+	server.persistMu.RUnlock()
+
+	proxyIndex := 0
+	if hasCfg && cfg.ProxyIndex >= 0 {
+		proxyIndex = cfg.ProxyIndex
+	}
+
+	server.poolMu.Lock()
+	if proxyIndex >= len(server.proxyPool) {
+		proxyIndex = 0
+	}
+	selectedProxy := server.proxyPool[proxyIndex]
+	proxyName := fmt.Sprintf("SG%d", proxyIndex+1)
+	server.poolMu.Unlock()
+
+	server.mu.Lock()
+	device := server.findDeviceByUsername(username)
+	if device == nil {
+		device = &Device{
+			ID:            fmt.Sprintf("device-%s", username),
+			IP:            clientIP,
+			Username:      username,
+			Name:          username,
+			Group:         "Default",
+			UpstreamProxy: selectedProxy,
+			Status:        "active",
+			FirstSeen:     time.Now(),
+			LastSeen:      time.Now(),
+		}
+		server.devices[username] = device
+	} else {
+		device.IP = clientIP
+		if device.UpstreamProxy == "" {
+			device.UpstreamProxy = selectedProxy
+		}
+		device.LastSeen = time.Now()
+	}
+	server.mu.Unlock()
+
+	go server.saveDeviceConfig(device)
+	session := server.createAppSession(username)
+
+	json.NewEncoder(w).Encode(AppAuthResponse{
+		Success:    true,
+		Message:    "Authenticated",
+		Token:      session.Token,
+		Username:   username,
+		ProxyIndex: proxyIndex,
+		ProxyName:  proxyName,
+	})
+}
+
+// handleAppWhoAmI reports the observed client IP (and optionally country)
+func handleAppWhoAmI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
+		return
+	}
+
+	username := strings.TrimSpace(r.Header.Get("X-App-Username"))
+	if username == "" {
+		username = strings.TrimSpace(r.URL.Query().Get("username"))
+	}
+
+	if !ensureAppAuth(w, r, username) {
+		return
+	}
+
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+	json.NewEncoder(w).Encode(map[string]string{
+		"ip":      clientIP,
+		"country": "",
 	})
 }
 
@@ -1453,18 +1860,7 @@ func handleChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 	device.LastSeen = time.Now()
 	server.mu.Unlock()
 
-	// Save config by Username if available, otherwise by IP
-	server.persistMu.Lock()
-	configKey := device.IP
-	if device.Username != "" {
-		configKey = device.Username
-	}
-	config := server.persistentData.DeviceConfigs[configKey]
-	config.Username = device.Username
-	config.ProxyIndex = req.ProxyIndex
-	server.persistentData.DeviceConfigs[configKey] = config
-	server.persistMu.Unlock()
-	go server.savePersistentData()
+	go server.saveDeviceConfig(device)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
@@ -1490,10 +1886,7 @@ func handleUpdateDeviceAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get old key for re-keying if username changes
-	oldKey := device.IP
-	if device.Username != "" {
-		oldKey = device.Username
-	}
+	oldKey := device.Username
 
 	// Update device fields
 	device.CustomName = req.CustomName
@@ -1517,35 +1910,22 @@ func handleUpdateDeviceAPI(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Add device with new key
-		newKey := device.IP
-		if newUsername != "" {
-			newKey = newUsername
+		newKey := newUsername
+		if newKey == "" {
+			newKey = device.IP
 		}
 		server.devices[newKey] = device
 	}
 	server.mu.Unlock()
 
-	// Update persistent data
+	// Update persistent data for username only
 	server.persistMu.Lock()
-	// Delete old config if username changed
-	if usernameChanged {
+	if usernameChanged && oldKey != "" {
 		delete(server.persistentData.DeviceConfigs, oldKey)
 	}
-
-	// Save with new key
-	newConfigKey := device.IP
-	if device.Username != "" {
-		newConfigKey = device.Username
-	}
-	config := server.persistentData.DeviceConfigs[newConfigKey]
-	config.Username = device.Username
-	config.CustomName = req.CustomName
-	config.Group = req.Group
-	config.Notes = req.Notes
-	server.persistentData.DeviceConfigs[newConfigKey] = config
 	server.persistMu.Unlock()
 
-	go server.savePersistentData()
+	go server.saveDeviceConfig(device)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
 }
@@ -1576,23 +1956,12 @@ func handleBulkChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 		if device != nil {
 			device.UpstreamProxy = newProxy
 			updated++
-			// Save config by Username if available, otherwise by IP
-			configKey := device.IP
-			if device.Username != "" {
-				configKey = device.Username
-			}
 			server.mu.Unlock()
-			server.persistMu.Lock()
-			config := server.persistentData.DeviceConfigs[configKey]
-			config.Username = device.Username
-			config.ProxyIndex = req.ProxyIndex
-			server.persistentData.DeviceConfigs[configKey] = config
-			server.persistMu.Unlock()
+			go server.saveDeviceConfig(device)
 		} else {
 			server.mu.Unlock()
 		}
 	}
-	go server.savePersistentData()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "updated": updated})
 }
@@ -1659,10 +2028,10 @@ func handleDeleteGroupAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	server.persistentData.Groups = newGroups
 	// Move devices from deleted group to Default
-	for ip, config := range server.persistentData.DeviceConfigs {
+	for key, config := range server.persistentData.DeviceConfigs {
 		if config.Group == req.GroupName {
 			config.Group = "Default"
-			server.persistentData.DeviceConfigs[ip] = config
+			server.persistentData.DeviceConfigs[key] = config
 		}
 	}
 	server.persistMu.Unlock()
@@ -1781,10 +2150,10 @@ func handleDeleteProxyAPI(w http.ResponseWriter, r *http.Request) {
 
 	// Update device configs that had higher proxy indices
 	server.persistMu.Lock()
-	for ip, config := range server.persistentData.DeviceConfigs {
+	for key, config := range server.persistentData.DeviceConfigs {
 		if config.ProxyIndex > req.ProxyIndex {
 			config.ProxyIndex--
-			server.persistentData.DeviceConfigs[ip] = config
+			server.persistentData.DeviceConfigs[key] = config
 		}
 	}
 	server.persistMu.Unlock()
@@ -1820,12 +2189,11 @@ func handleDeleteDeviceAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	server.mu.Unlock()
 
-	// Delete from persistent data by both Username and IP to ensure cleanup
+	// Delete from persistent data by Username to ensure cleanup
 	server.persistMu.Lock()
 	if device != nil && device.Username != "" {
 		delete(server.persistentData.DeviceConfigs, device.Username)
 	}
-	delete(server.persistentData.DeviceConfigs, req.DeviceIP)
 	server.persistMu.Unlock()
 
 	go server.savePersistentData()
@@ -1865,6 +2233,7 @@ func handleExportAPI(w http.ResponseWriter, r *http.Request) {
 		"proxy_health": healthData,
 	})
 }
+
 // ============================================================================
 // HTML PAGE HANDLERS AND TEMPLATES
 // ============================================================================
