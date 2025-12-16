@@ -1,50 +1,278 @@
-# lumierproxy
+# Lumier Dynamics - Enterprise Proxy Management System
 
-## Troubleshooting Windows connectivity to proxies
+A comprehensive HTTP/HTTPS proxy server with device management, upstream SOCKS5 proxy routing, and a web dashboard for administration.
 
-If `Test-NetConnection <proxy-ip> -Port <port>` hangs at "Attempting TCP connect" / "Waiting for response" on Windows 11, it means the server cannot open a TCP socket to that host:port. Check these next steps:
+## Features
 
-- Confirm the proxy is listening and reachable from the server network (firewall or NAT may block the port).
-- Try `Test-NetConnection <proxy-ip> -Port <port> -InformationLevel Detailed` to see DNS and routing results.
-- Use `curl -v -x socks5://user:pass@<proxy-ip>:<port> https://example.com/` from the same machine. If it times out or cannot connect, the upstream proxy or route is unreachable.
-- If the IP is on a local subnet (e.g., 192.168.x.x), ensure the server has a route to that network and that Windows Defender Firewall allows outbound traffic on that port.
+- **Multi-device proxy management** - Route multiple Android devices through different upstream SOCKS5 proxies
+- **Web Dashboard** - Real-time device monitoring, proxy health, traffic analytics
+- **Android App** - Easy device registration and proxy selection
+- **Supervisor Management** - Multiple supervisor accounts with audit logging
+- **Rollout Mode** - Lock device settings for end-user deployment
+- **IP Geolocation** - Check which proxy IP a device is using
+- **Persistent Storage** - Device configs survive server restarts
 
-A successful test shows `TcpTestSucceeded : True`. Any hang or failure indicates a network path, firewall, or proxy availability issue rather than a formatting problem in `proxies.txt`.
+## Quick Start
 
-## Connecting from the Android app after connectivity tests succeed
+### Windows
+```powershell
+# Double-click run_proxy.ps1 or run in PowerShell:
+.\run_proxy.ps1
+```
 
-Once `Test-NetConnection` succeeds on your server, configure the Android device to send traffic through the proxy listener on port **8888** (the dashboard stays on **8080**):
+### Linux (Ubuntu/Debian)
+```bash
+# Make executable and run:
+chmod +x run_proxy.sh
+./run_proxy.sh
+```
 
-1. Make sure the phone can reach the server's IP (same Wi-Fi/LAN or port-forwarded from the internet). Test in Chrome on the phone: `http://<server-ip>:8080` should load the dashboard login page; if it does not, follow the dashboard reachability steps in the section below.
-2. On the phone's Wi-Fi network settings, set **Proxy** to **Manual** with:
-   - **Host name:** `<server-ip>`
-   - **Port:** `8888`
-   - **Type:** HTTP (Android forwards both HTTP/HTTPS through it)
-3. Open the Lumier Android app and tap **Refresh proxies**. It should now connect through the server on 8888 to reach your upstream SOCKS5 proxies.
-   - The app API endpoints also respond on the proxy listener (8888) so even if the dashboard port is blocked, the **Refresh proxies** / **Register** buttons can still reach the server without timing out.
-   - When you register a username and proxy, the server saves that pairing by **username**. Devices that reconnect with the same username keep the same profile/proxy even if their IP changes. IP-only fallback is disabled by default; set `ALLOW_IP_FALLBACK=true` if you want the old behavior of matching by IP when no username is sent.
-   - To prevent unregistered devices from ever relaying traffic, the server blocks proxy requests that don’t map to a registered username. Leave `REQUIRE_REGISTRATION=true` (default) so only devices that authenticated in the app can go online. Turn it off only if you explicitly want anonymous pass-through during setup.
-   - Use the new **Change Proxy** button in the Android app (or `POST /api/app/change-proxy` with `username` and `proxy_index`) to switch a device to another upstream proxy without deleting/re-registering it.
-   - To force in-app authentication before any calls, set `AUTH_REQUIRED=true`. The app will first hit `/api/app/authenticate` to obtain a short-lived token (stored on the device) and will reuse the same profile/proxy on reconnects. Tokens expire based on `session_timeout_hours`.
-   - The app can show the proxy-presented public IP via the **Check IP** button (`GET /api/app/whoami`), which returns the server-observed IP and optional country when enabled server-side.
+### Access Points
+- **Dashboard**: http://YOUR_SERVER_IP:8080
+- **Proxy Port**: 8888 (configure on Android devices)
+- **Default Login**: admin / admin123
 
-If the app still fails, verify that:
-- Windows Defender Firewall (or any upstream firewall/router) allows inbound TCP on port 8888 to the Go server.
-- The server is still running and listening on 8888 (`netstat -ano | findstr 8888`).
-- Your `proxies.txt` entries are reachable from the server (use the earlier `curl -v -x socks5://...` check).
+---
 
-## If the dashboard at `http://<server-ip>:8080` is unreachable
+## Server Setup
 
-1. Confirm the server is listening on port 8080:
-   - On Windows: `netstat -ano | findstr 8080`
-   - On Linux/macOS: `ss -tlnp | grep :8080`
-2. Make sure the process is bound to the correct interface. If it shows `127.0.0.1:8080`, only localhost can reach it. Start the server so it binds to `0.0.0.0:8080` or the LAN IP. You can force the listener to bind to the LAN with environment variables:
-   - `BIND_ADDR=0.0.0.0` (default) binds to all IPv4 interfaces.
-   - `DASHBOARD_PORT=<port>` and `PROXY_PORT=<port>` override the default 8080/8888 ports if those are blocked.
-3. Allow inbound TCP 8080 through the OS firewall (e.g., Windows Defender Firewall rule, `ufw allow 8080/tcp` on Ubuntu).
-4. If the host PC can reach `http://<server-ip>:8080` but another device on the same Wi‑Fi cannot:
-   - The server is likely bound to the wrong interface or blocked by the firewall. Re-run the listener so it binds to `0.0.0.0:8080` and add an inbound firewall rule scoped to **Private** networks in Windows (or your LAN subnet).
-   - Verify both devices are on the same LAN/subnet and not isolated by the router/AP (guest Wi‑Fi often blocks client-to-client traffic). If isolation is enabled, move both devices to the same non-guest network or disable isolation.
-   - If using a VPN on the server, ensure 8080 is allowed on the VPN adapter or test with the VPN disconnected to confirm LAN reachability.
-5. Verify you are using the server’s LAN IP that other devices can reach (e.g., `192.168.1.14` on the same Wi‑Fi). If you’re on a different network, port-forward 8080 on your router to the server.
-6. From another device on the same network, test with `curl http://<server-ip>:8080/` or a browser. If it fails, recheck firewall/routing; if it works locally but not externally, it’s a network reachability issue, not the app.
+### Prerequisites
+- Go 1.19 or later
+- Network access to upstream SOCKS5 proxies
+
+### Configuration Files
+
+#### proxies.txt
+Add your upstream SOCKS5 proxies (one per line):
+```
+host:port:username:password
+```
+Example:
+```
+brd.superproxy.io:22228:brd-customer-xxx-ip-1.2.3.4:password123
+brd.superproxy.io:22228:brd-customer-xxx-ip-5.6.7.8:password456
+```
+
+#### Environment Variables (Optional)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BIND_ADDR` | 0.0.0.0 | Interface to bind to |
+| `PROXY_PORT` | 8888 | HTTP proxy port for devices |
+| `DASHBOARD_PORT` | 8080 | Web dashboard port |
+| `REQUIRE_REGISTRATION` | true | Block unregistered devices |
+| `ALLOW_IP_FALLBACK` | false | Match devices by IP if no username |
+
+### Running as a Service (Linux)
+
+```bash
+# Install as systemd service
+sudo ./install.sh
+
+# Control the service
+sudo systemctl start lumier-dynamics
+sudo systemctl stop lumier-dynamics
+sudo systemctl status lumier-dynamics
+
+# View logs
+sudo journalctl -u lumier-dynamics -f
+```
+
+---
+
+## Dashboard Guide
+
+### Devices Page
+- View all registered devices with status indicators
+- **Green**: Active (seen in last 5 minutes)
+- **Gray**: Offline
+- Click device name to edit
+- Change proxy assignment per device
+- Filter by group, search by name/username
+
+### Proxy Health Page
+- Monitor upstream proxy status
+- View success/failure rates
+- Check response times
+
+### Analytics Page
+- Traffic statistics over time
+- Peak device counts
+- Error rates
+
+### Settings Page
+
+#### Change Password
+Update your dashboard login password.
+
+#### Device Groups
+Create groups to organize devices (e.g., by location, team).
+
+#### Proxy Management
+- Add/remove upstream SOCKS5 proxies
+- Bulk import proxies (paste multiple lines)
+
+#### Supervisor Management
+Manage passwords for the Android app:
+
+**Admin Password** (for Register Device button):
+- Default: `Drnda123`
+- Used when registering new devices
+
+**Supervisor Passwords** (for Change Proxy button):
+- Each supervisor has a name and password
+- Changes are logged with supervisor name for audit
+- Default supervisors: Mirko, Ana, Marko, Ivan
+
+### Monitoring Page
+- Real-time CPU/memory usage
+- Network traffic statistics
+- Live server logs
+
+---
+
+## Android App Setup
+
+### Installation
+1. Build the APK from `android-app/` directory using Android Studio
+2. Install on Android device
+3. Grant necessary permissions
+
+### Configuration
+
+1. **Server IP**: Enter your server's IP address
+2. **Server Port**: Usually 8081 (API port, not proxy port)
+3. **Username**: Unique identifier for this device
+4. **Proxy**: Select from available upstream proxies
+
+### Buttons
+
+| Button | Password Required | Description |
+|--------|-------------------|-------------|
+| **Refresh** | No | Fetch available proxies from server |
+| **Connect** | No | Test connection to server |
+| **Register Device (Admin)** | Admin password | Register new device with server |
+| **Change Proxy (Supervisor)** | Supervisor password | Change proxy for existing device |
+| **Check IP** | No | Show current public IP and which proxy it belongs to |
+
+### Rollout Mode
+
+When "Rollout Setup" is checked during registration:
+- All settings are locked (IP, port, username, proxy)
+- Only Connect and Check IP buttons work
+- Supervisors can temporarily unlock to make changes
+- Prevents end-users from modifying device configuration
+
+### Android WiFi Proxy Settings
+
+After registering in the app:
+1. Go to **Settings > WiFi**
+2. Long-press your network > **Modify network**
+3. Enable **Advanced options**
+4. Set **Proxy** to **Manual**
+5. **Hostname**: Your server IP
+6. **Port**: 8888
+7. Save
+
+---
+
+## API Endpoints
+
+### App Endpoints (No Auth)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/app/proxies` | GET | List available proxies |
+| `/api/app/register` | POST | Register new device |
+| `/api/app/change-proxy` | POST | Change device's proxy |
+| `/api/app/whoami` | GET | Get current public IP |
+| `/api/app/check-ip` | POST | Check if IP matches a proxy |
+| `/api/app/validate-password` | POST | Validate admin/supervisor password |
+
+### Dashboard Endpoints (Auth Required)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/devices` | GET | List all devices |
+| `/api/proxies` | GET | List all proxies |
+| `/api/change-proxy` | POST | Change device proxy |
+| `/api/supervisors` | GET | List supervisors |
+| `/api/add-supervisor` | POST | Add supervisor |
+| `/api/update-supervisor` | POST | Update supervisor |
+| `/api/delete-supervisor` | POST | Delete supervisor |
+| `/api/admin-password` | POST | Update admin password |
+
+---
+
+## Troubleshooting
+
+### Dashboard not accessible
+1. Check firewall: `sudo ufw allow 8080/tcp`
+2. Verify server is running: `netstat -tlnp | grep 8080`
+3. Ensure binding to all interfaces (BIND_ADDR=0.0.0.0)
+
+### Devices can't connect through proxy
+1. Check firewall: `sudo ufw allow 8888/tcp`
+2. Verify proxy port: `netstat -tlnp | grep 8888`
+3. Test upstream proxy connectivity from server
+
+### Android app can't reach server
+1. Ensure phone and server on same network
+2. Test: `http://SERVER_IP:8080` in phone browser
+3. Check if server IP is correct in app settings
+
+### Check IP shows wrong IP
+1. Verify the device is using WiFi proxy (not mobile data)
+2. Check that the correct proxy is selected
+3. Ensure upstream proxy is working
+
+### Password validation fails
+1. Check server connectivity
+2. Verify password in Dashboard > Settings > Supervisor Management
+3. Fallback passwords work if server is unreachable
+
+---
+
+## File Structure
+
+```
+lumierproxy/
+├── main.go              # Server source code
+├── proxies.txt          # Upstream proxy list
+├── device_data.json     # Persistent device/settings data
+├── go.mod               # Go module definition
+├── run_proxy.ps1        # Windows launcher
+├── run_proxy.sh         # Linux launcher
+├── install.sh           # Linux service installer
+├── start.sh             # Simple Linux launcher
+└── android-app/         # Android application source
+```
+
+---
+
+## Security Notes
+
+- Change default dashboard password immediately after first login
+- Use strong passwords for admin and supervisors
+- Keep `REQUIRE_REGISTRATION=true` in production
+- Consider running behind a reverse proxy with HTTPS
+- Supervisor passwords are stored in `device_data.json`
+
+---
+
+## Version History
+
+### v3.0 (Current)
+- Supervisor management in dashboard
+- Server-side password validation
+- Improved proxy selection dialog
+- Rollout mode field locking
+- Audit logging for proxy changes
+
+### v2.0
+- Device groups and search
+- Traffic analytics
+- Proxy health monitoring
+- Export functionality
+
+### v1.0
+- Basic proxy routing
+- Device registration
+- Web dashboard
