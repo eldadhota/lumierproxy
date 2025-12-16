@@ -2,9 +2,12 @@ package com.lumier.proxyconnect
 
 import android.content.Context
 import android.os.Bundle
+import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
@@ -26,6 +29,16 @@ class MainActivity : AppCompatActivity() {
         const val KEY_USERNAME = "username"
         const val KEY_PROXY_INDEX = "proxy_index"
         const val KEY_SESSION_TOKEN = "session_token"
+        const val KEY_ROLLOUT_MODE = "rollout_mode"  // Locks username and proxy selection
+
+        // Fallback passwords (used if server is unreachable)
+        const val FALLBACK_ADMIN_PASSWORD = "Drnda123"
+        val FALLBACK_SUPERVISOR_PASSWORDS = mapOf(
+            "DobroJeMirko321a" to "Mirko",
+            "SupervisorAna123" to "Ana",
+            "SupervisorMarko456" to "Marko",
+            "SupervisorIvan789" to "Ivan"
+        )
     }
 
     private lateinit var etServerIp: EditText
@@ -33,6 +46,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etUsername: EditText
     private lateinit var spinnerProxy: Spinner
     private lateinit var btnRefresh: Button
+    private lateinit var btnConnect: Button
     private lateinit var btnRegister: Button
     private lateinit var btnChangeProxy: Button
     private lateinit var btnCheckIp: Button
@@ -41,6 +55,8 @@ class MainActivity : AppCompatActivity() {
 
     private val proxyList = mutableListOf<ProxyItem>()
     private var sessionToken: String? = null
+    private var isRolloutMode = false
+    private var detectedProxyName: String? = null  // Store detected proxy from Check IP
 
     data class ProxyItem(val index: Int, val name: String) {
         override fun toString() = name
@@ -55,6 +71,7 @@ class MainActivity : AppCompatActivity() {
         etUsername = findViewById(R.id.etUsername)
         spinnerProxy = findViewById(R.id.spinnerProxy)
         btnRefresh = findViewById(R.id.btnRefresh)
+        btnConnect = findViewById(R.id.btnConnect)
         btnRegister = findViewById(R.id.btnRegister)
         btnChangeProxy = findViewById(R.id.btnChangeProxy)
         btnCheckIp = findViewById(R.id.btnCheckIp)
@@ -62,8 +79,10 @@ class MainActivity : AppCompatActivity() {
         tvWhoAmI = findViewById(R.id.tvWhoAmI)
 
         loadSavedSettings()
+        applyRolloutMode()
 
         btnRefresh.setOnClickListener { fetchProxies() }
+        btnConnect.setOnClickListener { connectDevice() }
         btnRegister.setOnClickListener { registerDevice() }
         btnChangeProxy.setOnClickListener { changeProxy() }
         btnCheckIp.setOnClickListener { checkWhoAmI() }
@@ -80,6 +99,40 @@ class MainActivity : AppCompatActivity() {
         etServerPort.setText(prefs.getString(KEY_SERVER_PORT, "8888"))
         etUsername.setText(prefs.getString(KEY_USERNAME, ""))
         sessionToken = prefs.getString(KEY_SESSION_TOKEN, null)
+        isRolloutMode = prefs.getBoolean(KEY_ROLLOUT_MODE, false)
+    }
+
+    private fun applyRolloutMode() {
+        if (isRolloutMode) {
+            // Lock all settings in rollout mode - only Connect and Check IP available to users
+            etServerIp.isEnabled = false
+            etServerPort.isEnabled = false
+            etUsername.isEnabled = false
+            spinnerProxy.isEnabled = false
+            btnRefresh.visibility = View.GONE
+            tvStatus.text = "Rollout Mode - Settings locked"
+            tvStatus.setTextColor(getColor(R.color.primary))
+        } else {
+            etServerIp.isEnabled = true
+            etServerPort.isEnabled = true
+            etUsername.isEnabled = true
+            spinnerProxy.isEnabled = true
+            btnRefresh.visibility = View.VISIBLE
+        }
+    }
+
+    private fun temporarilyUnlockForSupervisor() {
+        // Temporarily unlock proxy selection for supervisor to make changes
+        spinnerProxy.isEnabled = true
+        btnRefresh.visibility = View.VISIBLE
+    }
+
+    private fun relockAfterSupervisorChange() {
+        // Re-lock fields after supervisor makes changes (if in rollout mode)
+        if (isRolloutMode) {
+            spinnerProxy.isEnabled = false
+            btnRefresh.visibility = View.GONE
+        }
     }
 
     private fun saveSettings() {
@@ -117,6 +170,42 @@ class MainActivity : AppCompatActivity() {
     private fun readResponse(connection: HttpURLConnection): String {
         val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
         return stream?.bufferedReader()?.use(BufferedReader::readText) ?: ""
+    }
+
+    // Validates password against server API, returns supervisor name if valid, null if invalid
+    // Uses fallback passwords if server is unreachable
+    private fun validatePassword(password: String, type: String): String? {
+        return try {
+            val url = URL("${getServerUrl()}/api/app/validate-password")
+            val connection = url.openConnection() as HttpURLConnection
+            connection.connectTimeout = 5000
+            connection.readTimeout = 5000
+            connection.requestMethod = "POST"
+            connection.setRequestProperty("Content-Type", "application/json")
+            connection.doOutput = true
+
+            val json = JSONObject().apply {
+                put("password", password)
+                put("type", type)
+            }
+            connection.outputStream.write(json.toString().toByteArray())
+
+            val response = readResponse(connection)
+            val jsonResponse = JSONObject(response)
+
+            if (jsonResponse.optBoolean("valid", false)) {
+                jsonResponse.optString("name", "Unknown")
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            // Server unreachable - use fallback passwords
+            if (type == "admin") {
+                if (password == FALLBACK_ADMIN_PASSWORD) "Admin" else null
+            } else {
+                FALLBACK_SUPERVISOR_PASSWORDS[password]
+            }
+        }
     }
 
     private fun authenticate(): Boolean {
@@ -273,6 +362,47 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun connectDevice() {
+        val serverIp = etServerIp.text.toString().trim()
+        val username = etUsername.text.toString().trim()
+
+        if (serverIp.isEmpty()) {
+            Toast.makeText(this, "Enter server IP", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (username.isEmpty()) {
+            Toast.makeText(this, "Enter username", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        saveSettings()
+        tvStatus.text = "Connecting..."
+        tvStatus.setTextColor(getColor(R.color.text_secondary))
+        btnConnect.isEnabled = false
+
+        // Authenticate and check IP
+        Thread {
+            try {
+                val authenticated = authenticate()
+                runOnUiThread {
+                    btnConnect.isEnabled = true
+                    if (authenticated) {
+                        tvStatus.text = "Connected as $username"
+                        tvStatus.setTextColor(getColor(R.color.status_connected))
+                        // Trigger IP check
+                        checkWhoAmI()
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    btnConnect.isEnabled = true
+                    tvStatus.text = "Error: ${e.message?.take(40)}"
+                    tvStatus.setTextColor(getColor(R.color.status_disconnected))
+                }
+            }
+        }.start()
+    }
+
     private fun registerDevice() {
         val serverIp = etServerIp.text.toString().trim()
         val username = etUsername.text.toString().trim()
@@ -296,33 +426,59 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Show password dialog
+        // Show password dialog with rollout option
         showRegistrationPasswordDialog(username, selectedProxy)
     }
 
     private fun showRegistrationPasswordDialog(username: String, selectedProxy: ProxyItem) {
-        val passwordInput = EditText(this).apply {
-            hint = "Enter registration password"
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(50, 30, 50, 10)
         }
 
+        val passwordInput = EditText(this).apply {
+            hint = "Enter admin password"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        layout.addView(passwordInput)
+
+        val rolloutCheckbox = CheckBox(this).apply {
+            text = "Rollout Setup (lock username & proxy)"
+            setPadding(0, 20, 0, 0)
+        }
+        layout.addView(rolloutCheckbox)
+
         AlertDialog.Builder(this)
-            .setTitle("Registration Password")
-            .setMessage("Enter the registration password to register this device")
-            .setView(passwordInput)
+            .setTitle("Admin Registration")
+            .setMessage("Enter admin password to register this device")
+            .setView(layout)
             .setPositiveButton("Register") { _, _ ->
                 val password = passwordInput.text.toString()
                 if (password.isEmpty()) {
                     Toast.makeText(this, "Password is required", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
-                performRegistration(username, selectedProxy, password)
+                val enableRollout = rolloutCheckbox.isChecked
+
+                // Validate password in background thread
+                tvStatus.text = "Validating password..."
+                Thread {
+                    val adminName = validatePassword(password, "admin")
+                    runOnUiThread {
+                        if (adminName != null) {
+                            performRegistration(username, selectedProxy, password, enableRollout)
+                        } else {
+                            tvStatus.text = "Ready"
+                            Toast.makeText(this, "Invalid admin password", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }.start()
             }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun performRegistration(username: String, selectedProxy: ProxyItem, password: String) {
+    private fun performRegistration(username: String, selectedProxy: ProxyItem, password: String, enableRollout: Boolean) {
         saveSettings()
 
         tvStatus.text = "Registering..."
@@ -369,7 +525,17 @@ class MainActivity : AppCompatActivity() {
                             val proxyName = result.optString("proxy_name", selectedProxy.name)
                             tvStatus.text = "Registered: $username -> $proxyName"
                             tvStatus.setTextColor(getColor(R.color.status_connected))
-                            Toast.makeText(this, "Device registered!", Toast.LENGTH_SHORT).show()
+
+                            // Save rollout mode if enabled
+                            if (enableRollout) {
+                                isRolloutMode = true
+                                val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                                prefs.edit { putBoolean(KEY_ROLLOUT_MODE, true) }
+                                applyRolloutMode()
+                                Toast.makeText(this, "Device registered with Rollout Setup!", Toast.LENGTH_LONG).show()
+                            } else {
+                                Toast.makeText(this, "Device registered!", Toast.LENGTH_SHORT).show()
+                            }
                         } else {
                             val message = result.optString("message", "Registration failed")
                             tvStatus.text = "Error: $message"
@@ -405,12 +571,93 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val selectedProxy = spinnerProxy.selectedItem as? ProxyItem
-        if (selectedProxy == null) {
-            Toast.makeText(this, "Select a proxy", Toast.LENGTH_SHORT).show()
-            return
+        // Show supervisor password dialog first
+        showSupervisorPasswordDialog(username)
+    }
+
+    private fun showSupervisorPasswordDialog(username: String) {
+        val passwordInput = EditText(this).apply {
+            hint = "Enter supervisor password"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setPadding(50, 30, 50, 30)
         }
 
+        AlertDialog.Builder(this)
+            .setTitle("Supervisor Access")
+            .setMessage("Enter your supervisor password to change proxy settings")
+            .setView(passwordInput)
+            .setPositiveButton("Authenticate") { _, _ ->
+                val password = passwordInput.text.toString()
+                if (password.isEmpty()) {
+                    Toast.makeText(this, "Password is required", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+
+                // Validate password in background thread
+                tvStatus.text = "Validating password..."
+                Thread {
+                    val supervisorName = validatePassword(password, "supervisor")
+                    runOnUiThread {
+                        tvStatus.text = if (isRolloutMode) "Rollout Mode - Settings locked" else "Ready"
+                        if (supervisorName != null) {
+                            // Supervisor authenticated - unlock fields and show proxy selection dialog
+                            temporarilyUnlockForSupervisor()
+                            Toast.makeText(this, "Welcome, $supervisorName!", Toast.LENGTH_SHORT).show()
+                            showProxySelectionDialog(username, supervisorName)
+                        } else {
+                            Toast.makeText(this, "Invalid supervisor password", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }.start()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showProxySelectionDialog(username: String, supervisorName: String) {
+        // Create a custom layout with a Spinner for proxy selection
+        val layout = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(50, 30, 50, 30)
+        }
+
+        val infoText = android.widget.TextView(this).apply {
+            text = "Supervisor: $supervisorName\nChanging proxy for: $username"
+            setPadding(0, 0, 0, 30)
+        }
+        layout.addView(infoText)
+
+        val proxySpinner = android.widget.Spinner(this)
+        val proxyNames = proxyList.map { it.name }
+        val adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_spinner_item, proxyNames)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        proxySpinner.adapter = adapter
+        proxySpinner.setSelection(spinnerProxy.selectedItemPosition.coerceIn(0, proxyList.size - 1))
+        layout.addView(proxySpinner)
+
+        AlertDialog.Builder(this)
+            .setTitle("Select New Proxy")
+            .setView(layout)
+            .setPositiveButton("Change Proxy") { _, _ ->
+                val selectedIndex = proxySpinner.selectedItemPosition
+                if (selectedIndex >= 0 && selectedIndex < proxyList.size) {
+                    val selectedProxy = proxyList[selectedIndex]
+                    spinnerProxy.setSelection(selectedIndex)
+                    performChangeProxy(username, selectedProxy, supervisorName)
+                }
+            }
+            .setNegativeButton("Cancel") { _, _ ->
+                // Re-lock if cancelled
+                relockAfterSupervisorChange()
+            }
+            .setOnCancelListener {
+                // Re-lock if dismissed
+                relockAfterSupervisorChange()
+            }
+            .show()
+    }
+
+    private fun performChangeProxy(username: String, selectedProxy: ProxyItem, supervisorName: String) {
         saveSettings()
 
         tvStatus.text = "Updating proxy..."
@@ -433,6 +680,7 @@ class MainActivity : AppCompatActivity() {
                     val json = JSONObject().apply {
                         put("username", username)
                         put("proxy_index", selectedProxy.index)
+                        put("supervisor", supervisorName)  // Send supervisor name for logging
                     }
 
                     connection.outputStream.bufferedWriter().use { it.write(json.toString()) }
@@ -452,11 +700,14 @@ class MainActivity : AppCompatActivity() {
 
                     runOnUiThread {
                         btnChangeProxy.isEnabled = true
+                        relockAfterSupervisorChange()  // Re-lock after change
                         if (result.optBoolean("success", false)) {
                             val proxyName = result.optString("proxy_name", selectedProxy.name)
-                            tvStatus.text = "Proxy updated: $username -> $proxyName"
+                            tvStatus.text = "Proxy updated by $supervisorName: $username -> $proxyName"
                             tvStatus.setTextColor(getColor(R.color.status_connected))
-                            Toast.makeText(this, "Proxy changed!", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this, "Proxy changed by $supervisorName!", Toast.LENGTH_SHORT).show()
+                            // Trigger IP check to verify the change
+                            checkWhoAmI()
                         } else {
                             val message = result.optString("message", "Update failed")
                             tvStatus.text = "Error: $message"
@@ -468,6 +719,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 runOnUiThread {
                     btnChangeProxy.isEnabled = true
+                    relockAfterSupervisorChange()
                     tvStatus.text = "Error: ${e.message?.take(40)}"
                     tvStatus.setTextColor(getColor(R.color.status_disconnected))
                 }
@@ -478,6 +730,10 @@ class MainActivity : AppCompatActivity() {
     private fun checkWhoAmI() {
         tvWhoAmI.text = "Checking IP..."
         tvWhoAmI.setTextColor(getColor(R.color.text_secondary))
+
+        // Get selected proxy name for comparison
+        val selectedProxy = spinnerProxy.selectedItem as? ProxyItem
+        val selectedProxyName = selectedProxy?.name ?: ""
 
         Thread {
             try {
@@ -507,7 +763,7 @@ class MainActivity : AppCompatActivity() {
 
                 // Step 2: Check with server which proxy this IP belongs to
                 val serverIp = etServerIp.text.toString().trim()
-                var proxyInfo = ""
+                var detectedProxy = ""
                 var isMatched = false
                 var warningMsg = ""
 
@@ -525,7 +781,7 @@ class MainActivity : AppCompatActivity() {
                         val checkResult = JSONObject(checkResponse)
                         isMatched = checkResult.optBoolean("matched", false)
                         if (isMatched) {
-                            proxyInfo = checkResult.optString("proxy_name", "")
+                            detectedProxy = checkResult.optString("proxy_name", "")
                         } else {
                             warningMsg = checkResult.optString("message", "IP not in proxy list")
                         }
@@ -534,23 +790,51 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
+                // Store detected proxy for other functions
+                detectedProxyName = if (isMatched) detectedProxy else null
+
                 // Build display string
                 val displayBuilder = StringBuilder()
                 displayBuilder.append(publicIP)
                 if (location.isNotEmpty()) {
                     displayBuilder.append(" ($location)")
                 }
-                if (proxyInfo.isNotEmpty()) {
-                    displayBuilder.append("\n✓ $proxyInfo")
-                }
 
                 runOnUiThread {
                     if (isMatched) {
-                        tvWhoAmI.text = displayBuilder.toString()
-                        tvWhoAmI.setTextColor(getColor(R.color.status_connected))
+                        displayBuilder.append("\n✓ $detectedProxy")
+
+                        // Check if detected proxy matches selected proxy
+                        if (selectedProxyName.isNotEmpty() && detectedProxy != selectedProxyName) {
+                            // MISMATCH - Show warning
+                            displayBuilder.append("\n\n⚠️ MISMATCH: Selected $selectedProxyName but connected via $detectedProxy")
+                            displayBuilder.append("\n\nPlease check Wi-Fi settings or contact Supervisor!")
+                            tvWhoAmI.text = displayBuilder.toString()
+                            tvWhoAmI.setTextColor(getColor(R.color.status_disconnected))
+
+                            // Show alert dialog for mismatch
+                            AlertDialog.Builder(this)
+                                .setTitle("⚠️ Proxy Mismatch")
+                                .setMessage("Your selected proxy is $selectedProxyName but you're connected via $detectedProxy.\n\nPlease:\n1. Check your Wi-Fi proxy settings\n2. Make sure you're on the correct network\n3. Contact your Supervisor if the issue persists")
+                                .setPositiveButton("OK", null)
+                                .show()
+                        } else {
+                            // Match - all good
+                            tvWhoAmI.text = displayBuilder.toString()
+                            tvWhoAmI.setTextColor(getColor(R.color.status_connected))
+                        }
                     } else if (warningMsg.isNotEmpty()) {
-                        tvWhoAmI.text = "$displayBuilder\n⚠ $warningMsg"
+                        displayBuilder.append("\n\n⚠️ $warningMsg")
+                        displayBuilder.append("\n\nPlease check Wi-Fi settings or contact Supervisor!")
+                        tvWhoAmI.text = displayBuilder.toString()
                         tvWhoAmI.setTextColor(getColor(R.color.status_disconnected))
+
+                        // Show alert for unrecognized IP
+                        AlertDialog.Builder(this)
+                            .setTitle("⚠️ Unknown IP")
+                            .setMessage("Your IP address ($publicIP) is not recognized as one of our proxies.\n\nPlease:\n1. Check your Wi-Fi proxy settings\n2. Make sure you're connected through the proxy\n3. Contact your Supervisor if the issue persists")
+                            .setPositiveButton("OK", null)
+                            .show()
                     } else {
                         tvWhoAmI.text = displayBuilder.toString()
                         tvWhoAmI.setTextColor(getColor(R.color.text_secondary))
