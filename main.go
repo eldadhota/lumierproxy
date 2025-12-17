@@ -108,6 +108,7 @@ type PersistentData struct {
 	SystemSettings  SystemSettings          `json:"system_settings"`
 	Supervisors     []Supervisor            `json:"supervisors"`
 	AdminPassword   string                  `json:"admin_password"`
+	ProxyNames      map[int]string          `json:"proxy_names"` // Custom names for proxies (index -> name)
 }
 
 type Supervisor struct {
@@ -217,12 +218,13 @@ type LogEntry struct {
 }
 
 type ProxyInfo struct {
-	Index int    `json:"index"`
-	Host  string `json:"host"`
-	Port  string `json:"port"`
-	User  string `json:"user"`
-	Pass  string `json:"pass"`
-	Full  string `json:"full"`
+	Index      int    `json:"index"`
+	Host       string `json:"host"`
+	Port       string `json:"port"`
+	User       string `json:"user"`
+	Pass       string `json:"pass"`
+	Full       string `json:"full"`
+	CustomName string `json:"custom_name"`
 }
 
 type changeProxyRequest struct {
@@ -582,6 +584,20 @@ func (s *ProxyServer) loadPersistentData() {
 	if s.persistentData.AdminPassword == "" {
 		s.persistentData.AdminPassword = "Drnda123"
 	}
+	// Initialize proxy names map if empty
+	if s.persistentData.ProxyNames == nil {
+		s.persistentData.ProxyNames = make(map[int]string)
+	}
+}
+
+// getProxyName returns the custom name for a proxy or the default "SG{n}" format
+func (s *ProxyServer) getProxyName(index int) string {
+	s.persistMu.RLock()
+	defer s.persistMu.RUnlock()
+	if name, ok := s.persistentData.ProxyNames[index]; ok && name != "" {
+		return name
+	}
+	return fmt.Sprintf("SG%d", index+1)
 }
 
 // restoreDevicesFromConfig recreates device objects from saved configs so that
@@ -1118,6 +1134,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	case "/api/app/check-ip":
 		handleAppCheckIP(w, r)
 		return
+	case "/api/app/validate-password":
+		handleAppValidatePassword(w, r)
+		return
 	}
 
 	username := parseProxyUsername(r)
@@ -1350,6 +1369,8 @@ func startDashboard() {
 	http.HandleFunc("/api/update-supervisor", server.requireAuth(handleUpdateSupervisorAPI))
 	http.HandleFunc("/api/delete-supervisor", server.requireAuth(handleDeleteSupervisorAPI))
 	http.HandleFunc("/api/admin-password", server.requireAuth(handleAdminPasswordAPI))
+	http.HandleFunc("/api/update-proxy-name", server.requireAuth(handleUpdateProxyNameAPI))
+	http.HandleFunc("/api/reorder-proxies", server.requireAuth(handleReorderProxiesAPI))
 
 	log.Printf("📊 Dashboard on port %d\n", server.dashPort)
 	addr := fmt.Sprintf("%s:%d", server.bindAddr, server.dashPort)
@@ -1589,7 +1610,15 @@ func handleProxiesAPI(w http.ResponseWriter, r *http.Request) {
 	for i, line := range server.proxyPool {
 		parts := strings.Split(line, ":")
 		if len(parts) >= 4 {
-			proxies = append(proxies, ProxyInfo{Index: i, Host: parts[0], Port: parts[1], User: parts[2], Pass: parts[3], Full: line})
+			proxies = append(proxies, ProxyInfo{
+				Index:      i,
+				Host:       parts[0],
+				Port:       parts[1],
+				User:       parts[2],
+				Pass:       parts[3],
+				Full:       line,
+				CustomName: server.getProxyName(i),
+			})
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1626,7 +1655,7 @@ func handleAppProxiesAPI(w http.ResponseWriter, r *http.Request) {
 	for i := range server.proxyPool {
 		proxies = append(proxies, AppProxyInfo{
 			Index: i,
-			Name:  fmt.Sprintf("SG%d", i+1),
+			Name:  server.getProxyName(i),
 		})
 	}
 	json.NewEncoder(w).Encode(proxies)
@@ -3069,6 +3098,90 @@ func handleAdminPasswordAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
 }
 
+func handleUpdateProxyNameAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Index int    `json:"index"`
+		Name  string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	server.poolMu.Lock()
+	if req.Index < 0 || req.Index >= len(server.proxyPool) {
+		server.poolMu.Unlock()
+		http.Error(w, "invalid proxy index", http.StatusBadRequest)
+		return
+	}
+	server.poolMu.Unlock()
+	server.persistMu.Lock()
+	if server.persistentData.ProxyNames == nil {
+		server.persistentData.ProxyNames = make(map[int]string)
+	}
+	if req.Name == "" {
+		delete(server.persistentData.ProxyNames, req.Index)
+	} else {
+		server.persistentData.ProxyNames[req.Index] = req.Name
+	}
+	server.persistMu.Unlock()
+	server.savePersistentData()
+	log.Printf("📝 Proxy %d renamed to: %s\n", req.Index+1, req.Name)
+	server.addLog("info", fmt.Sprintf("Proxy %d renamed to: %s", req.Index+1, req.Name))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
+
+func handleReorderProxiesAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Order []int `json:"order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	server.poolMu.Lock()
+	if len(req.Order) != len(server.proxyPool) {
+		server.poolMu.Unlock()
+		http.Error(w, "invalid order length", http.StatusBadRequest)
+		return
+	}
+	newPool := make([]string, len(server.proxyPool))
+	for newIdx, oldIdx := range req.Order {
+		if oldIdx < 0 || oldIdx >= len(server.proxyPool) {
+			server.poolMu.Unlock()
+			http.Error(w, "invalid index in order", http.StatusBadRequest)
+			return
+		}
+		newPool[newIdx] = server.proxyPool[oldIdx]
+	}
+	server.persistMu.Lock()
+	newNames := make(map[int]string)
+	for newIdx, oldIdx := range req.Order {
+		if name, ok := server.persistentData.ProxyNames[oldIdx]; ok {
+			newNames[newIdx] = name
+		}
+	}
+	server.persistentData.ProxyNames = newNames
+	server.persistMu.Unlock()
+	server.proxyPool = newPool
+	server.poolMu.Unlock()
+	// Save to proxies.txt
+	content := strings.Join(server.proxyPool, "\n")
+	os.WriteFile("proxies.txt", []byte(content), 0644)
+	server.savePersistentData()
+	log.Printf("🔄 Proxies reordered\n")
+	server.addLog("info", "Proxies reordered")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
 const loginPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Login</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.login-container{background:rgba(255,255,255,0.95);padding:40px;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);width:100%;max-width:400px}.logo{text-align:center;margin-bottom:30px}.logo h1{color:#667eea;font-size:2em;margin-bottom:5px}.logo p{color:#666;font-size:0.9em}.form-group{margin-bottom:20px}.form-group label{display:block;font-weight:600;color:#333;margin-bottom:8px}.form-group input{width:100%;padding:14px 16px;border:2px solid #e0e0e0;border-radius:10px;font-size:1em}.form-group input:focus{outline:none;border-color:#667eea}.login-btn{width:100%;padding:14px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:10px;font-size:1.1em;font-weight:600;cursor:pointer}.login-btn:hover{opacity:0.9}.login-btn:disabled{opacity:0.5;cursor:not-allowed}.error-msg{background:#ffebee;color:#c62828;padding:12px;border-radius:8px;margin-bottom:20px;display:none}.error-msg.show{display:block}</style></head>
 <body><div class="login-container"><div class="logo"><h1>🌐 Lumier Dynamics</h1><p>Enterprise Proxy Management v3.0</p></div><div class="error-msg" id="errorMsg"></div><form onsubmit="return handleLogin(event)"><div class="form-group"><label>Username</label><input type="text" id="username" placeholder="Enter username" required autofocus></div><div class="form-group"><label>Password</label><input type="password" id="password" placeholder="Enter password" required></div><button type="submit" class="login-btn" id="loginBtn">Sign In</button></form></div>

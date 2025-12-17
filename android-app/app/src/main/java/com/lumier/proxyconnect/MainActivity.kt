@@ -1,6 +1,10 @@
 package com.lumier.proxyconnect
 
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.net.ConnectivityManager
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.view.View
 import android.widget.ArrayAdapter
@@ -58,6 +62,11 @@ class MainActivity : AppCompatActivity() {
     private var isRolloutMode = false
     private var detectedProxyName: String? = null  // Store detected proxy from Check IP
 
+    // Broadcast receivers for automatic IP checks
+    private val networkChangeReceiver = NetworkChangeReceiver()
+    private val screenUnlockReceiver = ScreenUnlockReceiver()
+    private var receiversRegistered = false
+
     data class ProxyItem(val index: Int, val name: String) {
         override fun toString() = name
     }
@@ -87,10 +96,67 @@ class MainActivity : AppCompatActivity() {
         btnChangeProxy.setOnClickListener { changeProxy() }
         btnCheckIp.setOnClickListener { checkWhoAmI() }
 
+        // Set up callbacks for automatic IP checks
+        NetworkChangeReceiver.onWifiConnected = {
+            runOnUiThread {
+                Toast.makeText(this, "WiFi connected - checking IP...", Toast.LENGTH_SHORT).show()
+                checkWhoAmI()
+            }
+        }
+        ScreenUnlockReceiver.onScreenUnlocked = {
+            runOnUiThread {
+                // Only check if app is visible
+                if (!isFinishing && !isDestroyed) {
+                    checkWhoAmI()
+                }
+            }
+        }
+
+        // Register broadcast receivers
+        registerReceivers()
+
         // Auto-fetch proxies if server is configured
         if (etServerIp.text.isNotEmpty()) {
             fetchProxies()
         }
+    }
+
+    private fun registerReceivers() {
+        if (receiversRegistered) return
+
+        try {
+            // Register for WiFi/connectivity changes
+            val networkFilter = IntentFilter().apply {
+                addAction(ConnectivityManager.CONNECTIVITY_ACTION)
+                addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION)
+            }
+            registerReceiver(networkChangeReceiver, networkFilter)
+
+            // Register for screen unlock
+            val screenFilter = IntentFilter(Intent.ACTION_USER_PRESENT)
+            registerReceiver(screenUnlockReceiver, screenFilter)
+
+            receiversRegistered = true
+        } catch (e: Exception) {
+            // Ignore registration errors
+        }
+    }
+
+    private fun unregisterReceivers() {
+        if (!receiversRegistered) return
+
+        try {
+            unregisterReceiver(networkChangeReceiver)
+            unregisterReceiver(screenUnlockReceiver)
+            receiversRegistered = false
+        } catch (e: Exception) {
+            // Ignore unregistration errors
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterReceivers()
     }
 
     private fun loadSavedSettings() {
@@ -738,7 +804,7 @@ class MainActivity : AppCompatActivity() {
         Thread {
             try {
                 // Step 1: Get public IP directly from external service (device's actual IP)
-                val ipApiUrl = URL("http://ip-api.com/json/?fields=status,query,country,city")
+                val ipApiUrl = URL("http://ip-api.com/json/?fields=status,query,country,city,countryCode")
                 val ipConnection = ipApiUrl.openConnection() as HttpURLConnection
                 ipConnection.connectTimeout = 15000
                 ipConnection.readTimeout = 15000
@@ -758,8 +824,13 @@ class MainActivity : AppCompatActivity() {
 
                 val publicIP = ipResult.optString("query", "?")
                 val country = ipResult.optString("country", "")
+                val countryCode = ipResult.optString("countryCode", "")
                 val city = ipResult.optString("city", "")
                 val location = listOf(city, country).filter { it.isNotEmpty() }.joinToString(", ")
+
+                // Check if country is Singapore
+                val isSingapore = countryCode.equals("SG", ignoreCase = true) ||
+                        country.equals("Singapore", ignoreCase = true)
 
                 // Step 2: Check with server which proxy this IP belongs to
                 val serverIp = etServerIp.text.toString().trim()
@@ -801,43 +872,56 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 runOnUiThread {
+                    var hasWarning = false
+                    var warningTitle = ""
+                    var warningMessage = ""
+
+                    // Check 1: Is it from Singapore?
+                    if (!isSingapore) {
+                        hasWarning = true
+                        displayBuilder.append("\n\n⚠️ WARNING: NOT from Singapore!")
+                        displayBuilder.append("\nCountry: $country")
+                        warningTitle = "⚠️ Wrong Location"
+                        warningMessage = "Your IP address ($publicIP) is from $country, NOT from Singapore!\n\nPlease:\n1. Check your Wi-Fi proxy settings\n2. Make sure you're connected through the correct proxy\n3. Contact your Supervisor immediately"
+                    }
+
+                    // Check 2: Is it a recognized proxy?
                     if (isMatched) {
                         displayBuilder.append("\n✓ $detectedProxy")
 
                         // Check if detected proxy matches selected proxy
                         if (selectedProxyName.isNotEmpty() && detectedProxy != selectedProxyName) {
-                            // MISMATCH - Show warning
+                            hasWarning = true
                             displayBuilder.append("\n\n⚠️ MISMATCH: Selected $selectedProxyName but connected via $detectedProxy")
-                            displayBuilder.append("\n\nPlease check Wi-Fi settings or contact Supervisor!")
-                            tvWhoAmI.text = displayBuilder.toString()
-                            tvWhoAmI.setTextColor(getColor(R.color.status_disconnected))
-
-                            // Show alert dialog for mismatch
-                            AlertDialog.Builder(this)
-                                .setTitle("⚠️ Proxy Mismatch")
-                                .setMessage("Your selected proxy is $selectedProxyName but you're connected via $detectedProxy.\n\nPlease:\n1. Check your Wi-Fi proxy settings\n2. Make sure you're on the correct network\n3. Contact your Supervisor if the issue persists")
-                                .setPositiveButton("OK", null)
-                                .show()
-                        } else {
-                            // Match - all good
-                            tvWhoAmI.text = displayBuilder.toString()
-                            tvWhoAmI.setTextColor(getColor(R.color.status_connected))
+                            warningTitle = "⚠️ Proxy Mismatch"
+                            warningMessage = "Your selected proxy is $selectedProxyName but you're connected via $detectedProxy.\n\nPlease:\n1. Check your Wi-Fi proxy settings\n2. Make sure you're on the correct network\n3. Contact your Supervisor if the issue persists"
                         }
                     } else if (warningMsg.isNotEmpty()) {
+                        hasWarning = true
                         displayBuilder.append("\n\n⚠️ $warningMsg")
+                        if (warningTitle.isEmpty()) {
+                            warningTitle = "⚠️ Unknown IP"
+                            warningMessage = "Your IP address ($publicIP) is not recognized as one of our proxies.\n\nPlease:\n1. Check your Wi-Fi proxy settings\n2. Make sure you're connected through the proxy\n3. Contact your Supervisor if the issue persists"
+                        }
+                    }
+
+                    if (hasWarning) {
                         displayBuilder.append("\n\nPlease check Wi-Fi settings or contact Supervisor!")
                         tvWhoAmI.text = displayBuilder.toString()
                         tvWhoAmI.setTextColor(getColor(R.color.status_disconnected))
 
-                        // Show alert for unrecognized IP
-                        AlertDialog.Builder(this)
-                            .setTitle("⚠️ Unknown IP")
-                            .setMessage("Your IP address ($publicIP) is not recognized as one of our proxies.\n\nPlease:\n1. Check your Wi-Fi proxy settings\n2. Make sure you're connected through the proxy\n3. Contact your Supervisor if the issue persists")
-                            .setPositiveButton("OK", null)
-                            .show()
+                        // Show alert dialog
+                        if (warningTitle.isNotEmpty()) {
+                            AlertDialog.Builder(this)
+                                .setTitle(warningTitle)
+                                .setMessage(warningMessage)
+                                .setPositiveButton("OK", null)
+                                .show()
+                        }
                     } else {
+                        // All good - matched and from Singapore
                         tvWhoAmI.text = displayBuilder.toString()
-                        tvWhoAmI.setTextColor(getColor(R.color.text_secondary))
+                        tvWhoAmI.setTextColor(getColor(R.color.status_connected))
                     }
                 }
 
