@@ -48,6 +48,10 @@ type Device struct {
 	ErrorCount    int64     `json:"error_count"`
 	LastError     string    `json:"last_error"`
 	LastErrorTime time.Time `json:"last_error_time"`
+	// Session confirmation fields
+	Confirmed     bool      `json:"confirmed"`
+	ConfirmedAt   time.Time `json:"confirmed_at"`
+	SessionStart  time.Time `json:"session_start"`
 }
 
 type ProxyHealth struct {
@@ -78,12 +82,14 @@ type TrafficSnapshot struct {
 }
 
 type DeviceConfig struct {
-	Username   string `json:"username"`
-	CustomName string `json:"custom_name"`
-	Group      string `json:"group"`
-	Notes      string `json:"notes"`
-	ProxyIndex int    `json:"proxy_index"`
-	LastIP     string `json:"last_ip,omitempty"` // Last known IP for IP-based device lookup
+	Username         string    `json:"username"`
+	CustomName       string    `json:"custom_name"`
+	Group            string    `json:"group"`
+	Notes            string    `json:"notes"`
+	ProxyIndex       int       `json:"proxy_index"`
+	LastIP           string    `json:"last_ip,omitempty"`            // Last known IP for IP-based device lookup
+	LastConfirmed    time.Time `json:"last_confirmed,omitempty"`     // When device last confirmed correct proxy
+	LastSessionStart time.Time `json:"last_session_start,omitempty"` // When current session started
 }
 
 type UserCredentials struct {
@@ -333,7 +339,7 @@ func main() {
 			TrafficHistory:  []TrafficSnapshot{},
 			ProxyHealthData: make(map[int]*ProxyHealth),
 			SystemSettings: SystemSettings{
-				SessionTimeout:       24,
+				SessionTimeout:       2, // 2 hours default WiFi session timeout
 				TrafficRetentionDays: 7,
 				DeviceTimeoutMinutes: 30,
 			},
