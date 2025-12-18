@@ -210,17 +210,33 @@ type ProxyServer struct {
 	sessions        map[string]*Session
 	appSessions     map[string]*Session
 	sessionMu       sync.RWMutex
-	startTime       time.Time
-	logBuffer       []LogEntry
-	logMu           sync.RWMutex
-	cpuUsage        float64
-	cpuMu           sync.RWMutex
+	startTime        time.Time
+	logBuffer        []LogEntry
+	logMu            sync.RWMutex
+	cpuUsage         float64
+	cpuMu            sync.RWMutex
+	deviceActivity   map[string][]DeviceActivity // keyed by device IP
+	deviceActivityMu sync.RWMutex
 }
 
 type LogEntry struct {
-	Timestamp time.Time `json:"timestamp"`
-	Level     string    `json:"level"`
-	Message   string    `json:"message"`
+	Timestamp  time.Time `json:"timestamp"`
+	Level      string    `json:"level"`
+	Message    string    `json:"message"`
+	DeviceIP   string    `json:"device_ip,omitempty"`
+	DeviceName string    `json:"device_name,omitempty"`
+	Username   string    `json:"username,omitempty"`
+	Category   string    `json:"category,omitempty"` // connection, auth, proxy, error, session, config
+}
+
+// DeviceActivity stores detailed activity for a specific device
+type DeviceActivity struct {
+	Timestamp  time.Time `json:"timestamp"`
+	Action     string    `json:"action"`
+	Details    string    `json:"details"`
+	Success    bool      `json:"success"`
+	ProxyName  string    `json:"proxy_name,omitempty"`
+	TargetHost string    `json:"target_host,omitempty"`
 }
 
 type ProxyInfo struct {
@@ -332,6 +348,7 @@ func main() {
 		appSessions:     make(map[string]*Session),
 		startTime:       time.Now(),
 		logBuffer:       make([]LogEntry, 0, 1000),
+		deviceActivity:  make(map[string][]DeviceActivity),
 		persistentData: PersistentData{
 			DeviceConfigs:   make(map[string]DeviceConfig),
 			Groups:          []string{"Default", "Floor 1", "Floor 2", "Team A", "Team B"},
@@ -904,11 +921,87 @@ func (s *ProxyServer) addLog(level, message string) {
 	}
 	s.logMu.Lock()
 	s.logBuffer = append(s.logBuffer, entry)
-	// Keep only last 500 entries
-	if len(s.logBuffer) > 500 {
-		s.logBuffer = s.logBuffer[len(s.logBuffer)-500:]
+	// Keep only last 1000 entries
+	if len(s.logBuffer) > 1000 {
+		s.logBuffer = s.logBuffer[len(s.logBuffer)-1000:]
 	}
 	s.logMu.Unlock()
+}
+
+// addDeviceLog adds a detailed log entry with device information
+func (s *ProxyServer) addDeviceLog(level, category, message string, device *Device) {
+	deviceIP := ""
+	deviceName := ""
+	username := ""
+	if device != nil {
+		deviceIP = device.IP
+		deviceName = device.CustomName
+		if deviceName == "" {
+			deviceName = device.Name
+		}
+		username = device.Username
+	}
+
+	entry := LogEntry{
+		Timestamp:  time.Now(),
+		Level:      level,
+		Message:    message,
+		DeviceIP:   deviceIP,
+		DeviceName: deviceName,
+		Username:   username,
+		Category:   category,
+	}
+	s.logMu.Lock()
+	s.logBuffer = append(s.logBuffer, entry)
+	if len(s.logBuffer) > 1000 {
+		s.logBuffer = s.logBuffer[len(s.logBuffer)-1000:]
+	}
+	s.logMu.Unlock()
+}
+
+// addDeviceActivity adds an activity entry for a specific device
+func (s *ProxyServer) addDeviceActivity(deviceIP string, action, details string, success bool, proxyName, targetHost string) {
+	activity := DeviceActivity{
+		Timestamp:  time.Now(),
+		Action:     action,
+		Details:    details,
+		Success:    success,
+		ProxyName:  proxyName,
+		TargetHost: targetHost,
+	}
+
+	s.deviceActivityMu.Lock()
+	if s.deviceActivity[deviceIP] == nil {
+		s.deviceActivity[deviceIP] = make([]DeviceActivity, 0, 100)
+	}
+	s.deviceActivity[deviceIP] = append(s.deviceActivity[deviceIP], activity)
+	// Keep only last 100 activities per device
+	if len(s.deviceActivity[deviceIP]) > 100 {
+		s.deviceActivity[deviceIP] = s.deviceActivity[deviceIP][len(s.deviceActivity[deviceIP])-100:]
+	}
+	s.deviceActivityMu.Unlock()
+}
+
+// getDeviceActivity returns activity log for a specific device
+func (s *ProxyServer) getDeviceActivity(deviceIP string, limit int) []DeviceActivity {
+	s.deviceActivityMu.RLock()
+	defer s.deviceActivityMu.RUnlock()
+
+	activities := s.deviceActivity[deviceIP]
+	if activities == nil {
+		return []DeviceActivity{}
+	}
+
+	if limit <= 0 || limit > len(activities) {
+		limit = len(activities)
+	}
+	start := len(activities) - limit
+	if start < 0 {
+		start = 0
+	}
+	result := make([]DeviceActivity, limit)
+	copy(result, activities[start:])
+	return result
 }
 
 func (s *ProxyServer) getLogs(limit int) []LogEntry {
@@ -1201,26 +1294,45 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	username := parseProxyUsername(r)
 	device, err := server.getOrCreateDevice(clientIP, username)
 	if err != nil {
+		// Log unregistered connection attempt
+		server.addLog("warn", fmt.Sprintf("[BLOCKED] Unregistered device %s (user: %s) tried to connect to %s", clientIP, username, r.Host))
+		server.addDeviceActivity(clientIP, "connection_blocked", "Device not registered", false, "", r.Host)
 		http.Error(w, "Registration required: please authenticate in the app", http.StatusProxyAuthRequired)
 		return
 	}
 
 	// Check if device session is confirmed and valid
 	if !server.isDeviceSessionValid(device) {
+		// Log session invalid attempt
+		server.addDeviceLog("warn", "session", fmt.Sprintf("[BLOCKED] Session expired/unconfirmed for %s trying to access %s", device.Username, r.Host), device)
+		server.addDeviceActivity(clientIP, "session_blocked", "Session expired or not confirmed", false, "", r.Host)
 		http.Error(w, "Session expired or not confirmed. Please open the app and confirm your connection.", http.StatusProxyAuthRequired)
 		return
 	}
 
 	atomic.AddInt64(&device.RequestCount, 1)
 
+	// Get proxy name for logging
+	proxyName := ""
+	proxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
+	if proxyIndex >= 0 {
+		server.persistMu.RLock()
+		if name, ok := server.persistentData.ProxyNames[proxyIndex]; ok {
+			proxyName = name
+		} else {
+			proxyName = fmt.Sprintf("Proxy #%d", proxyIndex+1)
+		}
+		server.persistMu.RUnlock()
+	}
+
 	if r.Method == http.MethodConnect {
-		handleHTTPS(w, r, device)
+		handleHTTPS(w, r, device, proxyName)
 	} else {
-		handleHTTP(w, r, device)
+		handleHTTP(w, r, device, proxyName)
 	}
 }
 
-func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device) {
+func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device, proxyName string) {
 	target := r.Host
 	if !strings.Contains(target, ":") {
 		target += ":443"
@@ -1242,7 +1354,10 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device) {
 			device.LastError = errMsg
 			device.LastErrorTime = time.Now()
 			server.mu.Unlock()
-			server.addLog("error", fmt.Sprintf("HTTPS proxy error for %s: %s", device.IP, errMsg))
+			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] HTTPS connection failed to %s via %s: %s", target, proxyName, errMsg), device)
+			server.addDeviceActivity(device.IP, "connection_error", fmt.Sprintf("HTTPS to %s failed: %s", target, errMsg), false, proxyName, target)
+		} else {
+			server.addDeviceLog("warn", "proxy", fmt.Sprintf("[PROXY ERROR] %s via %s to %s: %s", device.Username, proxyName, target, errMsg), device)
 		}
 		http.Error(w, "Failed to connect", http.StatusBadGateway)
 		return
@@ -1263,6 +1378,12 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device) {
 	defer clientConn.Close()
 
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// Log successful connection (only for first few requests to avoid spam)
+	reqCount := atomic.LoadInt64(&device.RequestCount)
+	if reqCount <= 5 || reqCount%100 == 0 {
+		server.addDeviceActivity(device.IP, "https_connect", fmt.Sprintf("Connected to %s", target), true, proxyName, target)
+	}
 
 	done := make(chan bool, 2)
 	var bytesOut, bytesIn int64
@@ -1287,7 +1408,7 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device) {
 	}
 }
 
-func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
+func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device, proxyName string) {
 	host := r.Host
 	if !strings.Contains(host, ":") {
 		host += ":80"
@@ -1307,6 +1428,10 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
 			server.mu.Lock()
 			device.LastError = errMsg
 			server.mu.Unlock()
+			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] HTTP connection failed to %s via %s: %s", host, proxyName, errMsg), device)
+			server.addDeviceActivity(device.IP, "connection_error", fmt.Sprintf("HTTP to %s failed: %s", host, errMsg), false, proxyName, host)
+		} else {
+			server.addDeviceLog("warn", "proxy", fmt.Sprintf("[PROXY ERROR] %s via %s to %s: %s", device.Username, proxyName, host, errMsg), device)
 		}
 		http.Error(w, "Failed to connect", http.StatusBadGateway)
 		return
@@ -1321,6 +1446,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
 		}
 		if !isProxySideError(errMsg) {
 			atomic.AddInt64(&device.ErrorCount, 1)
+			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] Failed to send HTTP request to %s: %s", host, errMsg), device)
 		}
 		http.Error(w, "Failed to send request", http.StatusBadGateway)
 		return
@@ -1334,6 +1460,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device) {
 		}
 		if !isProxySideError(errMsg) {
 			atomic.AddInt64(&device.ErrorCount, 1)
+			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] Failed to read HTTP response from %s: %s", host, errMsg), device)
 		}
 		http.Error(w, "Failed to read response", http.StatusBadGateway)
 		return
@@ -1407,6 +1534,7 @@ func startDashboard() {
 	http.HandleFunc("/dashboard", server.requireAuth(handleDashboard))
 	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
 	http.HandleFunc("/analytics", server.requireAuth(handleAnalyticsPage))
+	http.HandleFunc("/activity", server.requireAuth(handleActivityPage))
 	http.HandleFunc("/settings", server.requireAuth(handleSettingsPage))
 	http.HandleFunc("/monitoring", server.requireAuth(handleMonitoringPage))
 
@@ -1430,6 +1558,8 @@ func startDashboard() {
 	http.HandleFunc("/api/change-password", server.requireAuth(handleChangePasswordAPI))
 	http.HandleFunc("/api/system-stats", server.requireAuth(handleSystemStatsAPI))
 	http.HandleFunc("/api/logs", server.requireAuth(handleLogsAPI))
+	http.HandleFunc("/api/device-activity", server.requireAuth(handleDeviceActivityAPI))
+	http.HandleFunc("/api/activity-log", server.requireAuth(handleActivityLogAPI))
 	http.HandleFunc("/api/supervisors", server.requireAuth(handleSupervisorsAPI))
 	http.HandleFunc("/api/add-supervisor", server.requireAuth(handleAddSupervisorAPI))
 	http.HandleFunc("/api/update-supervisor", server.requireAuth(handleUpdateSupervisorAPI))
@@ -1856,12 +1986,15 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 	existingDevice := server.findDeviceByUsername(username)
 	if existingDevice != nil {
 		// Update existing device
+		oldIP := existingDevice.IP
 		existingDevice.IP = clientIP
 		existingDevice.UpstreamProxy = selectedProxy
 		existingDevice.LastSeen = time.Now()
 		server.mu.Unlock()
 		go server.saveDeviceConfig(existingDevice)
 		log.Printf("📱 App: Device '%s' updated -> %s\n", username, proxyName)
+		server.addDeviceLog("info", "config", fmt.Sprintf("[UPDATED] Device re-registered from IP %s (was %s) with %s", clientIP, oldIP, proxyName), existingDevice)
+		server.addDeviceActivity(clientIP, "device_updated", fmt.Sprintf("Re-registered with %s", proxyName), true, proxyName, "")
 	} else {
 		// Create new device
 		device := &Device{
@@ -1879,7 +2012,8 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 		server.mu.Unlock()
 		go server.saveDeviceConfig(device)
 		log.Printf("📱 App: New device '%s' registered -> %s\n", username, proxyName)
-		server.addLog("info", fmt.Sprintf("App: Device '%s' registered with %s", username, proxyName))
+		server.addDeviceLog("info", "config", fmt.Sprintf("[REGISTERED] New device '%s' from IP %s with %s", username, clientIP, proxyName), device)
+		server.addDeviceActivity(clientIP, "device_registered", fmt.Sprintf("New device registered with %s", proxyName), true, proxyName, "")
 	}
 
 	json.NewEncoder(w).Encode(AppRegisterResponse{
@@ -1962,7 +2096,8 @@ func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 		supervisorInfo = fmt.Sprintf(" by Supervisor %s", req.Supervisor)
 	}
 	log.Printf("📱 App: Device '%s' proxy changed: %s -> %s%s (IP: %s)\n", username, oldProxyName, proxyName, supervisorInfo, clientIP)
-	server.addLog("info", fmt.Sprintf("App: Device '%s' proxy changed: %s -> %s%s (IP: %s)", username, oldProxyName, proxyName, supervisorInfo, clientIP))
+	server.addDeviceLog("info", "config", fmt.Sprintf("[PROXY CHANGED] %s: %s -> %s%s", username, oldProxyName, proxyName, supervisorInfo), device)
+	server.addDeviceActivity(clientIP, "proxy_changed", fmt.Sprintf("Changed from %s to %s%s", oldProxyName, proxyName, supervisorInfo), true, proxyName, "")
 
 	json.NewEncoder(w).Encode(AppRegisterResponse{
 		Success:    true,
@@ -2498,14 +2633,17 @@ func handleAppConfirmConnection(w http.ResponseWriter, r *http.Request) {
 	sessionTimeout := server.persistentData.SystemSettings.SessionTimeout
 	server.persistMu.RUnlock()
 
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
 	log.Printf("✅ Device '%s' confirmed connection to %s (session: %dh)\n", req.Username, expectedProxyName, sessionTimeout)
-	server.addLog("info", fmt.Sprintf("Device '%s' confirmed connection to %s (session: %dh)", req.Username, expectedProxyName, sessionTimeout))
+	server.addDeviceLog("info", "session", fmt.Sprintf("[SESSION CONFIRMED] %s confirmed connection to %s (valid for %dh)", req.Username, expectedProxyName, sessionTimeout), device)
+	server.addDeviceActivity(clientIP, "session_confirmed", fmt.Sprintf("Session confirmed via %s (valid for %dh)", expectedProxyName, sessionTimeout), true, expectedProxyName, "")
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":         true,
+		"confirmed":       true,
 		"message":         fmt.Sprintf("Connection confirmed! Session valid for %d hours.", sessionTimeout),
 		"proxy_name":      expectedProxyName,
-		"session_hours":   sessionTimeout,
+		"timeout_hours":   sessionTimeout,
 		"session_expires": device.SessionStart.Add(time.Duration(sessionTimeout) * time.Hour).Format(time.RFC3339),
 	})
 }
@@ -3047,6 +3185,11 @@ func handleAnalyticsPage(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(analyticsPageHTML))
 }
 
+func handleActivityPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(activityPageHTML))
+}
+
 func handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(settingsPageHTML))
@@ -3117,9 +3260,138 @@ func formatUptime(d time.Duration) string {
 }
 
 func handleLogsAPI(w http.ResponseWriter, r *http.Request) {
-	logs := server.getLogs(100)
+	// Support filtering by device, category, and level
+	query := r.URL.Query()
+	deviceIP := query.Get("device_ip")
+	category := query.Get("category")
+	level := query.Get("level")
+	limitStr := query.Get("limit")
+	limit := 100
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	allLogs := server.getLogs(1000) // Get more logs for filtering
+
+	// Filter logs
+	var filtered []LogEntry
+	for _, log := range allLogs {
+		if deviceIP != "" && log.DeviceIP != deviceIP {
+			continue
+		}
+		if category != "" && log.Category != category {
+			continue
+		}
+		if level != "" && log.Level != level {
+			continue
+		}
+		filtered = append(filtered, log)
+	}
+
+	// Apply limit after filtering
+	if len(filtered) > limit {
+		filtered = filtered[len(filtered)-limit:]
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(logs)
+	json.NewEncoder(w).Encode(filtered)
+}
+
+// handleDeviceActivityAPI returns activity log for a specific device
+func handleDeviceActivityAPI(w http.ResponseWriter, r *http.Request) {
+	deviceIP := r.URL.Query().Get("device_ip")
+	if deviceIP == "" {
+		http.Error(w, "device_ip parameter required", http.StatusBadRequest)
+		return
+	}
+
+	limitStr := r.URL.Query().Get("limit")
+	limit := 50
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+
+	activities := server.getDeviceActivity(deviceIP, limit)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(activities)
+}
+
+// handleActivityLogAPI returns a comprehensive activity log with filtering
+func handleActivityLogAPI(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	filterCategory := query.Get("category")
+	filterLevel := query.Get("level")
+	filterDevice := query.Get("device")
+	limitStr := query.Get("limit")
+	limit := 200
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 1000 {
+			limit = l
+		}
+	}
+
+	// Get all logs (up to 1000)
+	allLogs := server.getLogs(1000)
+
+	// Build response with filtering
+	var result []map[string]interface{}
+	for _, log := range allLogs {
+		// Apply filters
+		if filterCategory != "" && log.Category != filterCategory {
+			continue
+		}
+		if filterLevel != "" && log.Level != filterLevel {
+			continue
+		}
+		if filterDevice != "" {
+			if log.DeviceIP != filterDevice && log.Username != filterDevice && log.DeviceName != filterDevice {
+				continue
+			}
+		}
+
+		entry := map[string]interface{}{
+			"timestamp":   log.Timestamp,
+			"level":       log.Level,
+			"message":     log.Message,
+			"category":    log.Category,
+			"device_ip":   log.DeviceIP,
+			"device_name": log.DeviceName,
+			"username":    log.Username,
+		}
+		result = append(result, entry)
+	}
+
+	// Apply limit
+	if len(result) > limit {
+		result = result[len(result)-limit:]
+	}
+
+	// Get summary stats
+	var errorCount, warnCount, infoCount int
+	for _, log := range allLogs {
+		switch log.Level {
+		case "error":
+			errorCount++
+		case "warn", "warning":
+			warnCount++
+		case "info":
+			infoCount++
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"logs":        result,
+		"total_count": len(allLogs),
+		"error_count": errorCount,
+		"warn_count":  warnCount,
+		"info_count":  infoCount,
+		"categories":  []string{"connection", "auth", "proxy", "error", "session", "config"},
+	})
 }
 
 func handleSupervisorsAPI(w http.ResponseWriter, r *http.Request) {
@@ -3399,7 +3671,7 @@ const loginPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Login
 <body><div class="login-container"><div class="logo"><h1>🌐 Lumier Dynamics</h1><p>Enterprise Proxy Management v3.0</p></div><div class="error-msg" id="errorMsg"></div><form onsubmit="return handleLogin(event)"><div class="form-group"><label>Username</label><input type="text" id="username" placeholder="Enter username" required autofocus></div><div class="form-group"><label>Password</label><input type="password" id="password" placeholder="Enter password" required></div><button type="submit" class="login-btn" id="loginBtn">Sign In</button></form></div>
 <script>async function handleLogin(e){e.preventDefault();const btn=document.getElementById('loginBtn'),err=document.getElementById('errorMsg');btn.disabled=true;btn.textContent='Signing in...';err.classList.remove('show');try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});if(r.ok)window.location.href='/dashboard';else{err.textContent='Invalid username or password';err.classList.add('show');btn.disabled=false;btn.textContent='Sign In';}}catch(e){err.textContent='Connection error';err.classList.add('show');btn.disabled=false;btn.textContent='Sign In';}return false;}</script></body></html>`
 
-const navHTML = `<nav style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:15px 30px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:1.5em">🌐</span><span style="color:white;font-size:1.3em;font-weight:bold">Lumier Dynamics</span></div><div style="display:flex;gap:5px;flex-wrap:wrap"><a href="/dashboard" class="nav-link" id="nav-dashboard">📱 Devices</a><a href="/health" class="nav-link" id="nav-health">💚 Health</a><a href="/analytics" class="nav-link" id="nav-analytics">📊 Analytics</a><a href="/monitoring" class="nav-link" id="nav-monitoring">🖥️ Monitor</a><a href="/settings" class="nav-link" id="nav-settings">⚙️ Settings</a></div><div style="display:flex;align-items:center;gap:15px;color:white"><span id="currentUser">Admin</span><button onclick="logout()" style="background:rgba(255,255,255,0.2);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500">Logout</button></div></nav>`
+const navHTML = `<nav style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:15px 30px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:1.5em">🌐</span><span style="color:white;font-size:1.3em;font-weight:bold">Lumier Dynamics</span></div><div style="display:flex;gap:5px;flex-wrap:wrap"><a href="/dashboard" class="nav-link" id="nav-dashboard">📱 Devices</a><a href="/health" class="nav-link" id="nav-health">💚 Health</a><a href="/analytics" class="nav-link" id="nav-analytics">📊 Analytics</a><a href="/activity" class="nav-link" id="nav-activity">📋 Activity</a><a href="/monitoring" class="nav-link" id="nav-monitoring">🖥️ Monitor</a><a href="/settings" class="nav-link" id="nav-settings">⚙️ Settings</a></div><div style="display:flex;align-items:center;gap:15px;color:white"><span id="currentUser">Admin</span><button onclick="logout()" style="background:rgba(255,255,255,0.2);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500">Logout</button></div></nav>`
 
 const baseStyles = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f7fa;min-height:100vh}.nav-link{color:rgba(255,255,255,0.85);text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:500}.nav-link:hover,.nav-link.active{background:rgba(255,255,255,0.2);color:white}.container{max-width:1600px;margin:0 auto;padding:25px}.page-header{margin-bottom:25px}.page-header h1{color:#333;font-size:1.8em;margin-bottom:5px}.page-header p{color:#666}.card{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.card h2{color:#333;font-size:1.3em;margin-bottom:15px;padding-bottom:10px;border-bottom:2px solid #f0f0f0}.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:20px;margin-bottom:25px}.stat-card{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);text-align:center;cursor:pointer;transition:transform 0.2s}.stat-card:hover{transform:translateY(-3px)}.stat-value{font-size:2.2em;font-weight:bold;color:#667eea;margin-bottom:5px}.stat-label{color:#666;font-size:0.85em;text-transform:uppercase;letter-spacing:1px}.btn{padding:10px 18px;border:none;border-radius:8px;cursor:pointer;font-size:0.95em;font-weight:600;transition:all 0.2s}.btn-primary{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white}.btn-primary:hover{opacity:0.9}.btn-secondary{background:#f5f5f5;color:#333;border:2px solid #e0e0e0}.btn-secondary:hover{background:#e8e8e8}.toast{position:fixed;bottom:30px;right:30px;background:#333;color:white;padding:15px 25px;border-radius:10px;z-index:1001;animation:slideIn 0.3s ease}.toast.success{background:#4caf50}.toast.error{background:#f44336}@keyframes slideIn{from{transform:translateX(100px);opacity:0}to{transform:translateX(0);opacity:1}}.loading{text-align:center;padding:40px;color:#666}`
 
@@ -3413,6 +3685,9 @@ const healthPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Prox
 
 const analyticsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Analytics</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>` + baseStyles + `.chart-container{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.chart-container h2{margin-bottom:20px}.chart{width:100%;height:300px;position:relative}.chart-bars{display:flex;align-items:flex-end;height:250px;gap:4px;padding:0 10px;border-bottom:2px solid #e0e0e0}.chart-bar{flex:1;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);border-radius:4px 4px 0 0;min-width:8px;position:relative;transition:height 0.3s}.chart-bar:hover{opacity:0.8}.chart-bar .tooltip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:#333;color:white;padding:5px 10px;border-radius:4px;font-size:0.8em;white-space:nowrap;opacity:0;transition:opacity 0.2s;pointer-events:none}.chart-bar:hover .tooltip{opacity:1}.chart-labels{display:flex;gap:4px;padding:10px 10px 0}.chart-label{flex:1;text-align:center;font-size:0.7em;color:#666}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📊 Traffic Analytics</h1><p>Historical traffic data and trends</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalData">-</div><div class="stat-label">Total Data</div></div><div class="stat-card"><div class="stat-value" id="totalReqs">-</div><div class="stat-label">Total Requests</div></div><div class="stat-card"><div class="stat-value" id="peakDevices">-</div><div class="stat-label">Peak Devices</div></div><div class="stat-card"><div class="stat-value" id="errorRate">-</div><div class="stat-label">Error Rate</div></div></div><div class="chart-container"><h2>📈 Traffic Over Time</h2><button class="btn btn-secondary" onclick="loadAnalytics()" style="float:right;margin-top:-45px">🔄 Refresh</button><div class="chart"><div class="chart-bars" id="trafficBars"></div><div class="chart-labels" id="trafficLabels"></div></div></div><div class="chart-container"><h2>📊 Active Devices Over Time</h2><div class="chart"><div class="chart-bars" id="deviceBars"></div><div class="chart-labels" id="deviceLabels"></div></div></div></div><script>` + baseJS + `document.getElementById('nav-analytics').classList.add('active');function loadAnalytics(){fetch('/api/traffic-history').then(r=>r.json()).then(data=>{if(!data||!data.length){document.getElementById('trafficBars').innerHTML='<div class="loading">No data yet. Traffic data is collected every 5 minutes.</div>';return;}const totalBytes=data.reduce((a,d)=>a+(d.total_bytes_in||0)+(d.total_bytes_out||0),0);const totalReqs=data.length>0?data[data.length-1].total_requests:0;const peakDevices=Math.max(...data.map(d=>d.active_devices||0));const totalErrors=data.length>0?data[data.length-1].error_count:0;const errorRate=totalReqs>0?((totalErrors/totalReqs)*100).toFixed(2)+'%':'0%';document.getElementById('totalData').textContent=formatBytes(totalBytes);document.getElementById('totalReqs').textContent=formatNumber(totalReqs);document.getElementById('peakDevices').textContent=peakDevices;document.getElementById('errorRate').textContent=errorRate;const maxBytes=Math.max(...data.map(d=>(d.total_bytes_in||0)+(d.total_bytes_out||0)));const maxDevices=Math.max(...data.map(d=>d.active_devices||0));document.getElementById('trafficBars').innerHTML=data.map(d=>{const bytes=(d.total_bytes_in||0)+(d.total_bytes_out||0);const h=maxBytes>0?(bytes/maxBytes*230):5;return'<div class="chart-bar" style="height:'+h+'px"><span class="tooltip">'+formatBytes(bytes)+'</span></div>';}).join('');document.getElementById('trafficLabels').innerHTML=data.map((d,i)=>{if(i%Math.ceil(data.length/8)===0){return'<div class="chart-label">'+new Date(d.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div>';}return'<div class="chart-label"></div>';}).join('');document.getElementById('deviceBars').innerHTML=data.map(d=>{const h=maxDevices>0?(d.active_devices/maxDevices*230):5;return'<div class="chart-bar" style="height:'+h+'px;background:linear-gradient(135deg,#4caf50 0%,#2e7d32 100%)"><span class="tooltip">'+d.active_devices+' devices</span></div>';}).join('');document.getElementById('deviceLabels').innerHTML=data.map((d,i)=>{if(i%Math.ceil(data.length/8)===0){return'<div class="chart-label">'+new Date(d.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div>';}return'<div class="chart-label"></div>';}).join('');});}loadAnalytics();setInterval(loadAnalytics,60000);</script></body></html>`
+
+const activityPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Activity Log</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>` + baseStyles + `.activity-container{background:white;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);overflow:hidden}.activity-header{background:#333;color:white;padding:15px 20px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}.activity-header h2{margin:0;font-size:1.1em}.filters{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.filters select,.filters input{padding:8px 12px;border:none;border-radius:6px;font-size:0.9em;background:rgba(255,255,255,0.9)}.activity-content{height:600px;overflow-y:auto;font-family:'Monaco','Menlo','Ubuntu Mono',monospace;font-size:0.85em}.log-entry{padding:10px 20px;border-bottom:1px solid #f0f0f0;display:grid;grid-template-columns:140px 80px 120px 120px 1fr;gap:15px;align-items:center}.log-entry:nth-child(odd){background:#fafafa}.log-entry:hover{background:#f0f5ff}.log-time{color:#888;white-space:nowrap;font-size:0.9em}.log-level{font-weight:600;text-transform:uppercase;font-size:0.75em;padding:3px 8px;border-radius:4px;text-align:center}.log-level.info{background:#e3f2fd;color:#1976d2}.log-level.error{background:#ffebee;color:#c62828}.log-level.warn,.log-level.warning{background:#fff3e0;color:#e65100}.log-category{font-size:0.8em;color:#666;background:#f5f5f5;padding:3px 8px;border-radius:4px;text-align:center}.log-device{font-size:0.85em;color:#667eea;font-weight:500}.log-msg{color:#333;word-break:break-word}.auto-refresh{display:flex;align-items:center;gap:8px;font-size:0.9em;color:white}.auto-refresh input{width:18px;height:18px;cursor:pointer}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📋 Activity Log</h1><p>Detailed device and system activity log with filtering</p></div><div class="stats-grid"><div class="stat-card" onclick="filterLevel('')" style="cursor:pointer"><div class="stat-value" id="totalLogs">-</div><div class="stat-label">Total Logs</div></div><div class="stat-card" onclick="filterLevel('info')" style="cursor:pointer"><div class="stat-value" id="infoLogs" style="color:#1976d2">-</div><div class="stat-label">Info</div></div><div class="stat-card" onclick="filterLevel('warn')" style="cursor:pointer"><div class="stat-value" id="warnLogs" style="color:#e65100">-</div><div class="stat-label">Warnings</div></div><div class="stat-card" onclick="filterLevel('error')" style="cursor:pointer"><div class="stat-value" id="errorLogs" style="color:#c62828">-</div><div class="stat-label">Errors</div></div></div><div class="activity-container"><div class="activity-header"><h2>📋 Live Activity Feed</h2><div class="filters"><select id="filterCategory" onchange="loadActivity()"><option value="">All Categories</option><option value="connection">Connection</option><option value="session">Session</option><option value="config">Config</option><option value="proxy">Proxy</option><option value="auth">Auth</option><option value="error">Error</option></select><select id="filterLevelSelect" onchange="loadActivity()"><option value="">All Levels</option><option value="info">Info</option><option value="warn">Warning</option><option value="error">Error</option></select><input type="text" id="filterDevice" placeholder="Filter by device/user..." style="width:180px" onkeyup="debounceLoad()"><button class="btn btn-secondary" onclick="loadActivity()" style="padding:8px 15px;font-size:0.85em">🔄 Refresh</button></div><label class="auto-refresh"><input type="checkbox" id="autoRefresh" checked> Auto-refresh</label></div><div class="activity-content" id="activityContent"><div class="loading">Loading activity log...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-activity').classList.add('active');let debounceTimer;function debounceLoad(){clearTimeout(debounceTimer);debounceTimer=setTimeout(loadActivity,300);}function filterLevel(level){document.getElementById('filterLevelSelect').value=level;loadActivity();}function loadActivity(){const category=document.getElementById('filterCategory').value;const level=document.getElementById('filterLevelSelect').value;const device=document.getElementById('filterDevice').value.trim();let url='/api/activity-log?limit=500';if(category)url+='&category='+encodeURIComponent(category);if(level)url+='&level='+encodeURIComponent(level);if(device)url+='&device='+encodeURIComponent(device);fetch(url).then(r=>r.json()).then(data=>{document.getElementById('totalLogs').textContent=data.total_count||0;document.getElementById('infoLogs').textContent=data.info_count||0;document.getElementById('warnLogs').textContent=data.warn_count||0;document.getElementById('errorLogs').textContent=data.error_count||0;const container=document.getElementById('activityContent');if(!data.logs||!data.logs.length){container.innerHTML='<div style="padding:40px;text-align:center;color:#666">No activity logs yet. Device activity will appear here.</div>';return;}container.innerHTML=data.logs.slice().reverse().map(log=>{const time=new Date(log.timestamp).toLocaleString();const deviceInfo=log.username||log.device_name||log.device_ip||'-';const category=log.category||'-';return'<div class="log-entry"><span class="log-time">'+time+'</span><span class="log-level '+log.level+'">'+log.level+'</span><span class="log-category">'+category+'</span><span class="log-device" title="'+(log.device_ip||'')+'">'+deviceInfo+'</span><span class="log-msg">'+escapeHtml(log.message)+'</span></div>';}).join('');if(document.getElementById('autoRefresh').checked){container.scrollTop=0;}});}function escapeHtml(t){if(!t)return'';const d=document.createElement('div');d.textContent=t;return d.innerHTML;}loadActivity();setInterval(()=>{if(document.getElementById('autoRefresh').checked)loadActivity();},5000);</script></body></html>`
 
 const settingsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Settings</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>` + baseStyles + `.settings-section{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.settings-section h2{margin-bottom:20px;padding-bottom:10px;border-bottom:2px solid #f0f0f0}.form-group{margin-bottom:20px}.form-group label{display:block;font-weight:600;color:#333;margin-bottom:8px}.form-group input{width:100%;max-width:400px;padding:12px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.form-group input:focus{outline:none;border-color:#667eea}.form-group small{display:block;color:#666;margin-top:5px;font-size:0.85em}.success-msg{background:#e8f5e9;color:#2e7d32;padding:12px;border-radius:8px;margin-bottom:20px;display:none}.success-msg.show{display:block}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>⚙️ Settings</h1><p>Configure your Lumier Dynamics system</p></div><div class="settings-section"><h2>🔐 Change Password</h2><div class="success-msg" id="pwSuccess">Password changed successfully!</div><form onsubmit="return changePassword(event)"><div class="form-group"><label>Current Password</label><input type="password" id="oldPassword" required></div><div class="form-group"><label>New Password</label><input type="password" id="newPassword" required><small>Choose a strong password with at least 8 characters</small></div><div class="form-group"><label>Confirm New Password</label><input type="password" id="confirmPassword" required></div><button type="submit" class="btn btn-primary">Change Password</button></form></div><div class="settings-section"><h2>📱 Device Groups</h2><p style="margin-bottom:15px;color:#666">Manage device groups for better organization</p><div id="groupsList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px"><input type="text" id="newGroupName" placeholder="New group name..." style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;flex:1;max-width:300px"><button class="btn btn-primary" onclick="addGroup()">Add Group</button></div></div><div class="settings-section"><h2>🌐 Proxy Management</h2><p style="margin-bottom:15px;color:#666">Manage and organize upstream SOCKS5 proxies</p><table id="proxyTable" style="width:100%;border-collapse:collapse;margin-bottom:20px"><thead><tr style="background:#f5f5f5"><th style="padding:12px;text-align:left;border-bottom:2px solid #e0e0e0">#</th><th style="padding:12px;text-align:left;border-bottom:2px solid #e0e0e0">Name</th><th style="padding:12px;text-align:left;border-bottom:2px solid #e0e0e0">IP Address</th><th style="padding:12px;text-align:center;border-bottom:2px solid #e0e0e0">Order</th><th style="padding:12px;text-align:center;border-bottom:2px solid #e0e0e0">Actions</th></tr></thead><tbody id="proxyTableBody"></tbody></table><div style="display:flex;gap:10px;flex-wrap:wrap"><input type="text" id="newProxyString" placeholder="host:port:username:password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;flex:1;min-width:300px;max-width:500px"><button class="btn btn-primary" onclick="addProxy()">Add Proxy</button></div><p style="margin-top:10px;color:#888;font-size:0.85em">Format: host:port:username:password (e.g., proxy.example.com:1080:user:pass)</p><div style="margin-top:20px;padding-top:20px;border-top:1px solid #eee"><h3 style="margin-bottom:15px;font-size:1.1em">📥 Bulk Import Proxies</h3><p style="margin-bottom:10px;color:#666;font-size:0.9em">Paste multiple proxies (one per line) in format: host:port:username:password</p><textarea id="bulkProxies" placeholder="brd.superproxy.io:22228:brd-customer-xxx-ip-1.2.3.4:password&#10;brd.superproxy.io:22228:brd-customer-xxx-ip-5.6.7.8:password&#10;..." style="width:100%;height:150px;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-family:monospace;font-size:0.9em"></textarea><div style="margin-top:10px;display:flex;gap:10px;align-items:center"><button class="btn btn-primary" onclick="bulkImportProxies()">Import Proxies</button><span id="bulkImportResult" style="color:#666;font-size:0.9em"></span></div></div></div><div class="settings-section"><h2>👤 Supervisor Management</h2><p style="margin-bottom:15px;color:#666">Manage supervisor accounts for the Android app (used for Change Proxy authentication)</p><div style="margin-bottom:20px"><h3 style="font-size:1em;margin-bottom:10px">🔐 Admin Password (for Register Device)</h3><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><input type="password" id="adminPassword" placeholder="Admin password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:250px"><button class="btn btn-primary" onclick="updateAdminPassword()">Update Admin Password</button><button class="btn btn-secondary" onclick="togglePasswordVisibility('adminPassword')" style="padding:10px">👁️</button></div></div><div style="margin-bottom:15px"><h3 style="font-size:1em;margin-bottom:10px">👥 Supervisors (for Change Proxy)</h3><div id="supervisorsList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px;flex-wrap:wrap"><input type="text" id="newSupervisorName" placeholder="Name" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:150px"><input type="password" id="newSupervisorPassword" placeholder="Password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:200px"><button class="btn btn-primary" onclick="addSupervisor()">Add Supervisor</button></div></div></div><div class="settings-section"><h2>⏱️ Session Settings</h2><p style="margin-bottom:15px;color:#666">Configure session timeout for device connections. Devices must re-confirm their connection after the timeout expires.</p><div style="display:flex;gap:15px;align-items:center;flex-wrap:wrap;margin-bottom:15px"><div style="display:flex;align-items:center;gap:10px"><label style="font-weight:600;color:#333">Session Timeout:</label><input type="number" id="sessionTimeout" min="1" max="48" value="2" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:80px;text-align:center;font-weight:600"><span style="color:#666">hours</span></div><button class="btn btn-primary" onclick="saveSessionSettings()">Save Settings</button></div><p style="color:#888;font-size:0.85em">Range: 1-48 hours. Default: 2 hours. Devices will need to confirm their proxy connection again after this time.</p></div><div class="settings-section"><h2>ℹ️ System Information</h2><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px"><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Version:</strong> 3.0.0</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Server IP:</strong> <span id="sysServerIP">...</span></div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Proxy Port:</strong> 8888</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Dashboard Port:</strong> 8080</div></div></div></div><script>` + baseJS + `document.getElementById('nav-settings').classList.add('active');fetch('/api/server-ip').then(r=>r.text()).then(ip=>document.getElementById('sysServerIP').textContent=ip);function loadGroups(){fetch('/api/groups').then(r=>r.json()).then(groups=>{document.getElementById('groupsList').innerHTML=groups.map(g=>{const isDefault=g==='Default';return'<span style="display:inline-flex;align-items:center;gap:8px;background:#e3f2fd;color:#1976d2;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">'+g+(isDefault?'':' <button onclick="deleteGroup(\''+g+'\')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center" title="Delete group">&times;</button>')+'</span>';}).join('');});}loadGroups();function deleteGroup(name){if(!confirm('Delete group "'+name+'"? Devices in this group will be moved to Default.')){return;}fetch('/api/delete-group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_name:name})}).then(r=>{if(r.ok)return r.json();throw new Error('Failed to delete');}).then(d=>{if(d.ok){showToast('Group deleted','success');loadGroups();}}).catch(()=>showToast('Failed to delete group','error'));}function addGroup(){const name=document.getElementById('newGroupName').value.trim();if(!name){showToast('Please enter a group name','error');return;}fetch('/api/add-group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_name:name})}).then(r=>r.json()).then(d=>{if(d.ok){showToast(d.added?'Group added':'Group already exists',d.added?'success':'');document.getElementById('newGroupName').value='';loadGroups();}});}function changePassword(e){e.preventDefault();const oldPw=document.getElementById('oldPassword').value;const newPw=document.getElementById('newPassword').value;const confirmPw=document.getElementById('confirmPassword').value;if(newPw!==confirmPw){showToast('Passwords do not match','error');return false;}if(newPw.length<6){showToast('Password must be at least 6 characters','error');return false;}fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_password:oldPw,new_password:newPw})}).then(r=>{if(r.ok){document.getElementById('pwSuccess').classList.add('show');document.getElementById('oldPassword').value='';document.getElementById('newPassword').value='';document.getElementById('confirmPassword').value='';setTimeout(()=>document.getElementById('pwSuccess').classList.remove('show'),3000);}else{showToast('Current password is incorrect','error');}});return false;}let allProxies=[];function loadProxies(){fetch('/api/proxies').then(r=>r.json()).then(proxies=>{allProxies=proxies;const tbody=document.getElementById('proxyTableBody');if(!proxies.length){tbody.innerHTML='<tr><td colspan="5" style="padding:20px;text-align:center;color:#666">No proxies configured. Add your first proxy below.</td></tr>';return;}tbody.innerHTML=proxies.map((p,i)=>{let ip=p.user&&p.user.includes('ip-')?p.user.split('ip-')[1]:p.host;const name=p.custom_name||'SG'+String(i+1).padStart(2,'0');return'<tr style="border-bottom:1px solid #eee"><td style="padding:12px;font-weight:600;color:#667eea">'+(i+1)+'</td><td style="padding:12px"><input type="text" value="'+escapeAttr(name)+'" style="padding:8px 12px;border:2px solid #e0e0e0;border-radius:6px;font-weight:600;width:100px" onchange="updateProxyName('+i+',this.value)" placeholder="SG'+String(i+1).padStart(2,'0')+'"></td><td style="padding:12px;font-family:monospace;color:#333">'+ip+'</td><td style="padding:12px;text-align:center"><button onclick="moveProxy('+i+',-1)" style="background:#e3f2fd;border:none;border-radius:4px;padding:6px 10px;cursor:pointer;margin-right:5px" '+(i===0?'disabled':'')+' title="Move Up">↑</button><button onclick="moveProxy('+i+',1)" style="background:#e3f2fd;border:none;border-radius:4px;padding:6px 10px;cursor:pointer" '+(i===proxies.length-1?'disabled':'')+' title="Move Down">↓</button></td><td style="padding:12px;text-align:center"><button onclick="deleteProxy('+i+')" style="background:#ef5350;color:white;border:none;border-radius:6px;padding:6px 12px;cursor:pointer" title="Delete">🗑️</button></td></tr>';}).join('');});}function escapeAttr(s){return s.replace(/"/g,'&quot;');}function updateProxyName(idx,name){fetch('/api/update-proxy-name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,name:name})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Proxy renamed to '+name,'success');}else{showToast('Failed to rename','error');}});}function moveProxy(idx,dir){const newOrder=allProxies.map((_,i)=>i);const targetIdx=idx+dir;if(targetIdx<0||targetIdx>=allProxies.length)return;[newOrder[idx],newOrder[targetIdx]]=[newOrder[targetIdx],newOrder[idx]];fetch('/api/reorder-proxies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order:newOrder})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Proxies reordered','success');loadProxies();}else{showToast('Failed to reorder','error');}});}loadProxies();function addProxy(){const proxy=document.getElementById('newProxyString').value.trim();if(!proxy){showToast('Please enter a proxy string','error');return;}fetch('/api/add-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_string:proxy})}).then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error(t);});return r.json();}).then(d=>{if(d.ok){showToast(d.added?'Proxy added':'Proxy already exists',d.added?'success':'');document.getElementById('newProxyString').value='';loadProxies();}}).catch(e=>showToast(e.message||'Failed to add proxy','error'));}function deleteProxy(idx){if(!confirm('Delete this proxy? Make sure no devices are using it.')){return;}fetch('/api/delete-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_index:idx})}).then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error(t);});return r.json();}).then(d=>{if(d.ok){showToast('Proxy deleted','success');loadProxies();}}).catch(e=>showToast(e.message||'Failed to delete proxy','error'));}function bulkImportProxies(){const proxies=document.getElementById('bulkProxies').value.trim();if(!proxies){showToast('Please paste proxy strings','error');return;}document.getElementById('bulkImportResult').textContent='Importing...';fetch('/api/bulk-import-proxies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxies:proxies})}).then(r=>r.json()).then(d=>{if(d.success){const msg='Added '+d.added+' proxies'+(d.skipped>0?', skipped '+d.skipped:'');document.getElementById('bulkImportResult').innerHTML='<span style="color:#4caf50">✓ '+msg+'</span>';showToast(msg,'success');document.getElementById('bulkProxies').value='';loadProxies();}else{document.getElementById('bulkImportResult').innerHTML='<span style="color:#c62828">✗ Import failed</span>';showToast('Import failed','error');}}).catch(e=>{document.getElementById('bulkImportResult').innerHTML='<span style="color:#c62828">✗ Error</span>';showToast('Import error','error');});}function loadSupervisors(){fetch('/api/supervisors').then(r=>r.json()).then(data=>{document.getElementById('adminPassword').value=data.admin_password||'';const list=document.getElementById('supervisorsList');if(!data.supervisors||!data.supervisors.length){list.innerHTML='<p style="color:#666">No supervisors configured.</p>';return;}list.innerHTML=data.supervisors.map(s=>'<div style="display:inline-flex;align-items:center;gap:8px;background:#e8f5e9;color:#2e7d32;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">'+s.name+' <button onclick="editSupervisor(\''+s.name+'\',\''+s.password+'\')" style="background:#1976d2;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:12px" title="Edit">✎</button> <button onclick="deleteSupervisor(\''+s.name+'\')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1" title="Delete">&times;</button></div>').join('');});}loadSupervisors();function togglePasswordVisibility(id){const input=document.getElementById(id);input.type=input.type==='password'?'text':'password';}function updateAdminPassword(){const pw=document.getElementById('adminPassword').value.trim();if(!pw){showToast('Please enter a password','error');return;}fetch('/api/admin-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Admin password updated','success');}else{showToast('Failed to update','error');}});}function addSupervisor(){const name=document.getElementById('newSupervisorName').value.trim();const pw=document.getElementById('newSupervisorPassword').value.trim();if(!name||!pw){showToast('Name and password required','error');return;}fetch('/api/add-supervisor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,password:pw})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Supervisor added','success');document.getElementById('newSupervisorName').value='';document.getElementById('newSupervisorPassword').value='';loadSupervisors();}else{showToast(d.message||'Failed to add','error');}});}function editSupervisor(name,pw){const newName=prompt('Supervisor name:',name);if(!newName)return;const newPw=prompt('Password:',pw);if(!newPw)return;fetch('/api/update-supervisor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_name:name,name:newName,password:newPw})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Supervisor updated','success');loadSupervisors();}else{showToast(d.message||'Failed to update','error');}});}function deleteSupervisor(name){if(!confirm('Delete supervisor "'+name+'"?'))return;fetch('/api/delete-supervisor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Supervisor deleted','success');loadSupervisors();}else{showToast(d.message||'Failed to delete','error');}});}function loadSessionSettings(){fetch('/api/session-settings').then(r=>r.json()).then(d=>{document.getElementById('sessionTimeout').value=d.session_timeout_hours||2;});}loadSessionSettings();function saveSessionSettings(){const timeout=parseInt(document.getElementById('sessionTimeout').value)||2;fetch('/api/session-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_timeout_hours:timeout})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Session settings saved','success');loadSessionSettings();}else{showToast('Failed to save settings','error');}});}</script></body></html>`
