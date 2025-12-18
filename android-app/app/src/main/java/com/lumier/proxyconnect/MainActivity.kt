@@ -920,8 +920,12 @@ class MainActivity : AppCompatActivity() {
                         }
                     } else {
                         // All good - matched and from Singapore
+                        displayBuilder.append("\n✓ Session confirmed")
                         tvWhoAmI.text = displayBuilder.toString()
                         tvWhoAmI.setTextColor(getColor(R.color.status_connected))
+
+                        // Confirm session with server
+                        confirmConnection()
                     }
                 }
 
@@ -930,6 +934,50 @@ class MainActivity : AppCompatActivity() {
                     tvWhoAmI.text = "Error: ${e.message?.take(40)}"
                     tvWhoAmI.setTextColor(getColor(R.color.status_disconnected))
                 }
+            }
+        }.start()
+    }
+
+    private fun confirmConnection() {
+        val serverIp = etServerIp.text.toString().trim()
+        val username = etUsername.text.toString().trim()
+
+        if (serverIp.isEmpty() || username.isEmpty()) {
+            return  // Can't confirm without server/username
+        }
+
+        Thread {
+            try {
+                val url = URL("${getServerUrl()}/api/app/confirm-connection")
+                val connection = url.openConnection() as HttpURLConnection
+                connection.connectTimeout = 10000
+                connection.readTimeout = 10000
+                connection.requestMethod = "POST"
+                connection.setRequestProperty("Content-Type", "application/json")
+                addAppHeaders(connection, username)
+                connection.doOutput = true
+
+                val json = JSONObject().apply {
+                    put("username", username)
+                }
+                connection.outputStream.bufferedWriter().use { it.write(json.toString()) }
+
+                val responseCode = connection.responseCode
+                val response = readResponse(connection)
+                connection.disconnect()
+
+                if (responseCode == 200) {
+                    val result = JSONObject(response)
+                    if (result.optBoolean("confirmed", false)) {
+                        val timeout = result.optInt("timeout_hours", 2)
+                        runOnUiThread {
+                            tvStatus.text = "Session confirmed (valid for ${timeout}h)"
+                            tvStatus.setTextColor(getColor(R.color.status_connected))
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Silently fail - session confirmation is best-effort
             }
         }.start()
     }
