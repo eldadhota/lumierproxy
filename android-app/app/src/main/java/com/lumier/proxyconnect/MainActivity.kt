@@ -985,7 +985,114 @@ class MainActivity : AppCompatActivity() {
     // Auto-check IP when app resumes
     override fun onResume() {
         super.onResume()
-        // Auto-check IP after a short delay to let UI settle
-        tvWhoAmI.postDelayed({ checkWhoAmI() }, 500)
+        // Sync settings from server and then check IP
+        syncSettingsFromServer()
+    }
+
+    // Sync device settings from the server (in case they were changed from dashboard)
+    private fun syncSettingsFromServer() {
+        val serverIp = etServerIp.text.toString().trim()
+        val username = etUsername.text.toString().trim()
+
+        if (serverIp.isEmpty() || username.isEmpty()) {
+            // No server/username configured, just check IP
+            tvWhoAmI.postDelayed({ checkWhoAmI() }, 500)
+            return
+        }
+
+        Thread {
+            try {
+                // First fetch proxies if list is empty
+                if (proxyList.isEmpty()) {
+                    try {
+                        val proxiesUrl = URL("${getServerUrl()}/api/app/proxies")
+                        val proxiesConn = proxiesUrl.openConnection() as HttpURLConnection
+                        proxiesConn.connectTimeout = 10000
+                        proxiesConn.readTimeout = 10000
+                        proxiesConn.requestMethod = "GET"
+                        addAppHeaders(proxiesConn, username)
+
+                        if (proxiesConn.responseCode == 200) {
+                            val proxiesResponse = readResponse(proxiesConn)
+                            val jsonArray = JSONArray(proxiesResponse)
+                            proxyList.clear()
+                            for (i in 0 until jsonArray.length()) {
+                                val obj = jsonArray.getJSONObject(i)
+                                proxyList.add(ProxyItem(obj.getInt("index"), obj.getString("name")))
+                            }
+                            runOnUiThread { updateProxySpinner() }
+                        }
+                        proxiesConn.disconnect()
+                    } catch (e: Exception) {
+                        // Ignore proxy fetch errors
+                    }
+                }
+
+                // Now fetch device settings
+                val url = URL("${getServerUrl()}/api/app/device-settings?username=$username")
+                val connection = url.openConnection() as HttpURLConnection
+                connection.connectTimeout = 10000
+                connection.readTimeout = 10000
+                connection.requestMethod = "GET"
+                addAppHeaders(connection, username)
+
+                val responseCode = connection.responseCode
+                val response = readResponse(connection)
+                connection.disconnect()
+
+                if (responseCode == 200) {
+                    val result = JSONObject(response)
+                    if (result.optBoolean("success", false)) {
+                        val serverProxyIndex = result.optInt("proxy_index", -1)
+                        val serverProxyName = result.optString("proxy_name", "")
+                        val sessionValid = result.optBoolean("session_valid", false)
+                        val sessionTimeout = result.optInt("session_timeout", 2)
+
+                        runOnUiThread {
+                            // Update proxy selection if it differs from server
+                            if (serverProxyIndex >= 0 && proxyList.isNotEmpty()) {
+                                val currentSelection = (spinnerProxy.selectedItem as? ProxyItem)?.index ?: -1
+                                if (currentSelection != serverProxyIndex) {
+                                    val position = proxyList.indexOfFirst { it.index == serverProxyIndex }
+                                    if (position >= 0) {
+                                        spinnerProxy.setSelection(position)
+                                        // Save the updated selection
+                                        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                                        prefs.edit { putInt(KEY_PROXY_INDEX, serverProxyIndex) }
+                                        Toast.makeText(this, "Proxy updated to: $serverProxyName", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+
+                            // Update status based on session validity
+                            if (sessionValid) {
+                                tvStatus.text = "Session active (${sessionTimeout}h timeout)"
+                                tvStatus.setTextColor(getColor(R.color.status_connected))
+                            } else {
+                                tvStatus.text = "Session expired - tap Connect"
+                                tvStatus.setTextColor(getColor(R.color.status_disconnected))
+                            }
+
+                            // Now check IP
+                            checkWhoAmI()
+                        }
+                    } else {
+                        // Device not registered or other error
+                        runOnUiThread {
+                            checkWhoAmI()
+                        }
+                    }
+                } else {
+                    runOnUiThread {
+                        checkWhoAmI()
+                    }
+                }
+            } catch (e: Exception) {
+                // Server unreachable, just check IP
+                runOnUiThread {
+                    tvWhoAmI.postDelayed({ checkWhoAmI() }, 500)
+                }
+            }
+        }.start()
     }
 }

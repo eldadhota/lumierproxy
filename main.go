@@ -1289,6 +1289,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	case "/api/app/confirm-connection":
 		handleAppConfirmConnection(w, r)
 		return
+	case "/api/app/device-settings":
+		handleAppDeviceSettings(w, r)
+		return
 	}
 
 	username := parseProxyUsername(r)
@@ -1530,6 +1533,7 @@ func startDashboard() {
 	http.HandleFunc("/api/app/whoami", handleAppWhoAmI)
 	http.HandleFunc("/api/app/check-ip", handleAppCheckIP)
 	http.HandleFunc("/api/app/validate-password", handleAppValidatePassword)
+	http.HandleFunc("/api/app/device-settings", handleAppDeviceSettings)
 
 	http.HandleFunc("/dashboard", server.requireAuth(handleDashboard))
 	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
@@ -2645,6 +2649,88 @@ func handleAppConfirmConnection(w http.ResponseWriter, r *http.Request) {
 		"proxy_name":      expectedProxyName,
 		"timeout_hours":   sessionTimeout,
 		"session_expires": device.SessionStart.Add(time.Duration(sessionTimeout) * time.Hour).Format(time.RFC3339),
+	})
+}
+
+// handleAppDeviceSettings returns the current device settings from the server
+// This allows the app to sync settings that were changed from the dashboard
+func handleAppDeviceSettings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "Method not allowed",
+		})
+		return
+	}
+
+	// Get username from query params or header
+	username := r.URL.Query().Get("username")
+	if username == "" {
+		username = r.Header.Get("X-App-Username")
+	}
+
+	if username == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "Username required",
+		})
+		return
+	}
+
+	// Look up device config
+	server.persistMu.RLock()
+	cfg, hasCfg := server.persistentData.DeviceConfigs[username]
+	sessionTimeout := server.persistentData.SystemSettings.SessionTimeout
+	server.persistMu.RUnlock()
+
+	if sessionTimeout <= 0 {
+		sessionTimeout = 2
+	}
+
+	if !hasCfg {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "Device not registered",
+		})
+		return
+	}
+
+	// Get proxy name
+	proxyName := server.getProxyName(cfg.ProxyIndex)
+
+	// Check device session status
+	server.mu.RLock()
+	device := server.findDeviceByUsername(username)
+	var sessionValid bool
+	var sessionExpires string
+	if device != nil {
+		sessionValid = server.isDeviceSessionValid(device)
+		if device.Confirmed && !device.SessionStart.IsZero() {
+			sessionExpires = device.SessionStart.Add(time.Duration(sessionTimeout) * time.Hour).Format(time.RFC3339)
+		}
+	}
+	server.mu.RUnlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":          true,
+		"username":         username,
+		"proxy_index":      cfg.ProxyIndex,
+		"proxy_name":       proxyName,
+		"custom_name":      cfg.CustomName,
+		"group":            cfg.Group,
+		"notes":            cfg.Notes,
+		"session_valid":    sessionValid,
+		"session_timeout":  sessionTimeout,
+		"session_expires":  sessionExpires,
 	})
 }
 
