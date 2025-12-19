@@ -30,6 +30,16 @@ import (
 // DATA STRUCTURES
 // ============================================================================
 
+// SessionState represents the explicit state of a device session
+type SessionState string
+
+const (
+	SessionStateRegistered SessionState = "REGISTERED" // Device exists but not actively connected
+	SessionStateActive     SessionState = "ACTIVE"     // Device connected and session confirmed
+	SessionStateExpired    SessionState = "EXPIRED"    // Session timed out, can reconnect within grace period
+	SessionStateBlocked    SessionState = "BLOCKED"    // Device temporarily blocked by admin
+)
+
 type Device struct {
 	ID            string    `json:"id"`
 	IP            string    `json:"ip"`
@@ -48,10 +58,15 @@ type Device struct {
 	ErrorCount    int64     `json:"error_count"`
 	LastError     string    `json:"last_error"`
 	LastErrorTime time.Time `json:"last_error_time"`
-	// Session confirmation fields
-	Confirmed     bool      `json:"confirmed"`
-	ConfirmedAt   time.Time `json:"confirmed_at"`
-	SessionStart  time.Time `json:"session_start"`
+	// Session state fields (v4.0 - explicit state machine)
+	SessionState  SessionState `json:"session_state"`
+	Confirmed     bool         `json:"confirmed"`
+	ConfirmedAt   time.Time    `json:"confirmed_at"`
+	SessionStart  time.Time    `json:"session_start"`
+	SessionExpiry time.Time    `json:"session_expiry"`
+	BlockedAt     time.Time    `json:"blocked_at,omitempty"`
+	BlockedReason string       `json:"blocked_reason,omitempty"`
+	BlockedBy     string       `json:"blocked_by,omitempty"`
 }
 
 type ProxyHealth struct {
@@ -123,9 +138,10 @@ type Supervisor struct {
 }
 
 type SystemSettings struct {
-	SessionTimeout       int `json:"session_timeout_hours"`
-	TrafficRetentionDays int `json:"traffic_retention_days"`
-	DeviceTimeoutMinutes int `json:"device_timeout_minutes"`
+	SessionTimeout        int `json:"session_timeout_hours"`
+	GracePeriodMinutes    int `json:"grace_period_minutes"`    // Grace period for reconnect after expiry (default 30)
+	TrafficRetentionDays  int `json:"traffic_retention_days"`
+	DeviceTimeoutMinutes  int `json:"device_timeout_minutes"`
 }
 
 // ============================================================================
@@ -377,9 +393,10 @@ func main() {
 			TrafficHistory:  []TrafficSnapshot{},
 			ProxyHealthData: make(map[int]*ProxyHealth),
 			SystemSettings: SystemSettings{
-				SessionTimeout:       2, // 2 hours default WiFi session timeout
-				TrafficRetentionDays: 7,
-				DeviceTimeoutMinutes: 30,
+				SessionTimeout:        2,  // 2 hours default WiFi session timeout
+				GracePeriodMinutes:    30, // 30 minutes grace period for reconnect
+				TrafficRetentionDays:  7,
+				DeviceTimeoutMinutes:  30,
 			},
 		},
 	}
@@ -1179,39 +1196,112 @@ func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) (*Devi
 	return device, nil
 }
 
-// isDeviceSessionValid checks if a device has a valid confirmed session
-func (s *ProxyServer) isDeviceSessionValid(device *Device) bool {
+// getDeviceSessionState returns the current session state for a device
+func (s *ProxyServer) getDeviceSessionState(device *Device) SessionState {
+	// If device is blocked, return blocked state
+	if device.SessionState == SessionStateBlocked {
+		return SessionStateBlocked
+	}
+
 	// Get session timeout in hours
 	s.persistMu.RLock()
 	sessionTimeoutHours := s.persistentData.SystemSettings.SessionTimeout
+	gracePeriodMinutes := s.persistentData.SystemSettings.GracePeriodMinutes
 	s.persistMu.RUnlock()
 
 	if sessionTimeoutHours <= 0 {
-		sessionTimeoutHours = 2 // Default to 2 hours if not set
+		sessionTimeoutHours = 2 // Default to 2 hours
+	}
+	if gracePeriodMinutes <= 0 {
+		gracePeriodMinutes = 30 // Default to 30 minutes grace period
 	}
 
-	// Device must be confirmed
+	// Device not confirmed = REGISTERED state
 	if !device.Confirmed {
-		return false
+		return SessionStateRegistered
 	}
 
-	// Check if session has expired
 	sessionDuration := time.Duration(sessionTimeoutHours) * time.Hour
-	if time.Since(device.SessionStart) > sessionDuration {
-		// Session expired - require re-confirmation
-		device.Confirmed = false
-		return false
+	graceDuration := time.Duration(gracePeriodMinutes) * time.Minute
+	timeSinceStart := time.Since(device.SessionStart)
+
+	// Active session
+	if timeSinceStart <= sessionDuration {
+		return SessionStateActive
 	}
 
-	return true
+	// Within grace period - session is EXPIRED but can reconnect
+	if timeSinceStart <= sessionDuration+graceDuration {
+		return SessionStateExpired
+	}
+
+	// Beyond grace period - back to REGISTERED state (needs full re-confirmation)
+	return SessionStateRegistered
+}
+
+// isDeviceSessionValid checks if a device has a valid confirmed session
+func (s *ProxyServer) isDeviceSessionValid(device *Device) bool {
+	state := s.getDeviceSessionState(device)
+	return state == SessionStateActive
+}
+
+// canDeviceReconnect checks if device can reconnect within grace period (without full re-registration)
+func (s *ProxyServer) canDeviceReconnect(device *Device) bool {
+	state := s.getDeviceSessionState(device)
+	return state == SessionStateActive || state == SessionStateExpired
+}
+
+// isDeviceBlocked checks if a device is blocked
+func (s *ProxyServer) isDeviceBlocked(device *Device) bool {
+	return device.SessionState == SessionStateBlocked
+}
+
+// blockDevice blocks a device with a reason
+func (s *ProxyServer) blockDevice(device *Device, reason, blockedBy string) {
+	device.SessionState = SessionStateBlocked
+	device.BlockedAt = time.Now()
+	device.BlockedReason = reason
+	device.BlockedBy = blockedBy
+	device.Confirmed = false
+
+	s.addDeviceLog("warn", "session", fmt.Sprintf("[BLOCKED] Device %s blocked by %s: %s", device.Username, blockedBy, reason), device)
+	go s.saveDeviceConfig(device)
+}
+
+// unblockDevice unblocks a device
+func (s *ProxyServer) unblockDevice(device *Device, unblockedBy string) {
+	oldReason := device.BlockedReason
+	device.SessionState = SessionStateRegistered
+	device.BlockedAt = time.Time{}
+	device.BlockedReason = ""
+	device.BlockedBy = ""
+
+	s.addDeviceLog("info", "session", fmt.Sprintf("[UNBLOCKED] Device %s unblocked by %s (was blocked for: %s)", device.Username, unblockedBy, oldReason), device)
+	go s.saveDeviceConfig(device)
 }
 
 // confirmDeviceSession marks a device as confirmed and starts a new session
 func (s *ProxyServer) confirmDeviceSession(device *Device) {
+	// Can't confirm if blocked
+	if device.SessionState == SessionStateBlocked {
+		return
+	}
+
 	now := time.Now()
+
+	// Get session timeout
+	s.persistMu.RLock()
+	sessionTimeoutHours := s.persistentData.SystemSettings.SessionTimeout
+	s.persistMu.RUnlock()
+	if sessionTimeoutHours <= 0 {
+		sessionTimeoutHours = 2
+	}
+
+	device.SessionState = SessionStateActive
 	device.Confirmed = true
 	device.ConfirmedAt = now
 	device.SessionStart = now
+	device.SessionExpiry = now.Add(time.Duration(sessionTimeoutHours) * time.Hour)
 
 	// Save to persistent config
 	s.persistMu.Lock()
@@ -1599,6 +1689,8 @@ func startDashboard() {
 	http.HandleFunc("/api/update-proxy-name", server.requireAuth(handleUpdateProxyNameAPI))
 	http.HandleFunc("/api/reorder-proxies", server.requireAuth(handleReorderProxiesAPI))
 	http.HandleFunc("/api/session-settings", server.requireAuth(handleSessionSettingsAPI))
+	http.HandleFunc("/api/block-device", server.requireAuth(handleBlockDeviceAPI))
+	http.HandleFunc("/api/unblock-device", server.requireAuth(handleUnblockDeviceAPI))
 
 	log.Printf("📊 Dashboard on port %d\n", server.dashPort)
 	addr := fmt.Sprintf("%s:%d", server.bindAddr, server.dashPort)
@@ -1722,7 +1814,10 @@ func handleChangePasswordAPI(w http.ResponseWriter, r *http.Request) {
 // DeviceWithStatus extends Device with online status for API response
 type DeviceWithStatus struct {
 	*Device
-	Online bool `json:"online"`
+	Online           bool   `json:"online"`
+	ComputedState    string `json:"computed_session_state"`
+	CanReconnect     bool   `json:"can_reconnect"`
+	SessionRemaining string `json:"session_remaining,omitempty"`
 }
 
 func handleDevicesAPI(w http.ResponseWriter, r *http.Request) {
@@ -1733,10 +1828,34 @@ func handleDevicesAPI(w http.ResponseWriter, r *http.Request) {
 	activeUsernames := make(map[string]bool)
 	devices := make([]DeviceWithStatus, 0)
 
-	// Add all active devices
+	// Add all active devices with computed session state
 	for _, d := range server.devices {
 		isOnline := time.Since(d.LastSeen) < 5*time.Minute
-		devices = append(devices, DeviceWithStatus{Device: d, Online: isOnline})
+		state := server.getDeviceSessionState(d)
+		canReconnect := server.canDeviceReconnect(d)
+		
+		// Calculate remaining session time
+		var remaining string
+		if state == SessionStateActive && !d.SessionExpiry.IsZero() {
+			remainingDuration := time.Until(d.SessionExpiry)
+			if remainingDuration > 0 {
+				hours := int(remainingDuration.Hours())
+				minutes := int(remainingDuration.Minutes()) % 60
+				if hours > 0 {
+					remaining = fmt.Sprintf("%dh %dm", hours, minutes)
+				} else {
+					remaining = fmt.Sprintf("%dm", minutes)
+				}
+			}
+		}
+		
+		devices = append(devices, DeviceWithStatus{
+			Device:           d,
+			Online:           isOnline,
+			ComputedState:    string(state),
+			CanReconnect:     canReconnect,
+			SessionRemaining: remaining,
+		})
 		if d.Username != "" {
 			activeUsernames[d.Username] = true
 		}
@@ -1770,8 +1889,14 @@ func handleDevicesAPI(w http.ResponseWriter, r *http.Request) {
 				Notes:         cfg.Notes,
 				UpstreamProxy: upstreamProxy,
 				Status:        "offline",
+				SessionState:  SessionStateRegistered, // Offline = registered but not active
 			}
-			devices = append(devices, DeviceWithStatus{Device: offlineDevice, Online: false})
+			devices = append(devices, DeviceWithStatus{
+				Device:        offlineDevice,
+				Online:        false,
+				ComputedState: string(SessionStateRegistered),
+				CanReconnect:  false,
+			})
 		}
 		server.persistMu.RUnlock()
 	}
@@ -2757,30 +2882,56 @@ func handleAppDeviceSettings(w http.ResponseWriter, r *http.Request) {
 	// Get proxy name
 	proxyName := server.getProxyName(cfg.ProxyIndex)
 
-	// Check device session status
+	// Get grace period setting
+	server.persistMu.RLock()
+	gracePeriodMinutes := server.persistentData.SystemSettings.GracePeriodMinutes
+	server.persistMu.RUnlock()
+	if gracePeriodMinutes <= 0 {
+		gracePeriodMinutes = 30
+	}
+
+	// Check device session status with new state machine
 	server.mu.RLock()
 	device := server.findDeviceByUsername(username)
+	var sessionState string
 	var sessionValid bool
+	var canReconnect bool
 	var sessionExpires string
+	var isBlocked bool
+	var blockedReason string
+
 	if device != nil {
-		sessionValid = server.isDeviceSessionValid(device)
+		state := server.getDeviceSessionState(device)
+		sessionState = string(state)
+		sessionValid = (state == SessionStateActive)
+		canReconnect = (state == SessionStateActive || state == SessionStateExpired)
+		isBlocked = (state == SessionStateBlocked)
+		blockedReason = device.BlockedReason
+
 		if device.Confirmed && !device.SessionStart.IsZero() {
 			sessionExpires = device.SessionStart.Add(time.Duration(sessionTimeout) * time.Hour).Format(time.RFC3339)
 		}
+	} else {
+		sessionState = string(SessionStateRegistered)
 	}
 	server.mu.RUnlock()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":          true,
-		"username":         username,
-		"proxy_index":      cfg.ProxyIndex,
-		"proxy_name":       proxyName,
-		"custom_name":      cfg.CustomName,
-		"group":            cfg.Group,
-		"notes":            cfg.Notes,
-		"session_valid":    sessionValid,
-		"session_timeout":  sessionTimeout,
-		"session_expires":  sessionExpires,
+		"success":              true,
+		"username":             username,
+		"proxy_index":          cfg.ProxyIndex,
+		"proxy_name":           proxyName,
+		"custom_name":          cfg.CustomName,
+		"group":                cfg.Group,
+		"notes":                cfg.Notes,
+		"session_state":        sessionState,
+		"session_valid":        sessionValid,
+		"can_reconnect":        canReconnect,
+		"session_timeout":      sessionTimeout,
+		"grace_period_minutes": gracePeriodMinutes,
+		"session_expires":      sessionExpires,
+		"is_blocked":           isBlocked,
+		"blocked_reason":       blockedReason,
 	})
 }
 
@@ -3785,14 +3936,16 @@ func handleSessionSettingsAPI(w http.ResponseWriter, r *http.Request) {
 		settings := server.persistentData.SystemSettings
 		server.persistMu.RUnlock()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"session_timeout_hours": settings.SessionTimeout,
+			"session_timeout_hours":  settings.SessionTimeout,
+			"grace_period_minutes":   settings.GracePeriodMinutes,
 		})
 		return
 	}
 
 	if r.Method == http.MethodPost {
 		var req struct {
-			SessionTimeout int `json:"session_timeout_hours"`
+			SessionTimeout     int `json:"session_timeout_hours"`
+			GracePeriodMinutes int `json:"grace_period_minutes"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid request", http.StatusBadRequest)
@@ -3806,19 +3959,139 @@ func handleSessionSettingsAPI(w http.ResponseWriter, r *http.Request) {
 			req.SessionTimeout = 48
 		}
 
+		// Validate grace period (5-120 minutes)
+		if req.GracePeriodMinutes < 5 {
+			req.GracePeriodMinutes = 5
+		} else if req.GracePeriodMinutes > 120 {
+			req.GracePeriodMinutes = 120
+		}
+
 		server.persistMu.Lock()
 		server.persistentData.SystemSettings.SessionTimeout = req.SessionTimeout
+		server.persistentData.SystemSettings.GracePeriodMinutes = req.GracePeriodMinutes
 		server.persistMu.Unlock()
 
 		server.savePersistentData()
-		log.Printf("⚙️ Session timeout updated to %d hours\n", req.SessionTimeout)
-		server.addLog("info", fmt.Sprintf("Session timeout updated to %d hours", req.SessionTimeout))
+		log.Printf("⚙️ Session settings updated: timeout=%dh, grace=%dm\n", req.SessionTimeout, req.GracePeriodMinutes)
+		server.addLog("info", fmt.Sprintf("Session settings updated: timeout=%dh, grace period=%dm", req.SessionTimeout, req.GracePeriodMinutes))
 
 		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
 		return
 	}
 
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+}
+
+// handleBlockDeviceAPI blocks a device from connecting
+func handleBlockDeviceAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Method not allowed"})
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Invalid request"})
+		return
+	}
+
+	if req.Username == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Username required"})
+		return
+	}
+
+	// Get admin username from session
+	cookie, _ := r.Cookie("session_token")
+	adminUser := "admin"
+	if cookie != nil {
+		if session, valid := server.validateSession(cookie.Value); valid {
+			adminUser = session.Username
+		}
+	}
+
+	// Find device
+	server.mu.Lock()
+	device := server.findDeviceByUsername(req.Username)
+	if device == nil {
+		server.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Device not found"})
+		return
+	}
+
+	reason := req.Reason
+	if reason == "" {
+		reason = "Blocked by administrator"
+	}
+
+	server.blockDevice(device, reason, adminUser)
+	server.mu.Unlock()
+
+	log.Printf("🚫 Device '%s' blocked by %s: %s\n", req.Username, adminUser, reason)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Device %s has been blocked", req.Username),
+	})
+}
+
+// handleUnblockDeviceAPI unblocks a blocked device
+func handleUnblockDeviceAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Method not allowed"})
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Invalid request"})
+		return
+	}
+
+	if req.Username == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Username required"})
+		return
+	}
+
+	// Get admin username from session
+	cookie, _ := r.Cookie("session_token")
+	adminUser := "admin"
+	if cookie != nil {
+		if session, valid := server.validateSession(cookie.Value); valid {
+			adminUser = session.Username
+		}
+	}
+
+	// Find device
+	server.mu.Lock()
+	device := server.findDeviceByUsername(req.Username)
+	if device == nil {
+		server.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Device not found"})
+		return
+	}
+
+	if device.SessionState != SessionStateBlocked {
+		server.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Device is not blocked"})
+		return
+	}
+
+	server.unblockDevice(device, adminUser)
+	server.mu.Unlock()
+
+	log.Printf("✅ Device '%s' unblocked by %s\n", req.Username, adminUser)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Device %s has been unblocked", req.Username),
+	})
 }
 
 const loginPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Login</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3839,7 +4112,7 @@ const healthPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Prox
 <style>` + baseStyles + `.health-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:20px}.proxy-card{background:white;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);border-left:4px solid #ccc}.proxy-card.healthy{border-left-color:#4caf50}.proxy-card.degraded{border-left-color:#ff9800}.proxy-card.unhealthy{border-left-color:#f44336}.proxy-card.unknown{border-left-color:#9e9e9e}.proxy-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}.proxy-name{font-size:1.2em;font-weight:bold;color:#333}.proxy-status{padding:5px 12px;border-radius:20px;font-size:0.85em;font-weight:600}.proxy-status.healthy{background:#e8f5e9;color:#2e7d32}.proxy-status.degraded{background:#fff3e0;color:#e65100}.proxy-status.unhealthy{background:#ffebee;color:#c62828}.proxy-status.unknown{background:#f5f5f5;color:#666}.proxy-stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}.proxy-stat{padding:10px;background:#f8f9fa;border-radius:8px}.proxy-stat-value{font-size:1.3em;font-weight:bold;color:#667eea}.proxy-stat-label{font-size:0.8em;color:#666;text-transform:uppercase}.progress-bar{height:8px;background:#e0e0e0;border-radius:4px;overflow:hidden;margin-top:10px}.progress-fill{height:100%;border-radius:4px;transition:width 0.3s}.progress-fill.good{background:#4caf50}.progress-fill.warning{background:#ff9800}.progress-fill.bad{background:#f44336}.last-error{margin-top:10px;padding:10px;background:#ffebee;border-radius:8px;font-size:0.85em;color:#c62828;word-break:break-all}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>💚 Proxy Health Monitor</h1><p>Real-time health status of all upstream proxies</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Total Proxies</div></div><div class="stat-card"><div class="stat-value" id="healthyProxies" style="color:#4caf50">-</div><div class="stat-label">Healthy</div></div><div class="stat-card"><div class="stat-value" id="degradedProxies" style="color:#ff9800">-</div><div class="stat-label">Degraded</div></div><div class="stat-card"><div class="stat-value" id="unhealthyProxies" style="color:#f44336">-</div><div class="stat-label">Unhealthy</div></div><div class="stat-card"><div class="stat-value" id="avgSuccessRate">-</div><div class="stat-label">Avg Success</div></div></div><div class="card"><h2>Proxy Status</h2><button class="btn btn-secondary" onclick="loadHealth()" style="float:right;margin-top:-45px">🔄 Refresh</button><div id="healthGrid" class="health-grid"><div class="loading">Loading...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-health').classList.add('active');function loadHealth(){fetch('/api/proxy-health').then(r=>r.json()).then(data=>{let healthy=0,degraded=0,unhealthy=0,totalRate=0;data.forEach(p=>{if(p.status==='healthy')healthy++;else if(p.status==='degraded')degraded++;else if(p.status==='unhealthy')unhealthy++;totalRate+=p.success_rate||0;});document.getElementById('totalProxies').textContent=data.length;document.getElementById('healthyProxies').textContent=healthy;document.getElementById('degradedProxies').textContent=degraded;document.getElementById('unhealthyProxies').textContent=unhealthy;document.getElementById('avgSuccessRate').textContent=data.length?(totalRate/data.length).toFixed(1)+'%':'-';document.getElementById('healthGrid').innerHTML=data.map(p=>{const rate=p.success_rate||0;const rateClass=rate>=95?'good':rate>=80?'warning':'bad';return'<div class="proxy-card '+p.status+'"><div class="proxy-header"><span class="proxy-name">#'+(p.index+1)+' – '+p.ip_address+'</span><span class="proxy-status '+p.status+'">'+p.status.toUpperCase()+'</span></div><div class="proxy-stats"><div class="proxy-stat"><div class="proxy-stat-value">'+formatNumber(p.total_requests)+'</div><div class="proxy-stat-label">Requests</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+rate.toFixed(1)+'%</div><div class="proxy-stat-label">Success Rate</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+formatNumber(p.success_count)+'</div><div class="proxy-stat-label">Success</div></div><div class="proxy-stat"><div class="proxy-stat-value" style="color:#c62828">'+formatNumber(p.failure_count)+'</div><div class="proxy-stat-label">Failures</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+p.avg_response_time_ms+'ms</div><div class="proxy-stat-label">Avg Response</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+p.active_devices+'</div><div class="proxy-stat-label">Active Devices</div></div></div><div class="progress-bar"><div class="progress-fill '+rateClass+'" style="width:'+rate+'%"></div></div>'+(p.last_error?'<div class="last-error">Last error: '+p.last_error+'</div>':'')+'</div>';}).join('');});}loadHealth();setInterval(loadHealth,30000);</script></body></html>`
 
 const analyticsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Analytics</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.chart-container{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.chart-container h2{margin-bottom:20px}.chart{width:100%;height:300px;position:relative}.chart-bars{display:flex;align-items:flex-end;height:250px;gap:4px;padding:0 10px;border-bottom:2px solid #e0e0e0}.chart-bar{flex:1;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);border-radius:4px 4px 0 0;min-width:8px;position:relative;transition:height 0.3s}.chart-bar:hover{opacity:0.8}.chart-bar .tooltip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:#333;color:white;padding:5px 10px;border-radius:4px;font-size:0.8em;white-space:nowrap;opacity:0;transition:opacity 0.2s;pointer-events:none}.chart-bar:hover .tooltip{opacity:1}.chart-labels{display:flex;gap:4px;padding:10px 10px 0}.chart-label{flex:1;text-align:center;font-size:0.7em;color:#666}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📊 Traffic Analytics</h1><p>Historical traffic data and trends</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalData">-</div><div class="stat-label">Total Data</div></div><div class="stat-card"><div class="stat-value" id="totalReqs">-</div><div class="stat-label">Total Requests</div></div><div class="stat-card"><div class="stat-value" id="peakDevices">-</div><div class="stat-label">Peak Devices</div></div><div class="stat-card"><div class="stat-value" id="errorRate">-</div><div class="stat-label">Error Rate</div></div></div><div class="chart-container"><h2>📈 Traffic Over Time</h2><button class="btn btn-secondary" onclick="loadAnalytics()" style="float:right;margin-top:-45px">🔄 Refresh</button><div class="chart"><div class="chart-bars" id="trafficBars"></div><div class="chart-labels" id="trafficLabels"></div></div></div><div class="chart-container"><h2>📊 Active Devices Over Time</h2><div class="chart"><div class="chart-bars" id="deviceBars"></div><div class="chart-labels" id="deviceLabels"></div></div></div></div><script>` + baseJS + `document.getElementById('nav-analytics').classList.add('active');function loadAnalytics(){fetch('/api/traffic-history').then(r=>r.json()).then(data=>{if(!data||!data.length){document.getElementById('trafficBars').innerHTML='<div class="loading">No data yet. Traffic data is collected every 5 minutes.</div>';return;}const totalBytes=data.reduce((a,d)=>a+(d.total_bytes_in||0)+(d.total_bytes_out||0),0);const totalReqs=data.length>0?data[data.length-1].total_requests:0;const peakDevices=Math.max(...data.map(d=>d.active_devices||0));const totalErrors=data.length>0?data[data.length-1].error_count:0;const errorRate=totalReqs>0?((totalErrors/totalReqs)*100).toFixed(2)+'%':'0%';document.getElementById('totalData').textContent=formatBytes(totalBytes);document.getElementById('totalReqs').textContent=formatNumber(totalReqs);document.getElementById('peakDevices').textContent=peakDevices;document.getElementById('errorRate').textContent=errorRate;const maxBytes=Math.max(...data.map(d=>(d.total_bytes_in||0)+(d.total_bytes_out||0)));const maxDevices=Math.max(...data.map(d=>d.active_devices||0));document.getElementById('trafficBars').innerHTML=data.map(d=>{const bytes=(d.total_bytes_in||0)+(d.total_bytes_out||0);const h=maxBytes>0?(bytes/maxBytes*230):5;return'<div class="chart-bar" style="height:'+h+'px"><span class="tooltip">'+formatBytes(bytes)+'</span></div>';}).join('');document.getElementById('trafficLabels').innerHTML=data.map((d,i)=>{if(i%Math.ceil(data.length/8)===0){return'<div class="chart-label">'+new Date(d.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div>';}return'<div class="chart-label"></div>';}).join('');document.getElementById('deviceBars').innerHTML=data.map(d=>{const h=maxDevices>0?(d.active_devices/maxDevices*230):5;return'<div class="chart-bar" style="height:'+h+'px;background:linear-gradient(135deg,#4caf50 0%,#2e7d32 100%)"><span class="tooltip">'+d.active_devices+' devices</span></div>';}).join('');document.getElementById('deviceLabels').innerHTML=data.map((d,i)=>{if(i%Math.ceil(data.length/8)===0){return'<div class="chart-label">'+new Date(d.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div>';}return'<div class="chart-label"></div>';}).join('');});}loadAnalytics();setInterval(loadAnalytics,60000);</script></body></html>`
+<style>` + baseStyles + `.chart-container{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px;overflow:hidden}.chart-container h2{margin-bottom:20px}.chart{width:100%;height:300px;position:relative;overflow:hidden}.chart-bars{display:flex;align-items:flex-end;height:250px;gap:2px;padding:0 10px;border-bottom:2px solid #e0e0e0;overflow:hidden}.chart-bar{flex:1;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);border-radius:4px 4px 0 0;min-width:2px;max-width:40px;position:relative;transition:height 0.3s}.chart-bar:hover{opacity:0.8}.chart-bar .tooltip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:#333;color:white;padding:5px 10px;border-radius:4px;font-size:0.8em;white-space:nowrap;opacity:0;transition:opacity 0.2s;pointer-events:none;z-index:10}.chart-bar:hover .tooltip{opacity:1}.chart-labels{display:flex;gap:2px;padding:10px 10px 0;overflow:hidden}.chart-label{flex:1;text-align:center;font-size:0.7em;color:#666;min-width:0;overflow:hidden;text-overflow:ellipsis}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📊 Traffic Analytics</h1><p>Historical traffic data and trends</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalData">-</div><div class="stat-label">Total Data</div></div><div class="stat-card"><div class="stat-value" id="totalReqs">-</div><div class="stat-label">Total Requests</div></div><div class="stat-card"><div class="stat-value" id="peakDevices">-</div><div class="stat-label">Peak Devices</div></div><div class="stat-card"><div class="stat-value" id="errorRate">-</div><div class="stat-label">Error Rate</div></div></div><div class="chart-container"><h2>📈 Traffic Over Time</h2><button class="btn btn-secondary" onclick="loadAnalytics()" style="float:right;margin-top:-45px">🔄 Refresh</button><div class="chart"><div class="chart-bars" id="trafficBars"></div><div class="chart-labels" id="trafficLabels"></div></div></div><div class="chart-container"><h2>📊 Active Devices Over Time</h2><div class="chart"><div class="chart-bars" id="deviceBars"></div><div class="chart-labels" id="deviceLabels"></div></div></div></div><script>` + baseJS + `document.getElementById('nav-analytics').classList.add('active');function loadAnalytics(){fetch('/api/traffic-history').then(r=>r.json()).then(data=>{if(!data||!data.length){document.getElementById('trafficBars').innerHTML='<div class="loading">No data yet. Traffic data is collected every 5 minutes.</div>';return;}const totalBytes=data.reduce((a,d)=>a+(d.total_bytes_in||0)+(d.total_bytes_out||0),0);const totalReqs=data.length>0?data[data.length-1].total_requests:0;const peakDevices=Math.max(...data.map(d=>d.active_devices||0));const totalErrors=data.length>0?data[data.length-1].error_count:0;const errorRate=totalReqs>0?((totalErrors/totalReqs)*100).toFixed(2)+'%':'0%';document.getElementById('totalData').textContent=formatBytes(totalBytes);document.getElementById('totalReqs').textContent=formatNumber(totalReqs);document.getElementById('peakDevices').textContent=peakDevices;document.getElementById('errorRate').textContent=errorRate;const maxBytes=Math.max(...data.map(d=>(d.total_bytes_in||0)+(d.total_bytes_out||0)));const maxDevices=Math.max(...data.map(d=>d.active_devices||0));document.getElementById('trafficBars').innerHTML=data.map(d=>{const bytes=(d.total_bytes_in||0)+(d.total_bytes_out||0);const h=maxBytes>0?(bytes/maxBytes*230):5;return'<div class="chart-bar" style="height:'+h+'px"><span class="tooltip">'+formatBytes(bytes)+'</span></div>';}).join('');document.getElementById('trafficLabels').innerHTML=data.map((d,i)=>{if(i%Math.ceil(data.length/8)===0){return'<div class="chart-label">'+new Date(d.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div>';}return'<div class="chart-label"></div>';}).join('');document.getElementById('deviceBars').innerHTML=data.map(d=>{const h=maxDevices>0?(d.active_devices/maxDevices*230):5;return'<div class="chart-bar" style="height:'+h+'px;background:linear-gradient(135deg,#4caf50 0%,#2e7d32 100%)"><span class="tooltip">'+d.active_devices+' devices</span></div>';}).join('');document.getElementById('deviceLabels').innerHTML=data.map((d,i)=>{if(i%Math.ceil(data.length/8)===0){return'<div class="chart-label">'+new Date(d.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div>';}return'<div class="chart-label"></div>';}).join('');});}loadAnalytics();setInterval(loadAnalytics,60000);</script></body></html>`
 
 const activityPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Activity Log</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>` + baseStyles + `.activity-container{background:white;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);overflow:hidden}.activity-header{background:#333;color:white;padding:15px 20px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}.activity-header h2{margin:0;font-size:1.1em}.filters{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.filters select,.filters input{padding:8px 12px;border:none;border-radius:6px;font-size:0.9em;background:rgba(255,255,255,0.9)}.activity-content{height:600px;overflow-y:auto;font-family:'Monaco','Menlo','Ubuntu Mono',monospace;font-size:0.85em}.log-entry{padding:10px 20px;border-bottom:1px solid #f0f0f0;display:grid;grid-template-columns:140px 80px 120px 120px 1fr;gap:15px;align-items:center}.log-entry:nth-child(odd){background:#fafafa}.log-entry:hover{background:#f0f5ff}.log-time{color:#888;white-space:nowrap;font-size:0.9em}.log-level{font-weight:600;text-transform:uppercase;font-size:0.75em;padding:3px 8px;border-radius:4px;text-align:center}.log-level.info{background:#e3f2fd;color:#1976d2}.log-level.error{background:#ffebee;color:#c62828}.log-level.warn,.log-level.warning{background:#fff3e0;color:#e65100}.log-category{font-size:0.8em;color:#666;background:#f5f5f5;padding:3px 8px;border-radius:4px;text-align:center}.log-device{font-size:0.85em;color:#667eea;font-weight:500}.log-msg{color:#333;word-break:break-word}.auto-refresh{display:flex;align-items:center;gap:8px;font-size:0.9em;color:white}.auto-refresh input{width:18px;height:18px;cursor:pointer}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📋 Activity Log</h1><p>Detailed device and system activity log with filtering</p></div><div class="stats-grid"><div class="stat-card" onclick="filterLevel('')" style="cursor:pointer"><div class="stat-value" id="totalLogs">-</div><div class="stat-label">Total Logs</div></div><div class="stat-card" onclick="filterLevel('info')" style="cursor:pointer"><div class="stat-value" id="infoLogs" style="color:#1976d2">-</div><div class="stat-label">Info</div></div><div class="stat-card" onclick="filterLevel('warn')" style="cursor:pointer"><div class="stat-value" id="warnLogs" style="color:#e65100">-</div><div class="stat-label">Warnings</div></div><div class="stat-card" onclick="filterLevel('error')" style="cursor:pointer"><div class="stat-value" id="errorLogs" style="color:#c62828">-</div><div class="stat-label">Errors</div></div></div><div class="activity-container"><div class="activity-header"><h2>📋 Live Activity Feed</h2><div class="filters"><select id="filterCategory" onchange="loadActivity()"><option value="">All Categories</option><option value="connection">Connection</option><option value="session">Session</option><option value="config">Config</option><option value="proxy">Proxy</option><option value="auth">Auth</option><option value="error">Error</option></select><select id="filterLevelSelect" onchange="loadActivity()"><option value="">All Levels</option><option value="info">Info</option><option value="warn">Warning</option><option value="error">Error</option></select><input type="text" id="filterDevice" placeholder="Filter by device/user..." style="width:180px" onkeyup="debounceLoad()"><button class="btn btn-secondary" onclick="loadActivity()" style="padding:8px 15px;font-size:0.85em">🔄 Refresh</button></div><label class="auto-refresh"><input type="checkbox" id="autoRefresh" checked> Auto-refresh</label></div><div class="activity-content" id="activityContent"><div class="loading">Loading activity log...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-activity').classList.add('active');let debounceTimer;function debounceLoad(){clearTimeout(debounceTimer);debounceTimer=setTimeout(loadActivity,300);}function filterLevel(level){document.getElementById('filterLevelSelect').value=level;loadActivity();}function loadActivity(){const category=document.getElementById('filterCategory').value;const level=document.getElementById('filterLevelSelect').value;const device=document.getElementById('filterDevice').value.trim();let url='/api/activity-log?limit=500';if(category)url+='&category='+encodeURIComponent(category);if(level)url+='&level='+encodeURIComponent(level);if(device)url+='&device='+encodeURIComponent(device);fetch(url).then(r=>r.json()).then(data=>{document.getElementById('totalLogs').textContent=data.total_count||0;document.getElementById('infoLogs').textContent=data.info_count||0;document.getElementById('warnLogs').textContent=data.warn_count||0;document.getElementById('errorLogs').textContent=data.error_count||0;const container=document.getElementById('activityContent');if(!data.logs||!data.logs.length){container.innerHTML='<div style="padding:40px;text-align:center;color:#666">No activity logs yet. Device activity will appear here.</div>';return;}container.innerHTML=data.logs.slice().reverse().map(log=>{const time=new Date(log.timestamp).toLocaleString();const deviceInfo=log.username||log.device_name||log.device_ip||'-';const category=log.category||'-';return'<div class="log-entry"><span class="log-time">'+time+'</span><span class="log-level '+log.level+'">'+log.level+'</span><span class="log-category">'+category+'</span><span class="log-device" title="'+(log.device_ip||'')+'">'+deviceInfo+'</span><span class="log-msg">'+escapeHtml(log.message)+'</span></div>';}).join('');if(document.getElementById('autoRefresh').checked){container.scrollTop=0;}});}function escapeHtml(t){if(!t)return'';const d=document.createElement('div');d.textContent=t;return d.innerHTML;}loadActivity();setInterval(()=>{if(document.getElementById('autoRefresh').checked)loadActivity();},5000);</script></body></html>`
