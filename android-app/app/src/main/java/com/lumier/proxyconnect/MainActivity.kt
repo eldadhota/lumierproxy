@@ -22,6 +22,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.URL
 
 class MainActivity : AppCompatActivity() {
@@ -803,18 +805,74 @@ class MainActivity : AppCompatActivity() {
 
         Thread {
             try {
-                // Step 1: Get public IP directly from external service (device's actual IP)
-                val ipApiUrl = URL("http://ip-api.com/json/?fields=status,query,country,city,countryCode")
-                val ipConnection = ipApiUrl.openConnection() as HttpURLConnection
-                ipConnection.connectTimeout = 15000
-                ipConnection.readTimeout = 15000
-                ipConnection.requestMethod = "GET"
+                val serverIp = etServerIp.text.toString().trim()
 
-                val ipResponse = readResponse(ipConnection)
-                ipConnection.disconnect()
+                // Get proxy configuration for routing the IP check through the proxy
+                val proxyHost = serverIp.ifEmpty { "192.168.50.60" }
+                val proxyPort = 8888  // HTTP proxy port
 
-                val ipResult = JSONObject(ipResponse)
-                if (ipResult.optString("status") != "success") {
+                var publicIP = ""
+                var country = ""
+                var countryCode = ""
+                var city = ""
+                var proxyCheckSuccess = false
+                var directCheckFallback = false
+
+                // Step 1: Try to get public IP through the proxy (this verifies proxy is working)
+                try {
+                    val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress(proxyHost, proxyPort))
+                    val ipApiUrl = URL("http://ip-api.com/json/?fields=status,query,country,city,countryCode")
+                    val ipConnection = ipApiUrl.openConnection(proxy) as HttpURLConnection
+                    ipConnection.connectTimeout = 15000
+                    ipConnection.readTimeout = 15000
+                    ipConnection.requestMethod = "GET"
+
+                    val ipResponse = readResponse(ipConnection)
+                    ipConnection.disconnect()
+
+                    val ipResult = JSONObject(ipResponse)
+                    if (ipResult.optString("status") == "success") {
+                        publicIP = ipResult.optString("query", "?")
+                        country = ipResult.optString("country", "")
+                        countryCode = ipResult.optString("countryCode", "")
+                        city = ipResult.optString("city", "")
+                        proxyCheckSuccess = true
+                    }
+                } catch (e: Exception) {
+                    // Proxy connection failed - will try direct connection as fallback
+                    proxyCheckSuccess = false
+                }
+
+                // Step 2: If proxy check failed, try direct connection (to show user their real IP)
+                if (!proxyCheckSuccess) {
+                    try {
+                        directCheckFallback = true
+                        val ipApiUrl = URL("http://ip-api.com/json/?fields=status,query,country,city,countryCode")
+                        val ipConnection = ipApiUrl.openConnection() as HttpURLConnection
+                        ipConnection.connectTimeout = 15000
+                        ipConnection.readTimeout = 15000
+                        ipConnection.requestMethod = "GET"
+
+                        val ipResponse = readResponse(ipConnection)
+                        ipConnection.disconnect()
+
+                        val ipResult = JSONObject(ipResponse)
+                        if (ipResult.optString("status") == "success") {
+                            publicIP = ipResult.optString("query", "?")
+                            country = ipResult.optString("country", "")
+                            countryCode = ipResult.optString("countryCode", "")
+                            city = ipResult.optString("city", "")
+                        }
+                    } catch (e: Exception) {
+                        runOnUiThread {
+                            tvWhoAmI.text = "Failed to check IP - network error"
+                            tvWhoAmI.setTextColor(getColor(R.color.status_disconnected))
+                        }
+                        return@Thread
+                    }
+                }
+
+                if (publicIP.isEmpty()) {
                     runOnUiThread {
                         tvWhoAmI.text = "Failed to check IP"
                         tvWhoAmI.setTextColor(getColor(R.color.status_disconnected))
@@ -822,18 +880,13 @@ class MainActivity : AppCompatActivity() {
                     return@Thread
                 }
 
-                val publicIP = ipResult.optString("query", "?")
-                val country = ipResult.optString("country", "")
-                val countryCode = ipResult.optString("countryCode", "")
-                val city = ipResult.optString("city", "")
                 val location = listOf(city, country).filter { it.isNotEmpty() }.joinToString(", ")
 
                 // Check if country is Singapore
                 val isSingapore = countryCode.equals("SG", ignoreCase = true) ||
                         country.equals("Singapore", ignoreCase = true)
 
-                // Step 2: Check with server which proxy this IP belongs to
-                val serverIp = etServerIp.text.toString().trim()
+                // Step 3: Check with server which proxy this IP belongs to
                 var detectedProxy = ""
                 var isMatched = false
                 var warningMsg = ""
@@ -876,8 +929,17 @@ class MainActivity : AppCompatActivity() {
                     var warningTitle = ""
                     var warningMessage = ""
 
+                    // Check 0: Did proxy connection fail? (had to use direct fallback)
+                    if (directCheckFallback) {
+                        hasWarning = true
+                        displayBuilder.append("\n\n⚠️ PROXY NOT WORKING!")
+                        displayBuilder.append("\nShowing your real device IP (not proxied)")
+                        warningTitle = "⚠️ Proxy Connection Failed"
+                        warningMessage = "Could not connect through the proxy at $proxyHost:$proxyPort.\n\nThe IP shown ($publicIP) is your real device IP, NOT the proxy IP.\n\nPlease:\n1. Check Wi-Fi is connected\n2. Verify Wi-Fi proxy settings (Host: $proxyHost, Port: 8888)\n3. Make sure the proxy server is running\n4. Contact your Supervisor if the issue persists"
+                    }
+
                     // Check 1: Is it from Singapore?
-                    if (!isSingapore) {
+                    if (!isSingapore && !hasWarning) {
                         hasWarning = true
                         displayBuilder.append("\n\n⚠️ WARNING: NOT from Singapore!")
                         displayBuilder.append("\nCountry: $country")
@@ -886,7 +948,7 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     // Check 2: Is it a recognized proxy?
-                    if (isMatched) {
+                    if (isMatched && !directCheckFallback) {
                         displayBuilder.append("\n✓ $detectedProxy")
 
                         // Check if detected proxy matches selected proxy
@@ -896,7 +958,7 @@ class MainActivity : AppCompatActivity() {
                             warningTitle = "⚠️ Proxy Mismatch"
                             warningMessage = "Your selected proxy is $selectedProxyName but you're connected via $detectedProxy.\n\nPlease:\n1. Check your Wi-Fi proxy settings\n2. Make sure you're on the correct network\n3. Contact your Supervisor if the issue persists"
                         }
-                    } else if (warningMsg.isNotEmpty()) {
+                    } else if (warningMsg.isNotEmpty() && !directCheckFallback) {
                         hasWarning = true
                         displayBuilder.append("\n\n⚠️ $warningMsg")
                         if (warningTitle.isEmpty()) {
