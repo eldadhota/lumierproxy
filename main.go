@@ -1995,10 +1995,14 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 		existingDevice.UpstreamProxy = selectedProxy
 		existingDevice.LastSeen = time.Now()
 		server.mu.Unlock()
+
+		// Auto-confirm session on registration
+		server.confirmDeviceSession(existingDevice)
+
 		go server.saveDeviceConfig(existingDevice)
-		log.Printf("📱 App: Device '%s' updated -> %s\n", username, proxyName)
-		server.addDeviceLog("info", "config", fmt.Sprintf("[UPDATED] Device re-registered from IP %s (was %s) with %s", clientIP, oldIP, proxyName), existingDevice)
-		server.addDeviceActivity(clientIP, "device_updated", fmt.Sprintf("Re-registered with %s", proxyName), true, proxyName, "")
+		log.Printf("📱 App: Device '%s' updated -> %s (session auto-confirmed)\n", username, proxyName)
+		server.addDeviceLog("info", "config", fmt.Sprintf("[UPDATED] Device re-registered from IP %s (was %s) with %s - session confirmed", clientIP, oldIP, proxyName), existingDevice)
+		server.addDeviceActivity(clientIP, "device_updated", fmt.Sprintf("Re-registered with %s (session confirmed)", proxyName), true, proxyName, "")
 	} else {
 		// Create new device
 		device := &Device{
@@ -2014,10 +2018,14 @@ func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		server.devices[username] = device
 		server.mu.Unlock()
+
+		// Auto-confirm session on registration
+		server.confirmDeviceSession(device)
+
 		go server.saveDeviceConfig(device)
-		log.Printf("📱 App: New device '%s' registered -> %s\n", username, proxyName)
-		server.addDeviceLog("info", "config", fmt.Sprintf("[REGISTERED] New device '%s' from IP %s with %s", username, clientIP, proxyName), device)
-		server.addDeviceActivity(clientIP, "device_registered", fmt.Sprintf("New device registered with %s", proxyName), true, proxyName, "")
+		log.Printf("📱 App: New device '%s' registered -> %s (session auto-confirmed)\n", username, proxyName)
+		server.addDeviceLog("info", "config", fmt.Sprintf("[REGISTERED] New device '%s' from IP %s with %s - session confirmed", username, clientIP, proxyName), device)
+		server.addDeviceActivity(clientIP, "device_registered", fmt.Sprintf("New device registered with %s (session confirmed)", proxyName), true, proxyName, "")
 	}
 
 	json.NewEncoder(w).Encode(AppRegisterResponse{
@@ -2092,6 +2100,9 @@ func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 	device.LastSeen = time.Now()
 	server.mu.Unlock()
 
+	// Auto-confirm session on proxy change
+	server.confirmDeviceSession(device)
+
 	go server.saveDeviceConfig(device)
 
 	// Log proxy change with supervisor name if provided
@@ -2099,9 +2110,9 @@ func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
 	if req.Supervisor != "" {
 		supervisorInfo = fmt.Sprintf(" by Supervisor %s", req.Supervisor)
 	}
-	log.Printf("📱 App: Device '%s' proxy changed: %s -> %s%s (IP: %s)\n", username, oldProxyName, proxyName, supervisorInfo, clientIP)
-	server.addDeviceLog("info", "config", fmt.Sprintf("[PROXY CHANGED] %s: %s -> %s%s", username, oldProxyName, proxyName, supervisorInfo), device)
-	server.addDeviceActivity(clientIP, "proxy_changed", fmt.Sprintf("Changed from %s to %s%s", oldProxyName, proxyName, supervisorInfo), true, proxyName, "")
+	log.Printf("📱 App: Device '%s' proxy changed: %s -> %s%s (IP: %s) - session confirmed\n", username, oldProxyName, proxyName, supervisorInfo, clientIP)
+	server.addDeviceLog("info", "config", fmt.Sprintf("[PROXY CHANGED] %s: %s -> %s%s - session confirmed", username, oldProxyName, proxyName, supervisorInfo), device)
+	server.addDeviceActivity(clientIP, "proxy_changed", fmt.Sprintf("Changed from %s to %s%s (session confirmed)", oldProxyName, proxyName, supervisorInfo), true, proxyName, "")
 
 	json.NewEncoder(w).Encode(AppRegisterResponse{
 		Success:    true,
@@ -2190,6 +2201,9 @@ func handleAppAuthenticateAPI(w http.ResponseWriter, r *http.Request) {
 		device.LastSeen = time.Now()
 	}
 	server.mu.Unlock()
+
+	// Auto-confirm session on connect/authenticate
+	server.confirmDeviceSession(device)
 
 	go server.saveDeviceConfig(device)
 	session := server.createAppSession(username)
