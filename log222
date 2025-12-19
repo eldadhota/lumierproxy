@@ -1,0 +1,330 @@
+2025/12/19 09:22:38 📱 App: New device 'DBS_PARVEEN' registered -> SG24 (session auto-confirmed)
+fatal error: concurrent map writes
+
+goroutine 1811 [running]:
+internal/runtime/maps.fatal({0x7d0b48?, 0xc0000536d0?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/panic.go:1053 +0x18
+main.(*ProxyServer).savePersistentData(0xc0000bc248)
+	/home/lumier/lumierproxy/main.go:681 +0x129
+created by main.(*ProxyServer).confirmDeviceSession in goroutine 1522
+	/home/lumier/lumierproxy/main.go:1208 +0x447
+
+goroutine 1 [IO wait]:
+internal/poll.runtime_pollWait(0x73218085c6f0, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0000e2280?, 0x900000036?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0xc0000e2280)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:620 +0x295
+net.(*netFD).accept(0xc0000e2280)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_unix.go:172 +0x29
+net.(*TCPListener).accept(0xc000082640)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/tcpsock_posix.go:159 +0x1b
+net.(*TCPListener).Accept(0xc000082640)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/tcpsock.go:380 +0x30
+net/http.(*Server).Serve(0xc0000e4300, {0x86ae50, 0xc000082640})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3424 +0x30c
+net/http.(*Server).ListenAndServe(0xc0000e4300)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3350 +0x71
+net/http.ListenAndServe(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3659
+main.main()
+	/home/lumier/lumierproxy/main.go:394 +0xc77
+
+goroutine 7 [chan receive, 7 minutes]:
+main.cleanupInactiveDevices()
+	/home/lumier/lumierproxy/main.go:1506 +0x69
+created by main.main in goroutine 1
+	/home/lumier/lumierproxy/main.go:380 +0x825
+
+goroutine 8 [chan receive, 2 minutes]:
+main.autoSaveData()
+	/home/lumier/lumierproxy/main.go:690 +0x65
+created by main.main in goroutine 1
+	/home/lumier/lumierproxy/main.go:381 +0x831
+
+goroutine 9 [chan receive, 2 minutes]:
+main.collectTrafficSnapshots()
+	/home/lumier/lumierproxy/main.go:700 +0x7e
+created by main.main in goroutine 1
+	/home/lumier/lumierproxy/main.go:382 +0x83d
+
+goroutine 10 [chan receive, 7 minutes]:
+main.cleanupExpiredSessions()
+	/home/lumier/lumierproxy/main.go:561 +0x74
+created by main.main in goroutine 1
+	/home/lumier/lumierproxy/main.go:383 +0x849
+
+goroutine 11 [chan receive, 1 minutes]:
+main.proxyHealthChecker()
+	/home/lumier/lumierproxy/main.go:849 +0x7a
+created by main.main in goroutine 1
+	/home/lumier/lumierproxy/main.go:384 +0x855
+
+goroutine 12 [chan receive]:
+main.cpuMonitor()
+	/home/lumier/lumierproxy/main.go:876 +0x58
+created by main.main in goroutine 1
+	/home/lumier/lumierproxy/main.go:385 +0x865
+
+goroutine 13 [IO wait]:
+internal/poll.runtime_pollWait(0x73218085c5d8, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc000134080?, 0x41a1a6?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0xc000134080)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:620 +0x295
+net.(*netFD).accept(0xc000134080)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_unix.go:172 +0x29
+net.(*TCPListener).accept(0xc00011c0c0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/tcpsock_posix.go:159 +0x1b
+net.(*TCPListener).Accept(0xc00011c0c0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/tcpsock.go:380 +0x30
+net/http.(*Server).Serve(0xc00013a100, {0x86ae50, 0xc00011c0c0})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3424 +0x30c
+net/http.(*Server).ListenAndServe(0xc00013a100)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3350 +0x71
+net/http.ListenAndServe(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3659
+main.startDashboard()
+	/home/lumier/lumierproxy/main.go:1578 +0x1225
+created by main.main in goroutine 1
+	/home/lumier/lumierproxy/main.go:386 +0x871
+
+goroutine 26 [IO wait]:
+internal/poll.runtime_pollWait(0x73218085bf48, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc000134500?, 0xc00036a000?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc000134500, {0xc00036a000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x27a
+net.(*netFD).Read(0xc000134500, {0xc00036a000?, 0xc0002c7ad0?, 0x4c1605?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_posix.go:55 +0x25
+net.(*conn).Read(0xc00012c1f8, {0xc00036a000?, 0x0?, 0x0?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/net.go:194 +0x45
+net/http.(*connReader).Read(0xc000304ea0, {0xc00036a000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:798 +0x159
+bufio.(*Reader).fill(0xc0003202a0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:113 +0x103
+bufio.(*Reader).Peek(0xc0003202a0, 0x4)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:152 +0x53
+net/http.(*conn).serve(0xc000146630, {0x86b370, 0xc000116a50})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:2137 +0x785
+created by net/http.(*Server).Serve in goroutine 13
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3454 +0x485
+
+goroutine 1767 [IO wait]:
+internal/poll.runtime_pollWait(0x73218085bd18, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0002bc100?, 0xc000396000?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc0002bc100, {0xc000396000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x27a
+net.(*netFD).Read(0xc0002bc100, {0xc000396000?, 0xc0000d5ad0?, 0x4c1605?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_posix.go:55 +0x25
+net.(*conn).Read(0xc00005a158, {0xc000396000?, 0x0?, 0x0?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/net.go:194 +0x45
+net/http.(*connReader).Read(0xc00026e540, {0xc000396000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:798 +0x159
+bufio.(*Reader).fill(0xc0000345a0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:113 +0x103
+bufio.(*Reader).Peek(0xc0000345a0, 0x4)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:152 +0x53
+net/http.(*conn).serve(0xc0001463f0, {0x86b370, 0xc000116a50})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:2137 +0x785
+created by net/http.(*Server).Serve in goroutine 13
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3454 +0x485
+
+goroutine 1765 [IO wait]:
+internal/poll.runtime_pollWait(0x73218085c178, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0002bc000?, 0xc00014a000?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc0002bc000, {0xc00014a000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x27a
+net.(*netFD).Read(0xc0002bc000, {0xc00014a000?, 0xc00019fad0?, 0x4c1605?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_posix.go:55 +0x25
+net.(*conn).Read(0xc00005a148, {0xc00014a000?, 0x0?, 0x0?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/net.go:194 +0x45
+net/http.(*connReader).Read(0xc00026e5a0, {0xc00014a000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:798 +0x159
+bufio.(*Reader).fill(0xc000111800)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:113 +0x103
+bufio.(*Reader).Peek(0xc000111800, 0x4)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:152 +0x53
+net/http.(*conn).serve(0xc000146240, {0x86b370, 0xc000116a50})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:2137 +0x785
+created by net/http.(*Server).Serve in goroutine 13
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3454 +0x485
+
+goroutine 1327 [IO wait, 1 minutes]:
+internal/poll.runtime_pollWait(0x73218085c3a8, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc000302a00?, 0xc000156000?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc000302a00, {0xc000156000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x27a
+net.(*netFD).Read(0xc000302a00, {0xc000156000?, 0xc0002cbad0?, 0x4c1605?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_posix.go:55 +0x25
+net.(*conn).Read(0xc000306110, {0xc000156000?, 0x0?, 0x0?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/net.go:194 +0x45
+net/http.(*connReader).Read(0xc000692bd0, {0xc000156000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:798 +0x159
+bufio.(*Reader).fill(0xc000111860)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:113 +0x103
+bufio.(*Reader).Peek(0xc000111860, 0x4)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:152 +0x53
+net/http.(*conn).serve(0xc000140d80, {0x86b370, 0xc000116a50})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:2137 +0x785
+created by net/http.(*Server).Serve in goroutine 13
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3454 +0x485
+
+goroutine 1681 [IO wait]:
+internal/poll.runtime_pollWait(0x73218085bc00, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0000e2000?, 0xc000455000?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc0000e2000, {0xc000455000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x27a
+net.(*netFD).Read(0xc0000e2000, {0xc000455000?, 0xc0002cdad0?, 0x4c1605?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_posix.go:55 +0x25
+net.(*conn).Read(0xc00021c000, {0xc000455000?, 0x0?, 0x0?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/net.go:194 +0x45
+net/http.(*connReader).Read(0xc0000f62a0, {0xc000455000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:798 +0x159
+bufio.(*Reader).fill(0xc000034480)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:113 +0x103
+bufio.(*Reader).Peek(0xc000034480, 0x4)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:152 +0x53
+net/http.(*conn).serve(0xc0001b8000, {0x86b370, 0xc000116a50})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:2137 +0x785
+created by net/http.(*Server).Serve in goroutine 13
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3454 +0x485
+
+goroutine 1813 [runnable]:
+encoding/json.mapEncoder.encode({0xc00009b380?}, 0xc0005b40c0?, {0x771740?, 0xc0000970e0?, 0x95?}, {0x0?, 0x1?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/encoding/json/encode.go:745 +0x8bc
+encoding/json.structEncoder.encode({{{0xc0000f4008, 0x9, 0x11}, 0xc0000f6090, 0xc0000f60c0}}, 0xc0005b40c0, {0x7b1180?, 0xc0000970e0?, 0x4167d3?}, {0x0, ...})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/encoding/json/encode.go:727 +0x30a
+encoding/json.(*encodeState).reflectValue(0xc0005b40c0, {0x7b1180?, 0xc0000970e0?, 0x46fc05?}, {0x0?, 0xc9?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/encoding/json/encode.go:333 +0x73
+encoding/json.(*encodeState).marshal(0x426145?, {0x7b1180?, 0xc0000970e0?}, {0x20?, 0x26?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/encoding/json/encode.go:309 +0xb2
+encoding/json.Marshal({0x7b1180, 0xc0000970e0})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/encoding/json/encode.go:175 +0xbe
+encoding/json.MarshalIndent({0x7b1180?, 0xc0000970e0?}, {0x0, 0x0}, {0x7c9baf, 0x2})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/encoding/json/encode.go:188 +0x47
+main.(*ProxyServer).savePersistentData(0xc0000bc248)
+	/home/lumier/lumierproxy/main.go:684 +0x1b2
+created by main.(*ProxyServer).saveDeviceConfig in goroutine 1812
+	/home/lumier/lumierproxy/main.go:1257 +0x58a
+
+goroutine 1397 [IO wait, 2 minutes]:
+internal/poll.runtime_pollWait(0x73218085c290, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0002bc500?, 0xc0001a6000?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc0002bc500, {0xc0001a6000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x27a
+net.(*netFD).Read(0xc0002bc500, {0xc0001a6000?, 0xc000179ad0?, 0x4c1605?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_posix.go:55 +0x25
+net.(*conn).Read(0xc00012c1e0, {0xc0001a6000?, 0x0?, 0x0?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/net.go:194 +0x45
+net/http.(*connReader).Read(0xc000422cc0, {0xc0001a6000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:798 +0x159
+bufio.(*Reader).fill(0xc000294420)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:113 +0x103
+bufio.(*Reader).Peek(0xc000294420, 0x4)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:152 +0x53
+net/http.(*conn).serve(0xc000146870, {0x86b370, 0xc0000f6570})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:2137 +0x785
+created by net/http.(*Server).Serve in goroutine 1
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3454 +0x485
+
+goroutine 1522 [IO wait]:
+internal/poll.runtime_pollWait(0x73218085b8b8, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc000302200?, 0xc000429000?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc000302200, {0xc000429000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x27a
+net.(*netFD).Read(0xc000302200, {0xc000429000?, 0xc00034dad0?, 0x4c1605?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_posix.go:55 +0x25
+net.(*conn).Read(0xc000306018, {0xc000429000?, 0x0?, 0x0?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/net.go:194 +0x45
+net/http.(*connReader).Read(0xc00026ef30, {0xc000429000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:798 +0x159
+bufio.(*Reader).fill(0xc00020c300)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:113 +0x103
+bufio.(*Reader).Peek(0xc00020c300, 0x4)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:152 +0x53
+net/http.(*conn).serve(0xc0000cce10, {0x86b370, 0xc0000f6570})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:2137 +0x785
+created by net/http.(*Server).Serve in goroutine 1
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3454 +0x485
+
+goroutine 1426 [IO wait]:
+internal/poll.runtime_pollWait(0x73218085b9d0, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0002bc200?, 0xc0003fc000?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc0002bc200, {0xc0003fc000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x27a
+net.(*netFD).Read(0xc0002bc200, {0xc0003fc000?, 0xc0001a1ad0?, 0x4c1605?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_posix.go:55 +0x25
+net.(*conn).Read(0xc00012c028, {0xc0003fc000?, 0x0?, 0x0?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/net.go:194 +0x45
+net/http.(*connReader).Read(0xc00026e4b0, {0xc0003fc000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:798 +0x159
+bufio.(*Reader).fill(0xc00020c420)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:113 +0x103
+bufio.(*Reader).Peek(0xc00020c420, 0x4)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:152 +0x53
+net/http.(*conn).serve(0xc000146360, {0x86b370, 0xc0000f6570})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:2137 +0x785
+created by net/http.(*Server).Serve in goroutine 1
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3454 +0x485
+
+goroutine 1766 [IO wait]:
+internal/poll.runtime_pollWait(0x73218085c4c0, 0x72)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0002bc080?, 0xc0001da000?, 0x0)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc0002bc080, {0xc0001da000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x27a
+net.(*netFD).Read(0xc0002bc080, {0xc0001da000?, 0xc0001a3ad0?, 0x4c1605?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/fd_posix.go:55 +0x25
+net.(*conn).Read(0xc00005a150, {0xc0001da000?, 0x0?, 0x0?})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/net.go:194 +0x45
+net/http.(*connReader).Read(0xc00038c540, {0xc0001da000, 0x1000, 0x1000})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:798 +0x159
+bufio.(*Reader).fill(0xc000294240)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:113 +0x103
+bufio.(*Reader).Peek(0xc000294240, 0x4)
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/bufio/bufio.go:152 +0x53
+net/http.(*conn).serve(0xc0001462d0, {0x86b370, 0xc000116a50})
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:2137 +0x785
+created by net/http.(*Server).Serve in goroutine 13
+	/home/lumier/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.0.linux-amd64/src/net/http/server.go:3454 +0x485
