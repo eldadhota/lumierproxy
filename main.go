@@ -52,6 +52,13 @@ type Device struct {
 	Confirmed     bool      `json:"confirmed"`
 	ConfirmedAt   time.Time `json:"confirmed_at"`
 	SessionStart  time.Time `json:"session_start"`
+	// IP Trust Score fields
+	TrustScore       int       `json:"trust_score"`        // 0-100 (100 = most trusted)
+	TrustRisk        string    `json:"trust_risk"`         // low, medium, high, very_high
+	TrustCheckedAt   time.Time `json:"trust_checked_at"`   // When score was last checked
+	IsVPN            bool      `json:"is_vpn"`             // Whether IP is a VPN/Proxy
+	IsDatacenter     bool      `json:"is_datacenter"`      // Whether IP is from datacenter
+	CountryCode      string    `json:"country_code"`       // 2-letter country code
 }
 
 type ProxyHealth struct {
@@ -237,6 +244,25 @@ type ProxyServer struct {
 	cpuMu            sync.RWMutex
 	deviceActivity   map[string][]DeviceActivity // keyed by device IP
 	deviceActivityMu sync.RWMutex
+	trustScoreCache  map[string]*TrustScoreResult // IP -> trust score (cached)
+	trustCacheMu     sync.RWMutex
+}
+
+// TrustScoreResult holds the result of an IP trust score lookup
+type TrustScoreResult struct {
+	IP           string    `json:"ip"`
+	Score        int       `json:"score"`          // 0-100 (higher = more trusted, inverted from fraud score)
+	Risk         string    `json:"risk"`           // low, medium, high, very_high
+	IsVPN        bool      `json:"is_vpn"`
+	IsProxy      bool      `json:"is_proxy"`
+	IsDatacenter bool      `json:"is_datacenter"`
+	IsTor        bool      `json:"is_tor"`
+	CountryCode  string    `json:"country_code"`
+	CountryName  string    `json:"country_name"`
+	City         string    `json:"city"`
+	ISP          string    `json:"isp"`
+	CheckedAt    time.Time `json:"checked_at"`
+	Source       string    `json:"source"` // "scamalytics" or "cache"
 }
 
 type LogEntry struct {
@@ -370,6 +396,7 @@ func main() {
 		startTime:       time.Now(),
 		logBuffer:       make([]LogEntry, 0, 1000),
 		deviceActivity:  make(map[string][]DeviceActivity),
+		trustScoreCache: make(map[string]*TrustScoreResult),
 		persistentData: PersistentData{
 			DeviceConfigs:   make(map[string]DeviceConfig),
 			Groups:          []string{"Default", "Floor 1", "Floor 2", "Team A", "Team B"},
@@ -1599,6 +1626,7 @@ func startDashboard() {
 	http.HandleFunc("/api/update-proxy-name", server.requireAuth(handleUpdateProxyNameAPI))
 	http.HandleFunc("/api/reorder-proxies", server.requireAuth(handleReorderProxiesAPI))
 	http.HandleFunc("/api/session-settings", server.requireAuth(handleSessionSettingsAPI))
+	http.HandleFunc("/api/trust-score", server.requireAuth(handleTrustScoreAPI))
 
 	log.Printf("📊 Dashboard on port %d\n", server.dashPort)
 	addr := fmt.Sprintf("%s:%d", server.bindAddr, server.dashPort)
@@ -2784,6 +2812,194 @@ func handleAppDeviceSettings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ============================================================================
+// IP TRUST SCORE FUNCTIONS
+// ============================================================================
+
+// lookupTrustScore fetches the trust score for an IP address from Scamalytics
+// The score is cached for 24 hours to avoid excessive API calls
+func (s *ProxyServer) lookupTrustScore(ip string) *TrustScoreResult {
+	// Check cache first
+	s.trustCacheMu.RLock()
+	cached, exists := s.trustScoreCache[ip]
+	s.trustCacheMu.RUnlock()
+
+	if exists && time.Since(cached.CheckedAt) < 24*time.Hour {
+		cached.Source = "cache"
+		return cached
+	}
+
+	// Fetch from Scamalytics (scraping their free public page)
+	result := s.fetchScamalyticsScore(ip)
+	if result != nil {
+		s.trustCacheMu.Lock()
+		s.trustScoreCache[ip] = result
+		s.trustCacheMu.Unlock()
+	}
+
+	return result
+}
+
+// fetchScamalyticsScore fetches the fraud score from Scamalytics public page
+func (s *ProxyServer) fetchScamalyticsScore(ip string) *TrustScoreResult {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	url := fmt.Sprintf("https://scamalytics.com/ip/%s", ip)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return s.createDefaultTrustScore(ip, "lookup_error")
+	}
+
+	// Set headers to mimic browser
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return s.createDefaultTrustScore(ip, "network_error")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return s.createDefaultTrustScore(ip, "http_error")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return s.createDefaultTrustScore(ip, "read_error")
+	}
+
+	html := string(body)
+	return s.parseScamalyticsResponse(ip, html)
+}
+
+// parseScamalyticsResponse parses the HTML response from Scamalytics
+func (s *ProxyServer) parseScamalyticsResponse(ip, html string) *TrustScoreResult {
+	result := &TrustScoreResult{
+		IP:        ip,
+		Score:     100, // Default to trusted
+		Risk:      "low",
+		CheckedAt: time.Now(),
+		Source:    "scamalytics",
+	}
+
+	// Extract fraud score (0-100, where 0 is safe and 100 is fraud)
+	// Look for pattern like: "Fraud Score: 0"
+	scoreRe := regexp.MustCompile(`(?i)fraud\s*score[:\s]*(\d+)`)
+	if matches := scoreRe.FindStringSubmatch(html); len(matches) >= 2 {
+		if score, err := strconv.Atoi(matches[1]); err == nil {
+			// Invert: Scamalytics fraud score (0=safe, 100=fraud) -> Trust score (100=trusted, 0=risky)
+			result.Score = 100 - score
+			result.Risk = s.calculateRiskLevel(result.Score)
+		}
+	}
+
+	// Check for VPN/Proxy detection
+	result.IsVPN = strings.Contains(strings.ToLower(html), "vpn: yes") ||
+		strings.Contains(strings.ToLower(html), "\"vpn\":\"yes\"")
+	result.IsProxy = strings.Contains(strings.ToLower(html), "proxy: yes") ||
+		strings.Contains(strings.ToLower(html), "\"proxy\":\"yes\"") ||
+		strings.Contains(strings.ToLower(html), "server: yes")
+	result.IsTor = strings.Contains(strings.ToLower(html), "tor: yes") ||
+		strings.Contains(strings.ToLower(html), "\"tor\":\"yes\"")
+	result.IsDatacenter = strings.Contains(strings.ToLower(html), "data center") ||
+		strings.Contains(strings.ToLower(html), "datacenter")
+
+	// Extract country
+	countryRe := regexp.MustCompile(`(?i)country[:\s]*([A-Z]{2})`)
+	if matches := countryRe.FindStringSubmatch(html); len(matches) >= 2 {
+		result.CountryCode = matches[1]
+	}
+
+	// Extract ISP
+	ispRe := regexp.MustCompile(`(?i)isp[:\s]*([^<\n]+)`)
+	if matches := ispRe.FindStringSubmatch(html); len(matches) >= 2 {
+		result.ISP = strings.TrimSpace(matches[1])
+	}
+
+	// Extract city
+	cityRe := regexp.MustCompile(`(?i)city[:\s]*([^<\n,]+)`)
+	if matches := cityRe.FindStringSubmatch(html); len(matches) >= 2 {
+		result.City = strings.TrimSpace(matches[1])
+	}
+
+	return result
+}
+
+// createDefaultTrustScore creates a default trust score when lookup fails
+func (s *ProxyServer) createDefaultTrustScore(ip, reason string) *TrustScoreResult {
+	return &TrustScoreResult{
+		IP:        ip,
+		Score:     -1, // -1 indicates unknown/error
+		Risk:      "unknown",
+		CheckedAt: time.Now(),
+		Source:    reason,
+	}
+}
+
+// calculateRiskLevel determines risk level based on trust score
+func (s *ProxyServer) calculateRiskLevel(score int) string {
+	if score >= 80 {
+		return "low"
+	} else if score >= 50 {
+		return "medium"
+	} else if score >= 20 {
+		return "high"
+	}
+	return "very_high"
+}
+
+// handleTrustScoreAPI returns the trust score for a device's IP
+func handleTrustScoreAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	ip := r.URL.Query().Get("ip")
+	if ip == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "IP address required",
+		})
+		return
+	}
+
+	result := server.lookupTrustScore(ip)
+	if result == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "Failed to lookup trust score",
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"data":    result,
+	})
+}
+
+// updateDeviceTrustScore updates a device's trust score
+func (s *ProxyServer) updateDeviceTrustScore(device *Device) {
+	if device == nil || device.IP == "" {
+		return
+	}
+
+	result := s.lookupTrustScore(device.IP)
+	if result == nil || result.Score < 0 {
+		return
+	}
+
+	s.mu.Lock()
+	device.TrustScore = result.Score
+	device.TrustRisk = result.Risk
+	device.TrustCheckedAt = result.CheckedAt
+	device.IsVPN = result.IsVPN || result.IsProxy || result.IsTor
+	device.IsDatacenter = result.IsDatacenter
+	device.CountryCode = result.CountryCode
+	s.mu.Unlock()
+}
+
 // handleBulkImportProxiesAPI imports multiple proxies at once
 func handleBulkImportProxiesAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -3833,7 +4049,93 @@ const baseStyles = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:
 const baseJS = `async function logout(){await fetch('/api/logout',{method:'POST'});window.location.href='/';}function showToast(msg,type=''){const t=document.createElement('div');t.className='toast '+type;t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),3000);}function formatBytes(b){if(!b)return"0 B";const k=1024,s=["B","KB","MB","GB","TB"];const i=Math.floor(Math.log(b)/Math.log(k));return(b/Math.pow(k,i)).toFixed(1)+" "+s[i];}function formatNumber(n){if(!n)return"0";if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"K";return n.toString();}fetch('/api/session-check').then(r=>r.json()).then(d=>{if(!d.valid)window.location.href='/';else if(document.getElementById('currentUser'))document.getElementById('currentUser').textContent=d.username;});`
 
 const dashboardPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Devices</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.toolbar{background:white;padding:15px 20px;border-radius:12px;margin-bottom:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);display:flex;flex-wrap:wrap;gap:15px;align-items:center}.search-box{flex:1;min-width:200px;position:relative}.search-box input{width:100%;padding:10px 15px 10px 40px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.search-box input:focus{outline:none;border-color:#667eea}.search-box::before{content:"🔍";position:absolute;left:12px;top:50%;transform:translateY(-50%)}.filter-group{display:flex;gap:10px;align-items:center}.filter-group label{font-weight:600;color:#555;font-size:0.9em}.filter-group select{padding:8px 12px;border:2px solid #e0e0e0;border-radius:8px}.device-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px}.device-card{background:white;border:2px solid #e8e8e8;border-radius:12px;padding:18px;transition:all 0.2s;position:relative}.device-card:hover{border-color:#667eea;box-shadow:0 5px 20px rgba(102,126,234,0.15)}.device-card.selected{border-color:#667eea;background:#f8f9ff}.device-checkbox{position:absolute;top:15px;right:15px;width:20px;height:20px;cursor:pointer}.device-name{font-size:1.15em;font-weight:bold;color:#333;margin-bottom:5px;padding-right:30px;cursor:pointer}.device-name:hover{color:#667eea}.device-group{display:inline-block;background:#e8f5e9;color:#2e7d32;padding:3px 10px;border-radius:12px;font-size:0.8em;font-weight:600;margin-bottom:10px}.device-info{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:0.9em}.info-row{display:flex;justify-content:space-between;padding:3px 0}.info-label{color:#888}.status-badge{padding:3px 10px;border-radius:12px;font-size:0.85em;font-weight:600}.status-active{background:#e8f5e9;color:#2e7d32}.status-inactive{background:#ffebee;color:#c62828}.proxy-selector{margin-top:12px;padding-top:12px;border-top:1px solid #eee;grid-column:1/-1}.proxy-selector label{display:block;font-size:0.85em;color:#666;margin-bottom:6px}.proxy-selector select{width:100%;padding:8px;border:2px solid #e0e0e0;border-radius:6px;margin-bottom:8px}.current-proxy{font-size:0.85em;color:#667eea;font-weight:600}.change-btn{width:100%;padding:8px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:6px;cursor:pointer;font-weight:600}.change-btn:hover{opacity:0.9}.pagination{display:flex;justify-content:center;align-items:center;gap:10px;margin-top:20px}.pagination button{padding:8px 16px;border:2px solid #e0e0e0;background:white;border-radius:6px;cursor:pointer;font-weight:600}.pagination button:hover:not(:disabled){border-color:#667eea;color:#667eea}.pagination button:disabled{opacity:0.5;cursor:not-allowed}.bulk-actions{display:flex;gap:10px;align-items:center}.selected-count{background:#667eea;color:white;padding:5px 12px;border-radius:20px;font-size:0.85em;font-weight:600}.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000}.modal{background:white;border-radius:15px;padding:25px;width:90%;max-width:450px}.modal h3{margin-bottom:20px;color:#333}.modal-field{margin-bottom:15px}.modal-field label{display:block;font-weight:600;color:#555;margin-bottom:5px}.modal-field input,.modal-field select,.modal-field textarea{width:100%;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.modal-field textarea{resize:vertical;min-height:80px}.modal-buttons{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}.setup-box{background:#e3f2fd;padding:12px 20px;border-radius:10px;margin-bottom:20px;border-left:4px solid #2196F3}.setup-box code{background:#fff;padding:2px 6px;border-radius:4px;font-family:monospace;color:#d32f2f;font-weight:bold}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📱 Device Management</h1><p>Monitor and manage all connected devices</p></div><div class="setup-box">📱 Phone Setup: Wi-Fi → Proxy Manual → Host: <code id="serverIP">...</code> Port: <code>8888</code> Username: <code>your-device-name</code> (password can be anything)</div><div class="stats-grid"><div class="stat-card" onclick="filterByStatus('all')"><div class="stat-value" id="totalDevices">-</div><div class="stat-label">Total</div></div><div class="stat-card" onclick="filterByStatus('active')"><div class="stat-value" id="activeDevices">-</div><div class="stat-label">Active</div></div><div class="stat-card" onclick="filterByStatus('inactive')"><div class="stat-value" id="inactiveDevices">-</div><div class="stat-label">Inactive</div></div><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Proxies</div></div><div class="stat-card"><div class="stat-value" id="totalRequests">-</div><div class="stat-label">Requests</div></div></div><div class="toolbar"><div class="search-box"><input type="text" id="searchInput" placeholder="Search devices..." oninput="applyFilters()"></div><div class="filter-group"><label>Group:</label><select id="groupFilter" onchange="applyFilters()"><option value="">All</option></select></div><div class="filter-group"><label>Sort:</label><select id="sortBy" onchange="applyFilters()"><option value="name">Name</option><option value="ip">IP</option><option value="lastSeen" selected>Last Seen</option><option value="requests">Requests</option></select></div><div class="filter-group"><label><input type="checkbox" id="showOffline" onchange="loadData()" style="margin-right:5px">Show Offline</label></div><button class="btn btn-secondary" onclick="loadData()">🔄 Refresh</button><button class="btn btn-secondary" onclick="location.href='/api/export'">📤 Export</button><div class="bulk-actions" id="bulkActions" style="display:none"><span class="selected-count"><span id="selectedCount">0</span> selected</span><select id="bulkProxySelect"></select><button class="btn btn-primary" onclick="bulkChangeProxy()">Change</button><button class="btn btn-secondary" onclick="clearSelection()">Clear</button></div></div><div class="card"><h2>Connected Devices</h2><div id="devicesList" class="device-grid"><div class="loading">Loading...</div></div><div class="pagination" id="pagination"></div></div></div><div class="modal-overlay" id="editModal" style="display:none"><div class="modal"><h3>✏️ Edit Device</h3><div class="modal-field"><label>Username (Device ID)</label><input type="text" id="editUsername" placeholder="e.g., phone1, samsung-s23"></div><div class="modal-field"><label>Custom Name</label><input type="text" id="editName" placeholder="e.g., Samsung S23"></div><div class="modal-field"><label>Group</label><select id="editGroup"></select></div><div class="modal-field"><label>Notes</label><textarea id="editNotes" placeholder="Optional notes..."></textarea></div><input type="hidden" id="editDeviceIP"><div class="modal-buttons"><button class="btn btn-secondary" onclick="closeEditModal()">Cancel</button><button class="btn btn-primary" onclick="saveDeviceEdit()">Save</button></div></div></div><script>` + baseJS + `document.getElementById('nav-dashboard').classList.add('active');fetch("/api/server-ip").then(r=>r.text()).then(ip=>document.getElementById("serverIP").textContent=ip);let allDevices=[],allProxies=[],allGroups=[],filteredDevices=[],selectedDevices=new Set(),currentPage=1,statusFilter='all';const PER_PAGE=20;function getDisplayName(d){return d.custom_name||d.name||'Unknown';}function isActive(d){return(Date.now()-new Date(d.last_seen))/60000<5;}function proxyLabel(p,i){let ip=p.user&&p.user.includes('ip-')?p.user.split('ip-')[1]:'unknown';return'#'+(i+1)+' – '+ip;}function filterByStatus(s){statusFilter=s;applyFilters();}function applyFilters(){const search=document.getElementById('searchInput').value.toLowerCase();const group=document.getElementById('groupFilter').value;const sort=document.getElementById('sortBy').value;filteredDevices=allDevices.filter(d=>{if(statusFilter==='active'&&!isActive(d))return false;if(statusFilter==='inactive'&&isActive(d))return false;if(group&&d.group!==group)return false;if(search&&!getDisplayName(d).toLowerCase().includes(search)&&!d.ip.includes(search)&&!(d.username&&d.username.toLowerCase().includes(search)))return false;return true;});filteredDevices.sort((a,b)=>{if(sort==='name')return getDisplayName(a).localeCompare(getDisplayName(b));if(sort==='ip')return a.ip.localeCompare(b.ip);if(sort==='lastSeen')return new Date(b.last_seen)-new Date(a.last_seen);if(sort==='requests')return(b.request_count||0)-(a.request_count||0);return 0;});currentPage=1;renderDevices();}function renderDevices(){const c=document.getElementById('devicesList');if(!filteredDevices.length){c.innerHTML='<div class="loading">No devices found</div>';document.getElementById('pagination').innerHTML='';return;}const pages=Math.ceil(filteredDevices.length/PER_PAGE);const start=(currentPage-1)*PER_PAGE;const pageDevices=filteredDevices.slice(start,start+PER_PAGE);c.innerHTML=pageDevices.map(d=>{const mins=Math.floor((Date.now()-new Date(d.last_seen))/60000);const active=mins<5;const sel=selectedDevices.has(d.ip);const pIdx=allProxies.findIndex(p=>p.full===d.upstream_proxy);const opts=allProxies.map((p,i)=>'<option value="'+i+'" '+(i===pIdx?'selected':'')+'>'+proxyLabel(p,i)+'</option>').join('');const pLabel=pIdx>=0?proxyLabel(allProxies[pIdx],pIdx):'N/A';return'<div class="device-card '+(sel?'selected':'')+'"><input type="checkbox" class="device-checkbox" '+(sel?'checked':'')+' onchange="toggleSel(\''+d.ip+'\',this.checked)"><div class="device-name" onclick="openEditModal(\''+d.ip+'\')">'+escapeHtml(getDisplayName(d))+' ✏️</div><div class="device-group">'+escapeHtml(d.group||'Default')+'</div><div class="device-info"><div class="info-row"><span class="info-label">Status:</span><span class="status-badge '+(active?'status-active':'status-inactive')+'">'+(active?'● Active':'○ Inactive')+'</span></div><div class="info-row"><span class="info-label">IP:</span><span><strong>'+d.ip+'</strong></span></div><div class="info-row"><span class="info-label">User:</span><span style="font-weight:600;color:#667eea">'+(d.username||'<em>anonymous</em>')+'</span></div><div class="info-row"><span class="info-label">Requests:</span><span>'+formatNumber(d.request_count)+'</span></div><div class="info-row"><span class="info-label">Errors:</span><span style="color:'+(d.error_count>0?'#c62828':'#666')+'">'+(d.error_count||0)+'</span></div><div class="info-row"><span class="info-label">Data:</span><span>↓'+formatBytes(d.bytes_in)+'</span></div><div class="info-row"><span class="info-label">Last seen:</span><span>'+(mins<1?'Now':mins+' min')+'</span></div><div class="proxy-selector"><label>Proxy: <span class="current-proxy">'+pLabel+'</span></label><select id="proxy-'+d.ip+'">'+opts+'</select><button class="change-btn" onclick="changeProxy(\''+d.ip+'\')">Change Proxy</button><button class="change-btn" style="background:#ef5350;margin-top:8px" onclick="deleteDevice(\''+d.ip+'\',\''+escapeHtml(d.username||'')+'\')">Delete Device</button></div></div></div>';}).join('');const pag=document.getElementById('pagination');pag.innerHTML=pages>1?'<button onclick="goPage('+(currentPage-1)+')" '+(currentPage===1?'disabled':'')+'>← Prev</button><span>Page '+currentPage+' of '+pages+'</span><button onclick="goPage('+(currentPage+1)+')" '+(currentPage===pages?'disabled':'')+'>Next →</button>':'<span>'+filteredDevices.length+' devices</span>';updateBulk();}function goPage(p){const pages=Math.ceil(filteredDevices.length/PER_PAGE);if(p>=1&&p<=pages){currentPage=p;renderDevices();}}function escapeHtml(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML;}function toggleSel(ip,checked){checked?selectedDevices.add(ip):selectedDevices.delete(ip);updateBulk();renderDevices();}function clearSelection(){selectedDevices.clear();updateBulk();renderDevices();}function updateBulk(){const b=document.getElementById('bulkActions');b.style.display=selectedDevices.size>0?'flex':'none';document.getElementById('selectedCount').textContent=selectedDevices.size;}function changeProxy(ip){const idx=parseInt(document.getElementById('proxy-'+ip).value);fetch('/api/change-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,proxy_index:idx})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Proxy changed','success');loadData();}});}function bulkChangeProxy(){const idx=parseInt(document.getElementById('bulkProxySelect').value);fetch('/api/bulk-change-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ips:Array.from(selectedDevices),proxy_index:idx})}).then(r=>r.json()).then(d=>{if(d.ok){showToast(d.updated+' devices updated','success');selectedDevices.clear();loadData();}});}function openEditModal(ip){const d=allDevices.find(x=>x.ip===ip);if(!d)return;document.getElementById('editDeviceIP').value=ip;document.getElementById('editUsername').value=d.username||'';document.getElementById('editName').value=d.custom_name||'';document.getElementById('editNotes').value=d.notes||'';document.getElementById('editGroup').innerHTML=allGroups.map(g=>'<option value="'+g+'" '+(g===d.group?'selected':'')+'>'+g+'</option>').join('');document.getElementById('editModal').style.display='flex';}function closeEditModal(){document.getElementById('editModal').style.display='none';}function saveDeviceEdit(){const ip=document.getElementById('editDeviceIP').value;fetch('/api/update-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,username:document.getElementById('editUsername').value,custom_name:document.getElementById('editName').value,group:document.getElementById('editGroup').value,notes:document.getElementById('editNotes').value})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Device updated','success');closeEditModal();loadData();}});}function loadGroups(){return fetch('/api/groups').then(r=>r.json()).then(g=>{allGroups=g;document.getElementById('groupFilter').innerHTML='<option value="">All</option>'+g.map(x=>'<option value="'+x+'">'+x+'</option>').join('');});}function loadData(){const showOffline=document.getElementById('showOffline').checked;Promise.all([fetch('/api/stats').then(r=>r.json()),fetch('/api/devices'+(showOffline?'?include_offline=true':'')).then(r=>r.json()),fetch('/api/proxies').then(r=>r.json()),loadGroups()]).then(([stats,devices,proxies])=>{document.getElementById('totalDevices').textContent=stats.total_devices||0;document.getElementById('activeDevices').textContent=stats.active_devices||0;document.getElementById('inactiveDevices').textContent=(stats.total_devices-stats.active_devices)||0;document.getElementById('totalProxies').textContent=stats.total_proxies||0;document.getElementById('totalRequests').textContent=formatNumber(stats.total_requests||0);allDevices=devices||[];allProxies=proxies||[];document.getElementById('bulkProxySelect').innerHTML=allProxies.map((p,i)=>'<option value="'+i+'">'+proxyLabel(p,i)+'</option>').join('');applyFilters();});}function deleteDevice(ip,username){const name=username||ip;if(!confirm('Delete device "'+name+'" ('+ip+')? This will remove all saved settings for this device.')){return;}fetch('/api/delete-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,username:username})}).then(r=>{if(r.ok)return r.json();throw new Error('Failed');}).then(d=>{if(d.ok){showToast('Device deleted','success');loadData();}}).catch(()=>showToast('Failed to delete device','error'));}loadData();setInterval(loadData,15000);</script></body></html>`
+<style>` + baseStyles + `
+.toolbar{background:white;padding:15px 20px;border-radius:16px;margin-bottom:20px;box-shadow:0 4px 20px rgba(0,0,0,0.08);display:flex;flex-wrap:wrap;gap:15px;align-items:center;backdrop-filter:blur(10px)}
+.search-box{flex:1;min-width:200px;position:relative}
+.search-box input{width:100%;padding:12px 15px 12px 45px;border:2px solid #e8e8e8;border-radius:12px;font-size:1em;background:#f8f9fa;transition:all 0.3s}
+.search-box input:focus{outline:none;border-color:#667eea;background:white;box-shadow:0 0 0 4px rgba(102,126,234,0.1)}
+.search-box::before{content:"🔍";position:absolute;left:15px;top:50%;transform:translateY(-50%);font-size:1.1em}
+.filter-group{display:flex;gap:10px;align-items:center}
+.filter-group label{font-weight:600;color:#555;font-size:0.9em}
+.filter-group select{padding:10px 14px;border:2px solid #e8e8e8;border-radius:10px;background:#f8f9fa;cursor:pointer;transition:all 0.2s}
+.filter-group select:hover{border-color:#667eea}
+.device-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:24px}
+.device-card{background:linear-gradient(145deg,#ffffff 0%,#f8f9ff 100%);border:1px solid rgba(102,126,234,0.1);border-radius:20px;padding:0;transition:all 0.3s cubic-bezier(0.4,0,0.2,1);position:relative;overflow:hidden;box-shadow:0 4px 15px rgba(0,0,0,0.05)}
+.device-card:hover{transform:translateY(-4px);box-shadow:0 12px 40px rgba(102,126,234,0.15);border-color:rgba(102,126,234,0.3)}
+.device-card.selected{border-color:#667eea;background:linear-gradient(145deg,#f8f9ff 0%,#eef1ff 100%)}
+.device-header{padding:20px 20px 15px;border-bottom:1px solid rgba(0,0,0,0.05);display:flex;align-items:flex-start;gap:12px}
+.device-avatar{width:48px;height:48px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:1.4em;flex-shrink:0}
+.device-avatar.active{background:linear-gradient(135deg,#4caf50 0%,#2e7d32 100%)}
+.device-avatar.inactive{background:linear-gradient(135deg,#9e9e9e 0%,#757575 100%)}
+.device-title{flex:1;min-width:0}
+.device-name{font-size:1.1em;font-weight:700;color:#1a1a2e;margin-bottom:4px;cursor:pointer;display:flex;align-items:center;gap:6px}
+.device-name:hover{color:#667eea}
+.device-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.device-group{background:linear-gradient(135deg,#e8f5e9 0%,#c8e6c9 100%);color:#2e7d32;padding:4px 10px;border-radius:8px;font-size:0.75em;font-weight:600}
+.device-session{padding:4px 10px;border-radius:8px;font-size:0.75em;font-weight:600}
+.device-session.confirmed{background:linear-gradient(135deg,#e3f2fd 0%,#bbdefb 100%);color:#1565c0}
+.device-session.expired{background:linear-gradient(135deg,#fff3e0 0%,#ffe0b2 100%);color:#e65100}
+.device-checkbox{position:absolute;top:16px;right:16px;width:22px;height:22px;cursor:pointer;accent-color:#667eea}
+.device-body{padding:15px 20px}
+.device-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:15px}
+.stat-mini{text-align:center;padding:10px 5px;background:rgba(102,126,234,0.04);border-radius:10px}
+.stat-mini-value{font-size:1.1em;font-weight:700;color:#1a1a2e}
+.stat-mini-label{font-size:0.7em;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px}
+.device-details{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:0.88em;padding:12px 0;border-top:1px solid rgba(0,0,0,0.05);border-bottom:1px solid rgba(0,0,0,0.05)}
+.detail-item{display:flex;justify-content:space-between;align-items:center;padding:4px 0}
+.detail-label{color:#888}
+.detail-value{font-weight:600;color:#333}
+.trust-section{margin-top:12px;padding:12px;background:linear-gradient(135deg,rgba(102,126,234,0.05) 0%,rgba(118,75,162,0.05) 100%);border-radius:12px}
+.trust-header{display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none}
+.trust-score{display:flex;align-items:center;gap:8px}
+.trust-badge{padding:5px 12px;border-radius:20px;font-size:0.8em;font-weight:700;display:flex;align-items:center;gap:5px}
+.trust-badge.low{background:#e8f5e9;color:#2e7d32}
+.trust-badge.medium{background:#fff3e0;color:#e65100}
+.trust-badge.high{background:#ffebee;color:#c62828}
+.trust-badge.very_high{background:#ffcdd2;color:#b71c1c}
+.trust-badge.unknown{background:#f5f5f5;color:#666}
+.trust-toggle{color:#667eea;font-size:0.85em;display:flex;align-items:center;gap:4px}
+.trust-details{display:none;margin-top:10px;padding-top:10px;border-top:1px dashed rgba(102,126,234,0.2);font-size:0.85em}
+.trust-details.show{display:block}
+.trust-detail-row{display:flex;justify-content:space-between;padding:4px 0}
+.trust-detail-label{color:#666}
+.trust-detail-value{font-weight:500}
+.trust-flags{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.trust-flag{padding:3px 8px;border-radius:6px;font-size:0.75em;font-weight:600}
+.trust-flag.vpn{background:#e3f2fd;color:#1565c0}
+.trust-flag.datacenter{background:#fce4ec;color:#c2185b}
+.trust-flag.proxy{background:#fff8e1;color:#f57f17}
+.proxy-section{margin-top:15px;padding-top:15px;border-top:1px solid rgba(0,0,0,0.05)}
+.proxy-current{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.proxy-label{font-size:0.85em;color:#666}
+.proxy-name{font-weight:700;color:#667eea;font-size:0.95em}
+.proxy-actions{display:flex;gap:8px}
+.proxy-actions select{flex:1;padding:10px;border:2px solid #e8e8e8;border-radius:10px;font-size:0.9em}
+.btn-change{padding:10px 16px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:10px;cursor:pointer;font-weight:600;font-size:0.9em;transition:all 0.2s}
+.btn-change:hover{opacity:0.9;transform:scale(1.02)}
+.btn-delete{padding:10px 16px;background:#ef5350;color:white;border:none;border-radius:10px;cursor:pointer;font-weight:600;font-size:0.9em;transition:all 0.2s}
+.btn-delete:hover{background:#e53935}
+.pagination{display:flex;justify-content:center;align-items:center;gap:10px;margin-top:25px}
+.pagination button{padding:10px 20px;border:2px solid #e0e0e0;background:white;border-radius:10px;cursor:pointer;font-weight:600;transition:all 0.2s}
+.pagination button:hover:not(:disabled){border-color:#667eea;color:#667eea;background:#f8f9ff}
+.pagination button:disabled{opacity:0.5;cursor:not-allowed}
+.bulk-actions{display:flex;gap:10px;align-items:center}
+.selected-count{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:6px 14px;border-radius:20px;font-size:0.85em;font-weight:600}
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:1000}
+.modal{background:white;border-radius:20px;padding:30px;width:90%;max-width:450px;box-shadow:0 20px 60px rgba(0,0,0,0.3)}
+.modal h3{margin-bottom:25px;color:#1a1a2e;font-size:1.3em}
+.modal-field{margin-bottom:18px}
+.modal-field label{display:block;font-weight:600;color:#555;margin-bottom:8px}
+.modal-field input,.modal-field select,.modal-field textarea{width:100%;padding:12px;border:2px solid #e0e0e0;border-radius:10px;font-size:1em;transition:border-color 0.2s}
+.modal-field input:focus,.modal-field select:focus,.modal-field textarea:focus{outline:none;border-color:#667eea}
+.modal-field textarea{resize:vertical;min-height:80px}
+.modal-buttons{display:flex;gap:12px;justify-content:flex-end;margin-top:25px}
+.setup-box{background:linear-gradient(135deg,#e3f2fd 0%,#bbdefb 100%);padding:15px 20px;border-radius:14px;margin-bottom:20px;border-left:4px solid #2196F3;box-shadow:0 2px 10px rgba(33,150,243,0.15)}
+.setup-box code{background:#fff;padding:3px 8px;border-radius:6px;font-family:monospace;color:#d32f2f;font-weight:bold}
+.options-row{display:flex;gap:15px;align-items:center;flex-wrap:wrap;margin-left:auto}
+.toggle-option{display:flex;align-items:center;gap:6px;font-size:0.9em;color:#555}
+.toggle-option input{width:18px;height:18px;accent-color:#667eea}
+</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📱 Device Management</h1><p>Monitor and manage all connected devices</p></div><div class="setup-box">📱 Phone Setup: Wi-Fi → Proxy Manual → Host: <code id="serverIP">...</code> Port: <code>8888</code> Username: <code>your-device-name</code> (password can be anything)</div><div class="stats-grid"><div class="stat-card" onclick="filterByStatus('all')"><div class="stat-value" id="totalDevices">-</div><div class="stat-label">Total</div></div><div class="stat-card" onclick="filterByStatus('active')"><div class="stat-value" id="activeDevices">-</div><div class="stat-label">Active</div></div><div class="stat-card" onclick="filterByStatus('inactive')"><div class="stat-value" id="inactiveDevices">-</div><div class="stat-label">Inactive</div></div><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Proxies</div></div><div class="stat-card"><div class="stat-value" id="totalRequests">-</div><div class="stat-label">Requests</div></div></div><div class="toolbar"><div class="search-box"><input type="text" id="searchInput" placeholder="Search devices..." oninput="applyFilters()"></div><div class="filter-group"><label>Group:</label><select id="groupFilter" onchange="applyFilters()"><option value="">All</option></select></div><div class="filter-group"><label>Sort:</label><select id="sortBy" onchange="applyFilters()"><option value="name">Name</option><option value="ip">IP</option><option value="lastSeen" selected>Last Seen</option><option value="requests">Requests</option><option value="trust">Trust Score</option></select></div><div class="options-row"><label class="toggle-option"><input type="checkbox" id="showOffline" onchange="loadData()">Show Offline</label><label class="toggle-option"><input type="checkbox" id="showTrustDetails">Show Trust Details</label></div><button class="btn btn-secondary" onclick="loadData()">🔄 Refresh</button><button class="btn btn-secondary" onclick="location.href='/api/export'">📤 Export</button><div class="bulk-actions" id="bulkActions" style="display:none"><span class="selected-count"><span id="selectedCount">0</span> selected</span><select id="bulkProxySelect"></select><button class="btn btn-primary" onclick="bulkChangeProxy()">Change</button><button class="btn btn-secondary" onclick="clearSelection()">Clear</button></div></div><div class="card"><h2>Connected Devices</h2><div id="devicesList" class="device-grid"><div class="loading">Loading...</div></div><div class="pagination" id="pagination"></div></div></div><div class="modal-overlay" id="editModal" style="display:none"><div class="modal"><h3>✏️ Edit Device</h3><div class="modal-field"><label>Username (Device ID)</label><input type="text" id="editUsername" placeholder="e.g., phone1, samsung-s23"></div><div class="modal-field"><label>Custom Name</label><input type="text" id="editName" placeholder="e.g., Samsung S23"></div><div class="modal-field"><label>Group</label><select id="editGroup"></select></div><div class="modal-field"><label>Notes</label><textarea id="editNotes" placeholder="Optional notes..."></textarea></div><input type="hidden" id="editDeviceIP"><div class="modal-buttons"><button class="btn btn-secondary" onclick="closeEditModal()">Cancel</button><button class="btn btn-primary" onclick="saveDeviceEdit()">Save</button></div></div></div><script>` + baseJS + `document.getElementById('nav-dashboard').classList.add('active');fetch("/api/server-ip").then(r=>r.text()).then(ip=>document.getElementById("serverIP").textContent=ip);let allDevices=[],allProxies=[],allGroups=[],filteredDevices=[],selectedDevices=new Set(),currentPage=1,statusFilter='all',trustCache={};const PER_PAGE=20;function getDisplayName(d){return d.custom_name||d.name||d.username||'Unknown';}function isActive(d){return(Date.now()-new Date(d.last_seen))/60000<5;}function proxyLabel(p,i){let ip=p.user&&p.user.includes('ip-')?p.user.split('ip-')[1]:'unknown';return'#'+(i+1)+' – '+ip;}function filterByStatus(s){statusFilter=s;applyFilters();}function getTrustBadgeClass(risk){return risk||'unknown';}function getTrustIcon(score){if(score>=80)return'🛡️';if(score>=50)return'⚠️';if(score>=20)return'🔶';return'🚨';}function applyFilters(){const search=document.getElementById('searchInput').value.toLowerCase();const group=document.getElementById('groupFilter').value;const sort=document.getElementById('sortBy').value;filteredDevices=allDevices.filter(d=>{if(statusFilter==='active'&&!isActive(d))return false;if(statusFilter==='inactive'&&isActive(d))return false;if(group&&d.group!==group)return false;if(search&&!getDisplayName(d).toLowerCase().includes(search)&&!d.ip.includes(search)&&!(d.username&&d.username.toLowerCase().includes(search)))return false;return true;});filteredDevices.sort((a,b)=>{if(sort==='name')return getDisplayName(a).localeCompare(getDisplayName(b));if(sort==='ip')return a.ip.localeCompare(b.ip);if(sort==='lastSeen')return new Date(b.last_seen)-new Date(a.last_seen);if(sort==='requests')return(b.request_count||0)-(a.request_count||0);if(sort==='trust')return(b.trust_score||0)-(a.trust_score||0);return 0;});currentPage=1;renderDevices();}function renderDevices(){const c=document.getElementById('devicesList');const showTrust=document.getElementById('showTrustDetails').checked;if(!filteredDevices.length){c.innerHTML='<div class="loading">No devices found</div>';document.getElementById('pagination').innerHTML='';return;}const pages=Math.ceil(filteredDevices.length/PER_PAGE);const start=(currentPage-1)*PER_PAGE;const pageDevices=filteredDevices.slice(start,start+PER_PAGE);c.innerHTML=pageDevices.map(d=>{const mins=Math.floor((Date.now()-new Date(d.last_seen))/60000);const active=mins<5;const sel=selectedDevices.has(d.ip);const pIdx=allProxies.findIndex(p=>p.full===d.upstream_proxy);const opts=allProxies.map((p,i)=>'<option value="'+i+'" '+(i===pIdx?'selected':'')+'>'+proxyLabel(p,i)+'</option>').join('');const pLabel=pIdx>=0?proxyLabel(allProxies[pIdx],pIdx):'Not assigned';const trustScore=d.trust_score||0;const trustRisk=d.trust_risk||'unknown';const hasSession=d.confirmed;const sessionClass=hasSession?'confirmed':'expired';const sessionText=hasSession?'Session Active':'Session Expired';const countryFlag=d.country_code?getCountryFlag(d.country_code):'🌍';const trustBadgeClass=getTrustBadgeClass(trustRisk);const trustIcon=getTrustIcon(trustScore);const vpnFlag=d.is_vpn?'<span class="trust-flag vpn">VPN/Proxy</span>':'';const dcFlag=d.is_datacenter?'<span class="trust-flag datacenter">Datacenter</span>':'';return'<div class="device-card '+(sel?'selected':'')+'"><input type="checkbox" class="device-checkbox" '+(sel?'checked':'')+' onchange="toggleSel(\''+d.ip+'\',this.checked)"><div class="device-header"><div class="device-avatar '+(active?'active':'inactive')+'">'+countryFlag+'</div><div class="device-title"><div class="device-name" onclick="openEditModal(\''+d.ip+'\')">'+escapeHtml(getDisplayName(d))+' <span style="opacity:0.5;font-size:0.8em">✏️</span></div><div class="device-meta"><span class="device-group">'+escapeHtml(d.group||'Default')+'</span><span class="device-session '+sessionClass+'">'+sessionText+'</span></div></div></div><div class="device-body"><div class="device-stats"><div class="stat-mini"><div class="stat-mini-value">'+formatNumber(d.request_count)+'</div><div class="stat-mini-label">Requests</div></div><div class="stat-mini"><div class="stat-mini-value" style="color:'+(d.error_count>0?'#c62828':'#2e7d32')+'">'+(d.error_count||0)+'</div><div class="stat-mini-label">Errors</div></div><div class="stat-mini"><div class="stat-mini-value">'+formatBytes(d.bytes_in)+'</div><div class="stat-mini-label">Data In</div></div><div class="stat-mini"><div class="stat-mini-value">'+formatBytes(d.bytes_out)+'</div><div class="stat-mini-label">Data Out</div></div></div><div class="device-details"><div class="detail-item"><span class="detail-label">Status</span><span class="detail-value" style="color:'+(active?'#2e7d32':'#c62828')+'">'+(active?'● Online':'○ Offline')+'</span></div><div class="detail-item"><span class="detail-label">Last Seen</span><span class="detail-value">'+(mins<1?'Now':mins+' min ago')+'</span></div><div class="detail-item"><span class="detail-label">IP Address</span><span class="detail-value">'+d.ip+'</span></div><div class="detail-item"><span class="detail-label">Username</span><span class="detail-value" style="color:#667eea">'+(d.username||'anonymous')+'</span></div></div><div class="trust-section"><div class="trust-header" onclick="toggleTrustDetails(\''+d.ip+'\')"><div class="trust-score"><span class="trust-badge '+trustBadgeClass+'">'+trustIcon+' Trust: '+(trustScore>0?trustScore+'%':'N/A')+'</span>'+vpnFlag+dcFlag+'</div><span class="trust-toggle" id="trust-toggle-'+d.ip+'">Details ▼</span></div><div class="trust-details '+(showTrust?'show':'')+'" id="trust-details-'+d.ip+'"><div class="trust-detail-row"><span class="trust-detail-label">Risk Level</span><span class="trust-detail-value" style="text-transform:capitalize">'+trustRisk+'</span></div><div class="trust-detail-row"><span class="trust-detail-label">Country</span><span class="trust-detail-value">'+(d.country_code||'Unknown')+'</span></div><button class="btn btn-secondary" style="width:100%;margin-top:8px;padding:8px" onclick="refreshTrustScore(\''+d.ip+'\')">🔄 Refresh Score</button></div></div><div class="proxy-section"><div class="proxy-current"><span class="proxy-label">Current Proxy:</span><span class="proxy-name">'+pLabel+'</span></div><div class="proxy-actions"><select id="proxy-'+d.ip+'">'+opts+'</select><button class="btn-change" onclick="changeProxy(\''+d.ip+'\')">Change</button><button class="btn-delete" onclick="deleteDevice(\''+d.ip+'\',\''+escapeHtml(d.username||'')+'\')">Delete</button></div></div></div></div>';}).join('');const pag=document.getElementById('pagination');pag.innerHTML=pages>1?'<button onclick="goPage('+(currentPage-1)+')" '+(currentPage===1?'disabled':'')+'>← Prev</button><span>Page '+currentPage+' of '+pages+'</span><button onclick="goPage('+(currentPage+1)+')" '+(currentPage===pages?'disabled':'')+'>Next →</button>':'<span>'+filteredDevices.length+' devices</span>';updateBulk();}function getCountryFlag(code){if(!code||code.length!==2)return'🌍';const offset=127397;return String.fromCodePoint(...[...code.toUpperCase()].map(c=>c.charCodeAt(0)+offset));}function toggleTrustDetails(ip){const el=document.getElementById('trust-details-'+ip);const toggle=document.getElementById('trust-toggle-'+ip);if(el){el.classList.toggle('show');toggle.textContent=el.classList.contains('show')?'Details ▲':'Details ▼';}}function refreshTrustScore(ip){fetch('/api/trust-score?ip='+encodeURIComponent(ip)).then(r=>r.json()).then(data=>{if(data.success){showToast('Trust score updated: '+data.data.score+'%','success');loadData();}else{showToast('Failed to get trust score','error');}}).catch(()=>showToast('Error refreshing trust score','error'));}function goPage(p){const pages=Math.ceil(filteredDevices.length/PER_PAGE);if(p>=1&&p<=pages){currentPage=p;renderDevices();}}function escapeHtml(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML;}function toggleSel(ip,checked){checked?selectedDevices.add(ip):selectedDevices.delete(ip);updateBulk();renderDevices();}function clearSelection(){selectedDevices.clear();updateBulk();renderDevices();}function updateBulk(){const b=document.getElementById('bulkActions');b.style.display=selectedDevices.size>0?'flex':'none';document.getElementById('selectedCount').textContent=selectedDevices.size;}function changeProxy(ip){const idx=parseInt(document.getElementById('proxy-'+ip).value);fetch('/api/change-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,proxy_index:idx})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Proxy changed','success');loadData();}});}function bulkChangeProxy(){const idx=parseInt(document.getElementById('bulkProxySelect').value);fetch('/api/bulk-change-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ips:Array.from(selectedDevices),proxy_index:idx})}).then(r=>r.json()).then(d=>{if(d.ok){showToast(d.updated+' devices updated','success');selectedDevices.clear();loadData();}});}function openEditModal(ip){const d=allDevices.find(x=>x.ip===ip);if(!d)return;document.getElementById('editDeviceIP').value=ip;document.getElementById('editUsername').value=d.username||'';document.getElementById('editName').value=d.custom_name||'';document.getElementById('editNotes').value=d.notes||'';document.getElementById('editGroup').innerHTML=allGroups.map(g=>'<option value="'+g+'" '+(g===d.group?'selected':'')+'>'+g+'</option>').join('');document.getElementById('editModal').style.display='flex';}function closeEditModal(){document.getElementById('editModal').style.display='none';}function saveDeviceEdit(){const ip=document.getElementById('editDeviceIP').value;fetch('/api/update-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,username:document.getElementById('editUsername').value,custom_name:document.getElementById('editName').value,group:document.getElementById('editGroup').value,notes:document.getElementById('editNotes').value})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Device updated','success');closeEditModal();loadData();}});}function loadGroups(){return fetch('/api/groups').then(r=>r.json()).then(g=>{allGroups=g;document.getElementById('groupFilter').innerHTML='<option value="">All</option>'+g.map(x=>'<option value="'+x+'">'+x+'</option>').join('');});}function loadData(){const showOffline=document.getElementById('showOffline').checked;Promise.all([fetch('/api/stats').then(r=>r.json()),fetch('/api/devices'+(showOffline?'?include_offline=true':'')).then(r=>r.json()),fetch('/api/proxies').then(r=>r.json()),loadGroups()]).then(([stats,devices,proxies])=>{document.getElementById('totalDevices').textContent=stats.total_devices||0;document.getElementById('activeDevices').textContent=stats.active_devices||0;document.getElementById('inactiveDevices').textContent=(stats.total_devices-stats.active_devices)||0;document.getElementById('totalProxies').textContent=stats.total_proxies||0;document.getElementById('totalRequests').textContent=formatNumber(stats.total_requests||0);allDevices=devices||[];allProxies=proxies||[];document.getElementById('bulkProxySelect').innerHTML=allProxies.map((p,i)=>'<option value="'+i+'">'+proxyLabel(p,i)+'</option>').join('');applyFilters();});}function deleteDevice(ip,username){const name=username||ip;if(!confirm('Delete device "'+name+'" ('+ip+')? This will remove all saved settings for this device.')){return;}fetch('/api/delete-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,username:username})}).then(r=>{if(r.ok)return r.json();throw new Error('Failed');}).then(d=>{if(d.ok){showToast('Device deleted','success');loadData();}}).catch(()=>showToast('Failed to delete device','error'));}document.getElementById('showTrustDetails').addEventListener('change',function(){renderDevices();});loadData();setInterval(loadData,15000);</script></body></html>`
 
 const healthPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Proxy Health</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>` + baseStyles + `.health-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:20px}.proxy-card{background:white;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);border-left:4px solid #ccc}.proxy-card.healthy{border-left-color:#4caf50}.proxy-card.degraded{border-left-color:#ff9800}.proxy-card.unhealthy{border-left-color:#f44336}.proxy-card.unknown{border-left-color:#9e9e9e}.proxy-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}.proxy-name{font-size:1.2em;font-weight:bold;color:#333}.proxy-status{padding:5px 12px;border-radius:20px;font-size:0.85em;font-weight:600}.proxy-status.healthy{background:#e8f5e9;color:#2e7d32}.proxy-status.degraded{background:#fff3e0;color:#e65100}.proxy-status.unhealthy{background:#ffebee;color:#c62828}.proxy-status.unknown{background:#f5f5f5;color:#666}.proxy-stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}.proxy-stat{padding:10px;background:#f8f9fa;border-radius:8px}.proxy-stat-value{font-size:1.3em;font-weight:bold;color:#667eea}.proxy-stat-label{font-size:0.8em;color:#666;text-transform:uppercase}.progress-bar{height:8px;background:#e0e0e0;border-radius:4px;overflow:hidden;margin-top:10px}.progress-fill{height:100%;border-radius:4px;transition:width 0.3s}.progress-fill.good{background:#4caf50}.progress-fill.warning{background:#ff9800}.progress-fill.bad{background:#f44336}.last-error{margin-top:10px;padding:10px;background:#ffebee;border-radius:8px;font-size:0.85em;color:#c62828;word-break:break-all}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>💚 Proxy Health Monitor</h1><p>Real-time health status of all upstream proxies</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Total Proxies</div></div><div class="stat-card"><div class="stat-value" id="healthyProxies" style="color:#4caf50">-</div><div class="stat-label">Healthy</div></div><div class="stat-card"><div class="stat-value" id="degradedProxies" style="color:#ff9800">-</div><div class="stat-label">Degraded</div></div><div class="stat-card"><div class="stat-value" id="unhealthyProxies" style="color:#f44336">-</div><div class="stat-label">Unhealthy</div></div><div class="stat-card"><div class="stat-value" id="avgSuccessRate">-</div><div class="stat-label">Avg Success</div></div></div><div class="card"><h2>Proxy Status</h2><button class="btn btn-secondary" onclick="loadHealth()" style="float:right;margin-top:-45px">🔄 Refresh</button><div id="healthGrid" class="health-grid"><div class="loading">Loading...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-health').classList.add('active');function loadHealth(){fetch('/api/proxy-health').then(r=>r.json()).then(data=>{let healthy=0,degraded=0,unhealthy=0,totalRate=0;data.forEach(p=>{if(p.status==='healthy')healthy++;else if(p.status==='degraded')degraded++;else if(p.status==='unhealthy')unhealthy++;totalRate+=p.success_rate||0;});document.getElementById('totalProxies').textContent=data.length;document.getElementById('healthyProxies').textContent=healthy;document.getElementById('degradedProxies').textContent=degraded;document.getElementById('unhealthyProxies').textContent=unhealthy;document.getElementById('avgSuccessRate').textContent=data.length?(totalRate/data.length).toFixed(1)+'%':'-';document.getElementById('healthGrid').innerHTML=data.map(p=>{const rate=p.success_rate||0;const rateClass=rate>=95?'good':rate>=80?'warning':'bad';return'<div class="proxy-card '+p.status+'"><div class="proxy-header"><span class="proxy-name">#'+(p.index+1)+' – '+p.ip_address+'</span><span class="proxy-status '+p.status+'">'+p.status.toUpperCase()+'</span></div><div class="proxy-stats"><div class="proxy-stat"><div class="proxy-stat-value">'+formatNumber(p.total_requests)+'</div><div class="proxy-stat-label">Requests</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+rate.toFixed(1)+'%</div><div class="proxy-stat-label">Success Rate</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+formatNumber(p.success_count)+'</div><div class="proxy-stat-label">Success</div></div><div class="proxy-stat"><div class="proxy-stat-value" style="color:#c62828">'+formatNumber(p.failure_count)+'</div><div class="proxy-stat-label">Failures</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+p.avg_response_time_ms+'ms</div><div class="proxy-stat-label">Avg Response</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+p.active_devices+'</div><div class="proxy-stat-label">Active Devices</div></div></div><div class="progress-bar"><div class="progress-fill '+rateClass+'" style="width:'+rate+'%"></div></div>'+(p.last_error?'<div class="last-error">Last error: '+p.last_error+'</div>':'')+'</div>';}).join('');});}loadHealth();setInterval(loadHealth,30000);</script></body></html>`
