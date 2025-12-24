@@ -289,6 +289,79 @@ type changeProxyRequest struct {
 	ProxyIndex int    `json:"proxy_index"`
 }
 
+// ============================================================================
+// WEBRTC LEAK PREVENTION
+// ============================================================================
+
+// Known STUN/TURN server patterns that can cause WebRTC IP leaks
+var webrtcBlockedPatterns = []string{
+	"stun.l.google.com",
+	"stun1.l.google.com",
+	"stun2.l.google.com",
+	"stun3.l.google.com",
+	"stun4.l.google.com",
+	"stun.services.mozilla.com",
+	"turn.l.google.com",
+	"turn.twilio.com",
+	"global.stun.twilio.com",
+	"stun.stunprotocol.org",
+	"stun.voip.eutelia.it",
+	"stun.sipgate.net",
+	"stun.ekiga.net",
+	"stun.ideasip.com",
+	"stun.schlund.de",
+	"stun.voipbuster.com",
+	"stun.voipstunt.com",
+	"stun.counterpath.com",
+	"stun.1und1.de",
+	"stun.gmx.net",
+	"stun.callwithus.com",
+	"stun.counterpath.net",
+	"stun.internetcalls.com",
+}
+
+// STUN/TURN ports to block
+var webrtcBlockedPorts = []string{"3478", "5349", "19302", "19305"}
+
+// isWebRTCLeakHost checks if a host:port is a STUN/TURN server that could cause WebRTC leaks
+func isWebRTCLeakHost(hostPort string) bool {
+	host := hostPort
+	port := ""
+
+	// Extract host and port
+	if idx := strings.LastIndex(hostPort, ":"); idx != -1 {
+		host = hostPort[:idx]
+		port = hostPort[idx+1:]
+	}
+
+	hostLower := strings.ToLower(host)
+
+	// Check against known STUN/TURN server patterns
+	for _, pattern := range webrtcBlockedPatterns {
+		if strings.Contains(hostLower, pattern) || hostLower == pattern {
+			return true
+		}
+	}
+
+	// Check for generic STUN/TURN patterns in hostname
+	if strings.Contains(hostLower, "stun.") || strings.Contains(hostLower, ".stun.") ||
+		strings.HasPrefix(hostLower, "stun") ||
+		strings.Contains(hostLower, "turn.") || strings.Contains(hostLower, ".turn.") ||
+		strings.HasPrefix(hostLower, "turn") ||
+		strings.Contains(hostLower, "webrtc") {
+		return true
+	}
+
+	// Check for STUN/TURN ports
+	for _, blockedPort := range webrtcBlockedPorts {
+		if port == blockedPort {
+			return true
+		}
+	}
+
+	return false
+}
+
 type updateDeviceRequest struct {
 	DeviceIP   string `json:"device_ip"`
 	CustomName string `json:"custom_name"`
@@ -1464,6 +1537,13 @@ func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device, proxyNa
 		target += ":443"
 	}
 
+	// Block WebRTC leak sources (STUN/TURN servers)
+	if isWebRTCLeakHost(target) {
+		// Silently block to prevent WebRTC IP leaks - return connection refused
+		http.Error(w, "Connection refused", http.StatusForbidden)
+		return
+	}
+
 	startTime := time.Now()
 	proxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
 
@@ -1539,6 +1619,13 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device, proxyNam
 	host := r.Host
 	if !strings.Contains(host, ":") {
 		host += ":80"
+	}
+
+	// Block WebRTC leak sources (STUN/TURN servers)
+	if isWebRTCLeakHost(host) {
+		// Silently block to prevent WebRTC IP leaks
+		http.Error(w, "Connection refused", http.StatusForbidden)
+		return
 	}
 
 	startTime := time.Now()
