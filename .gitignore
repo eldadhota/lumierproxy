@@ -1,6 +1,7 @@
 # Compiled binary
 lumierproxy
 lumierproxy.exe
+lumier-proxy
 
 # Go build artifacts
 *.exe

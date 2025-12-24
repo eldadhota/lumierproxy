@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.ConnectivityManager
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.view.View
@@ -56,6 +57,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnRegister: Button
     private lateinit var btnChangeProxy: Button
     private lateinit var btnCheckIp: Button
+    private lateinit var btnWebRTCTest: Button
+    private lateinit var btnWebRTCProtect: Button
     private lateinit var tvStatus: TextView
     private lateinit var tvWhoAmI: TextView
 
@@ -86,6 +89,8 @@ class MainActivity : AppCompatActivity() {
         btnRegister = findViewById(R.id.btnRegister)
         btnChangeProxy = findViewById(R.id.btnChangeProxy)
         btnCheckIp = findViewById(R.id.btnCheckIp)
+        btnWebRTCTest = findViewById(R.id.btnWebRTCTest)
+        btnWebRTCProtect = findViewById(R.id.btnWebRTCProtect)
         tvStatus = findViewById(R.id.tvStatus)
         tvWhoAmI = findViewById(R.id.tvWhoAmI)
 
@@ -97,6 +102,8 @@ class MainActivity : AppCompatActivity() {
         btnRegister.setOnClickListener { registerDevice() }
         btnChangeProxy.setOnClickListener { changeProxy() }
         btnCheckIp.setOnClickListener { checkWhoAmI() }
+        btnWebRTCTest.setOnClickListener { openWebRTCLeakTest() }
+        btnWebRTCProtect.setOnClickListener { showWebRTCProtectionGuide() }
 
         // Set up callbacks for automatic IP checks
         NetworkChangeReceiver.onWifiConnected = {
@@ -1156,5 +1163,62 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }.start()
+    }
+
+    // ============================================================================
+    // WEBRTC LEAK PROTECTION
+    // ============================================================================
+
+    private fun openWebRTCLeakTest() {
+        // Open a WebRTC leak test website in the browser
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://browserleaks.com/webrtc"))
+        try {
+            startActivity(intent)
+            Toast.makeText(this, "Check if your real IP appears under 'WebRTC Leak Test'", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Could not open browser", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showWebRTCProtectionGuide() {
+        val message = """
+WebRTC can bypass proxy settings and reveal your real IP address. Here's how to protect yourself:
+
+FIREFOX (Recommended):
+1. Type 'about:config' in the address bar
+2. Click 'Accept the Risk and Continue'
+3. Search for 'media.peerconnection.enabled'
+4. Double-click to set it to 'false'
+5. Restart Firefox
+
+CHROME:
+1. Install 'WebRTC Leak Prevent' extension
+2. Or use 'uBlock Origin' extension
+3. In uBlock: Settings > Privacy > Prevent WebRTC
+
+EDGE:
+1. Go to edge://flags
+2. Search for 'WebRTC'
+3. Disable 'Anonymize local IPs exposed by WebRTC'
+
+BRAVE:
+1. Settings > Privacy and security
+2. WebRTC IP handling policy
+3. Select 'Disable non-proxied UDP'
+
+IMPORTANT:
+- Always test using the 'Test Leaks' button after configuring
+- Your proxy IP should be the only IP visible
+- If you see your real IP, the protection is not working
+        """.trimIndent()
+
+        AlertDialog.Builder(this)
+            .setTitle("WebRTC Leak Protection Guide")
+            .setMessage(message)
+            .setPositiveButton("Got it", null)
+            .setNeutralButton("Test Now") { _, _ ->
+                openWebRTCLeakTest()
+            }
+            .show()
     }
 }
