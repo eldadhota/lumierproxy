@@ -548,6 +548,10 @@ func (s *ProxyServer) initializeProxyHealth() {
 }
 
 func extractProxyIP(proxyStr string) string {
+	// Handle passthrough/direct proxy
+	if proxyStr == "direct" {
+		return "Direct"
+	}
 	if idx := strings.Index(proxyStr, "-ip-"); idx != -1 {
 		rest := proxyStr[idx+4:]
 		if colonIdx := strings.Index(rest, ":"); colonIdx != -1 {
@@ -1698,7 +1702,8 @@ func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device, proxyNam
 }
 
 func dialThroughSOCKS5(target, proxyStr string) (net.Conn, error) {
-	if proxyStr == "" {
+	// Handle passthrough/direct connection (no upstream proxy)
+	if proxyStr == "" || proxyStr == "direct" {
 		return net.DialTimeout("tcp", target, 30*time.Second)
 	}
 
@@ -3010,12 +3015,15 @@ func handleBulkImportProxiesAPI(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Validate proxy format (host:port:user:pass)
-		parts := strings.Split(line, ":")
-		if len(parts) < 4 {
-			errors = append(errors, fmt.Sprintf("Invalid format: %s", line[:min(50, len(line))]))
-			skipped++
-			continue
+		// Allow "direct" as a special passthrough proxy, otherwise validate format
+		if line != "direct" {
+			// Validate proxy format (host:port:user:pass)
+			parts := strings.Split(line, ":")
+			if len(parts) < 4 {
+				errors = append(errors, fmt.Sprintf("Invalid format: %s", line[:min(50, len(line))]))
+				skipped++
+				continue
+			}
 		}
 
 		// Check if proxy already exists
@@ -3469,11 +3477,14 @@ func handleAddProxyAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	// Validate proxy format (host:port:user:pass)
-	parts := strings.Split(req.ProxyString, ":")
-	if len(parts) < 4 {
-		http.Error(w, "invalid proxy format. Use: host:port:username:password", http.StatusBadRequest)
-		return
+	// Allow "direct" as a special passthrough proxy (no upstream)
+	if req.ProxyString != "direct" {
+		// Validate proxy format (host:port:user:pass)
+		parts := strings.Split(req.ProxyString, ":")
+		if len(parts) < 4 {
+			http.Error(w, "invalid proxy format. Use: host:port:username:password or 'direct' for passthrough", http.StatusBadRequest)
+			return
+		}
 	}
 	// Check if proxy already exists
 	server.poolMu.Lock()
