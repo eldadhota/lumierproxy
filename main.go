@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -4201,33 +4202,78 @@ func handleSessionSettingsAPI(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }
 
-// TrustScoreResult contains the fraud score and risk assessment for an IP
+// TrustScoreResult contains the fraud score and risk assessment for an IP from a single source
 type TrustScoreResult struct {
-	Score     int    `json:"score"`      // 0-100, lower is better (less risky)
-	Risk      string `json:"risk"`       // "low", "medium", "high", "very high"
-	Available bool   `json:"available"`  // Whether score could be fetched
-	Error     string `json:"error"`      // Error message if fetch failed
+	Score     int    `json:"score"`     // 0-100, lower is better (less risky)
+	Risk      string `json:"risk"`      // "low", "medium", "high", "very high"
+	Available bool   `json:"available"` // Whether score could be fetched
+	Error     string `json:"error"`     // Error message if fetch failed
 }
 
-// getTrustScore fetches the fraud score from Scamalytics for an IP
-func getTrustScore(ip string) TrustScoreResult {
+// CombinedTrustScore contains fraud scores from multiple sources
+type CombinedTrustScore struct {
+	Scamalytics    TrustScoreResult `json:"scamalytics"`
+	IPQualityScore TrustScoreResult `json:"ipqualityscore"`
+}
+
+// createBrowserRequest creates an HTTP request with realistic browser headers
+func createBrowserRequest(url string) (*http.Request, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set comprehensive browser headers to avoid bot detection
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+
+	return req, nil
+}
+
+// getRiskLevel returns the risk level string based on score (0-100, lower is better)
+func getRiskLevel(score int) string {
+	switch {
+	case score <= 25:
+		return "low"
+	case score <= 50:
+		return "medium"
+	case score <= 75:
+		return "high"
+	default:
+		return "very high"
+	}
+}
+
+// getScamalyticsScore fetches the fraud score from Scamalytics for an IP
+func getScamalyticsScore(ip string) TrustScoreResult {
 	// Validate IP format
 	if net.ParseIP(ip) == nil {
 		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "invalid IP"}
 	}
 
-	// Create HTTP client with timeout
-	client := &http.Client{Timeout: 10 * time.Second}
+	// Create HTTP client with timeout and follow redirects
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+	}
 
 	// Fetch the Scamalytics page
 	url := "https://scamalytics.com/ip/" + ip
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := createBrowserRequest(url)
 	if err != nil {
 		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "request error"}
 	}
-
-	// Set user agent to avoid being blocked
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -4239,28 +4285,37 @@ func getTrustScore(ip string) TrustScoreResult {
 		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "status " + strconv.Itoa(resp.StatusCode)}
 	}
 
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "read error"}
+	// Read response body (handle gzip if needed)
+	var body []byte
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		reader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			body, _ = io.ReadAll(resp.Body)
+		} else {
+			defer reader.Close()
+			body, err = io.ReadAll(reader)
+			if err != nil {
+				return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "gzip read error"}
+			}
+		}
+	} else {
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "read error"}
+		}
 	}
 
 	html := string(body)
-
-	// Parse fraud score from HTML - look for the score in various patterns
-	// Pattern 1: <div class="score">XX</div>
-	// Pattern 2: Fraud Score: XX
-	// Pattern 3: data-score="XX"
-
 	score := -1
 
-	// Try to find score using regex patterns
+	// Try to find score using various patterns from Scamalytics HTML
 	patterns := []string{
 		`(?i)fraud\s*score[:\s]*(\d+)`,
 		`class="score"[^>]*>(\d+)<`,
 		`data-score="(\d+)"`,
 		`<div[^>]*score[^>]*>(\d+)</div>`,
 		`>(\d+)</div>\s*<div[^>]*class="[^"]*score`,
+		`(?i)score[^>]*>\s*(\d+)\s*<`,
 	}
 
 	for _, pattern := range patterns {
@@ -4274,39 +4329,115 @@ func getTrustScore(ip string) TrustScoreResult {
 		}
 	}
 
-	// If still not found, try a more direct approach
 	if score == -1 {
-		// Look for pattern like "Fraud Score" followed by a number
-		re := regexp.MustCompile(`(?i)(fraud|risk|score)[^0-9]*(\d{1,3})[^0-9]`)
-		matches := re.FindAllStringSubmatch(html, -1)
-		for _, m := range matches {
-			if len(m) > 2 {
-				if s, err := strconv.Atoi(m[2]); err == nil && s >= 0 && s <= 100 {
-					score = s
-					break
-				}
+		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "parse error"}
+	}
+
+	return TrustScoreResult{Score: score, Risk: getRiskLevel(score), Available: true}
+}
+
+// getIPQualityScore fetches the fraud score from IPQualityScore for an IP
+func getIPQualityScore(ip string) TrustScoreResult {
+	// Validate IP format
+	if net.ParseIP(ip) == nil {
+		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "invalid IP"}
+	}
+
+	// Create HTTP client
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+	}
+
+	// Fetch the IPQualityScore page
+	url := "https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/" + ip
+	req, err := createBrowserRequest(url)
+	if err != nil {
+		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "request error"}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "fetch error"}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "status " + strconv.Itoa(resp.StatusCode)}
+	}
+
+	// Read response body (handle gzip if needed)
+	var body []byte
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		reader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			body, _ = io.ReadAll(resp.Body)
+		} else {
+			defer reader.Close()
+			body, err = io.ReadAll(reader)
+			if err != nil {
+				return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "gzip read error"}
+			}
+		}
+	} else {
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "read error"}
+		}
+	}
+
+	html := string(body)
+	score := -1
+
+	// Try to find fraud score from IPQualityScore HTML
+	// They typically show "Fraud Score: XX" or similar
+	patterns := []string{
+		`(?i)fraud\s*score[:\s]*(\d+)`,
+		`(?i)risk\s*score[:\s]*(\d+)`,
+		`"fraud_score"[:\s]*(\d+)`,
+		`data-fraud-score="(\d+)"`,
+		`>(\d+)%</span>\s*(?i)fraud`,
+		`(?i)score[^>]*>(\d+)%<`,
+	}
+
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		matches := re.FindStringSubmatch(html)
+		if len(matches) > 1 {
+			if s, err := strconv.Atoi(matches[1]); err == nil && s >= 0 && s <= 100 {
+				score = s
+				break
 			}
 		}
 	}
 
 	if score == -1 {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "could not parse score"}
+		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "parse error"}
 	}
 
-	// Determine risk level based on score
-	var risk string
-	switch {
-	case score <= 25:
-		risk = "low"
-	case score <= 50:
-		risk = "medium"
-	case score <= 75:
-		risk = "high"
-	default:
-		risk = "very high"
-	}
+	return TrustScoreResult{Score: score, Risk: getRiskLevel(score), Available: true}
+}
 
-	return TrustScoreResult{Score: score, Risk: risk, Available: true}
+// getCombinedTrustScore fetches fraud scores from both Scamalytics and IPQualityScore
+func getCombinedTrustScore(ip string) CombinedTrustScore {
+	// Fetch from both sources concurrently
+	var scamResult, ipqsResult TrustScoreResult
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		scamResult = getScamalyticsScore(ip)
+	}()
+	go func() {
+		defer wg.Done()
+		ipqsResult = getIPQualityScore(ip)
+	}()
+	wg.Wait()
+
+	return CombinedTrustScore{
+		Scamalytics:    scamResult,
+		IPQualityScore: ipqsResult,
+	}
 }
 
 func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
@@ -4344,27 +4475,41 @@ func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
 		return proxies[i].Index < proxies[j].Index
 	})
 
-	// Check each proxy IP for trust score
+	// Check each proxy IP for trust score from both sources
 	results := make([]map[string]interface{}, 0)
-	lowRiskCount := 0
-	mediumRiskCount := 0
-	highRiskCount := 0
-	totalScore := 0
-	scoredCount := 0
+	scamLowRisk, scamMedRisk, scamHighRisk := 0, 0, 0
+	ipqsLowRisk, ipqsMedRisk, ipqsHighRisk := 0, 0, 0
+	scamTotalScore, ipqsTotalScore := 0, 0
+	scamScoredCount, ipqsScoredCount := 0, 0
 
 	for _, p := range proxies {
-		trustScore := getTrustScore(p.IPAddress)
+		combined := getCombinedTrustScore(p.IPAddress)
 
-		if trustScore.Available {
-			totalScore += trustScore.Score
-			scoredCount++
-			switch trustScore.Risk {
+		// Track Scamalytics stats
+		if combined.Scamalytics.Available {
+			scamTotalScore += combined.Scamalytics.Score
+			scamScoredCount++
+			switch combined.Scamalytics.Risk {
 			case "low":
-				lowRiskCount++
+				scamLowRisk++
 			case "medium":
-				mediumRiskCount++
+				scamMedRisk++
 			case "high", "very high":
-				highRiskCount++
+				scamHighRisk++
+			}
+		}
+
+		// Track IPQualityScore stats
+		if combined.IPQualityScore.Available {
+			ipqsTotalScore += combined.IPQualityScore.Score
+			ipqsScoredCount++
+			switch combined.IPQualityScore.Risk {
+			case "low":
+				ipqsLowRisk++
+			case "medium":
+				ipqsMedRisk++
+			case "high", "very high":
+				ipqsHighRisk++
 			}
 		}
 
@@ -4372,27 +4517,48 @@ func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
 			"index":      p.Index,
 			"name":       p.Name,
 			"ip_address": p.IPAddress,
-			"score":      trustScore.Score,
-			"risk":       trustScore.Risk,
-			"available":  trustScore.Available,
-			"error":      trustScore.Error,
+			"scamalytics": map[string]interface{}{
+				"score":     combined.Scamalytics.Score,
+				"risk":      combined.Scamalytics.Risk,
+				"available": combined.Scamalytics.Available,
+				"error":     combined.Scamalytics.Error,
+			},
+			"ipqualityscore": map[string]interface{}{
+				"score":     combined.IPQualityScore.Score,
+				"risk":      combined.IPQualityScore.Risk,
+				"available": combined.IPQualityScore.Available,
+				"error":     combined.IPQualityScore.Error,
+			},
 		})
 	}
 
-	avgScore := 0
-	if scoredCount > 0 {
-		avgScore = totalScore / scoredCount
+	scamAvgScore := -1
+	if scamScoredCount > 0 {
+		scamAvgScore = scamTotalScore / scamScoredCount
+	}
+	ipqsAvgScore := -1
+	if ipqsScoredCount > 0 {
+		ipqsAvgScore = ipqsTotalScore / ipqsScoredCount
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":           true,
-		"total_checked":     len(proxies),
-		"low_risk_count":    lowRiskCount,
-		"medium_risk_count": mediumRiskCount,
-		"high_risk_count":   highRiskCount,
-		"average_score":     avgScore,
-		"results":           results,
-		"source":            "Scamalytics",
+		"success":       true,
+		"total_checked": len(proxies),
+		"scamalytics": map[string]interface{}{
+			"low_risk_count":    scamLowRisk,
+			"medium_risk_count": scamMedRisk,
+			"high_risk_count":   scamHighRisk,
+			"average_score":     scamAvgScore,
+			"scored_count":      scamScoredCount,
+		},
+		"ipqualityscore": map[string]interface{}{
+			"low_risk_count":    ipqsLowRisk,
+			"medium_risk_count": ipqsMedRisk,
+			"high_risk_count":   ipqsHighRisk,
+			"average_score":     ipqsAvgScore,
+			"scored_count":      ipqsScoredCount,
+		},
+		"results": results,
 	})
 }
 
@@ -4535,7 +4701,7 @@ const healthPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Prox
 <style>` + baseStyles + `.health-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:20px}.proxy-card{background:white;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);border-left:4px solid #ccc}.proxy-card.healthy{border-left-color:#4caf50}.proxy-card.degraded{border-left-color:#ff9800}.proxy-card.unhealthy{border-left-color:#f44336}.proxy-card.unknown{border-left-color:#9e9e9e}.proxy-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}.proxy-name{font-size:1.2em;font-weight:bold;color:#333}.proxy-status{padding:5px 12px;border-radius:20px;font-size:0.85em;font-weight:600}.proxy-status.healthy{background:#e8f5e9;color:#2e7d32}.proxy-status.degraded{background:#fff3e0;color:#e65100}.proxy-status.unhealthy{background:#ffebee;color:#c62828}.proxy-status.unknown{background:#f5f5f5;color:#666}.proxy-stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}.proxy-stat{padding:10px;background:#f8f9fa;border-radius:8px}.proxy-stat-value{font-size:1.3em;font-weight:bold;color:#667eea}.proxy-stat-label{font-size:0.8em;color:#666;text-transform:uppercase}.progress-bar{height:8px;background:#e0e0e0;border-radius:4px;overflow:hidden;margin-top:10px}.progress-fill{height:100%;border-radius:4px;transition:width 0.3s}.progress-fill.good{background:#4caf50}.progress-fill.warning{background:#ff9800}.progress-fill.bad{background:#f44336}.last-error{margin-top:10px;padding:10px;background:#ffebee;border-radius:8px;font-size:0.85em;color:#c62828;word-break:break-all}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>💚 Proxy Health Monitor</h1><p>Real-time health status of all upstream proxies</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Total Proxies</div></div><div class="stat-card"><div class="stat-value" id="healthyProxies" style="color:#4caf50">-</div><div class="stat-label">Healthy</div></div><div class="stat-card"><div class="stat-value" id="degradedProxies" style="color:#ff9800">-</div><div class="stat-label">Degraded</div></div><div class="stat-card"><div class="stat-value" id="unhealthyProxies" style="color:#f44336">-</div><div class="stat-label">Unhealthy</div></div><div class="stat-card"><div class="stat-value" id="avgSuccessRate">-</div><div class="stat-label">Avg Success</div></div></div><div class="card"><h2>Proxy Status</h2><button class="btn btn-secondary" onclick="loadHealth()" style="float:right;margin-top:-45px">🔄 Refresh</button><div id="healthGrid" class="health-grid"><div class="loading">Loading...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-health').classList.add('active');function loadHealth(){fetch('/api/proxy-health').then(r=>r.json()).then(data=>{let healthy=0,degraded=0,unhealthy=0,totalRate=0;data.forEach(p=>{if(p.status==='healthy')healthy++;else if(p.status==='degraded')degraded++;else if(p.status==='unhealthy')unhealthy++;totalRate+=p.success_rate||0;});document.getElementById('totalProxies').textContent=data.length;document.getElementById('healthyProxies').textContent=healthy;document.getElementById('degradedProxies').textContent=degraded;document.getElementById('unhealthyProxies').textContent=unhealthy;document.getElementById('avgSuccessRate').textContent=data.length?(totalRate/data.length).toFixed(1)+'%':'-';document.getElementById('healthGrid').innerHTML=data.map(p=>{const rate=p.success_rate||0;const rateClass=rate>=95?'good':rate>=80?'warning':'bad';return'<div class="proxy-card '+p.status+'"><div class="proxy-header"><span class="proxy-name">#'+(p.index+1)+' – '+p.ip_address+'</span><span class="proxy-status '+p.status+'">'+p.status.toUpperCase()+'</span></div><div class="proxy-stats"><div class="proxy-stat"><div class="proxy-stat-value">'+formatNumber(p.total_requests)+'</div><div class="proxy-stat-label">Requests</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+rate.toFixed(1)+'%</div><div class="proxy-stat-label">Success Rate</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+formatNumber(p.success_count)+'</div><div class="proxy-stat-label">Success</div></div><div class="proxy-stat"><div class="proxy-stat-value" style="color:#c62828">'+formatNumber(p.failure_count)+'</div><div class="proxy-stat-label">Failures</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+(p.device_count||0)+'</div><div class="proxy-stat-label">Registered</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+p.active_devices+'</div><div class="proxy-stat-label">Active</div></div></div><div class="progress-bar"><div class="progress-fill '+rateClass+'" style="width:'+rate+'%"></div></div>'+(p.last_error?'<div class="last-error">Last error: '+p.last_error+'</div>':'')+'</div>';}).join('');});}loadHealth();setInterval(loadHealth,30000);</script></body></html>`
 
 const diagnosticsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Diagnostics</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.diag-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:20px}.diag-card{background:white;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);border-left:4px solid #ccc}.diag-card.healthy{border-left-color:#4caf50}.diag-card.degraded{border-left-color:#ff9800}.diag-card.broken{border-left-color:#f44336}.diag-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.diag-name{font-size:1.1em;font-weight:bold;color:#333}.diag-badge{padding:4px 10px;border-radius:15px;font-size:0.75em;font-weight:600;text-transform:uppercase}.diag-badge.healthy{background:#e8f5e9;color:#2e7d32}.diag-badge.degraded{background:#fff3e0;color:#e65100}.diag-badge.broken{background:#ffebee;color:#c62828}.diag-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px}.diag-stat{padding:8px;background:#f8f9fa;border-radius:6px;text-align:center}.diag-stat-value{font-size:1.1em;font-weight:bold;color:#667eea}.diag-stat-label{font-size:0.7em;color:#888;text-transform:uppercase}.diag-issue{padding:10px;background:#fff3e0;border-radius:8px;font-size:0.85em;color:#e65100;margin-top:10px}.diag-issue.broken{background:#ffebee;color:#c62828}.device-table{width:100%;border-collapse:collapse}.device-table th,.device-table td{padding:12px;text-align:left;border-bottom:1px solid #eee}.device-table th{background:#f5f5f5;font-weight:600;color:#555;font-size:0.85em;text-transform:uppercase}.device-table tr:hover{background:#f8f9ff}.usage-bar{height:20px;background:#e0e0e0;border-radius:10px;overflow:hidden;position:relative}.usage-bar-fill{height:100%;border-radius:10px;transition:width 0.3s}.usage-bar-label{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-size:0.75em;font-weight:600;color:#333}.tabs{display:flex;gap:5px;margin-bottom:20px}.tab{padding:10px 20px;background:#f5f5f5;border:none;border-radius:8px 8px 0 0;cursor:pointer;font-weight:600;color:#666}.tab.active{background:white;color:#667eea;box-shadow:0 -2px 10px rgba(0,0,0,0.05)}.tab-content{display:none}.tab-content.active{display:block}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>🔬 Diagnostics</h1><p>Proxy usage statistics and device health overview</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Total Proxies</div></div><div class="stat-card"><div class="stat-value" id="healthyCount" style="color:#4caf50">-</div><div class="stat-label">Healthy</div></div><div class="stat-card"><div class="stat-value" id="degradedCount" style="color:#ff9800">-</div><div class="stat-label">Degraded</div></div><div class="stat-card"><div class="stat-value" id="brokenCount" style="color:#f44336">-</div><div class="stat-label">Broken</div></div><div class="stat-card"><div class="stat-value" id="successRate">-</div><div class="stat-label">Success Rate</div></div></div><div class="tabs"><button class="tab active" onclick="showTab('proxies')">🌐 Proxy Status</button><button class="tab" onclick="showTab('usage')">📊 Usage Stats</button><button class="tab" onclick="showTab('devices')">📱 Device Health</button><button class="tab" onclick="showTab('trustscore')">🛡️ IP Trust Score</button></div><div class="card"><button class="btn btn-secondary" onclick="loadDiagnostics()" style="float:right;margin-top:-10px;margin-bottom:10px">🔄 Refresh</button><div id="proxies" class="tab-content active"><h2>Proxy Status</h2><p style="color:#666;margin-bottom:15px">Proxy health based on success rates</p><div id="diagGrid" class="diag-grid"><div class="loading">Loading...</div></div></div><div id="usage" class="tab-content"><h2>Proxy Usage Statistics</h2><p style="color:#666;margin-bottom:15px">Request distribution across all proxies</p><div id="usageStats"><div class="loading">Loading...</div></div></div><div id="devices" class="tab-content"><h2>Device Health Summary</h2><p style="color:#666;margin-bottom:15px">Top devices by activity with error rates</p><div id="deviceHealth"><div class="loading">Loading...</div></div></div><div id="trustscore" class="tab-content"><h2>IP Trust Score</h2><p style="color:#666;margin-bottom:15px">Check proxy IP fraud scores using Scamalytics. Lower scores indicate more trustworthy IPs (0-100 scale).</p><div style="margin-bottom:20px"><button class="btn btn-primary" id="checkTrustBtn" onclick="checkTrustScore()">🔍 Check All Proxy IPs</button><span id="trustStatus" style="margin-left:15px;color:#666"></span></div><div id="trustSummary" style="display:none;margin-bottom:20px"><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="trustTotal">-</div><div class="stat-label">Checked</div></div><div class="stat-card"><div class="stat-value" id="trustAvg" style="color:#667eea">-</div><div class="stat-label">Avg Score</div></div><div class="stat-card"><div class="stat-value" id="trustLow" style="color:#4caf50">-</div><div class="stat-label">Low Risk</div></div><div class="stat-card"><div class="stat-value" id="trustMed" style="color:#ff9800">-</div><div class="stat-label">Medium</div></div><div class="stat-card"><div class="stat-value" id="trustHigh" style="color:#f44336">-</div><div class="stat-label">High Risk</div></div></div></div><div id="trustResults"><div style="padding:30px;text-align:center;color:#888">Click the button above to check trust scores for all proxy IPs.</div></div></div></div></div><script>` + baseJS + `document.getElementById('nav-diagnostics').classList.add('active');function checkTrustScore(){const btn=document.getElementById('checkTrustBtn');const status=document.getElementById('trustStatus');btn.disabled=true;btn.textContent='Checking...';status.textContent='Fetching scores from Scamalytics (this may take a moment)...';fetch('/api/check-blacklist').then(r=>r.json()).then(data=>{btn.disabled=false;btn.textContent='🔍 Check All Proxy IPs';status.textContent='Last checked: '+new Date().toLocaleTimeString()+' (Source: '+data.source+')';document.getElementById('trustSummary').style.display='block';document.getElementById('trustTotal').textContent=data.total_checked;document.getElementById('trustAvg').textContent=data.average_score>=0?data.average_score:'-';document.getElementById('trustLow').textContent=data.low_risk_count||0;document.getElementById('trustMed').textContent=data.medium_risk_count||0;document.getElementById('trustHigh').textContent=data.high_risk_count||0;if(!data.results||!data.results.length){document.getElementById('trustResults').innerHTML='<div style="padding:30px;text-align:center;color:#888">No proxy IPs to check.</div>';return;}document.getElementById('trustResults').innerHTML='<table class="device-table"><thead><tr><th>Proxy</th><th>IP Address</th><th>Fraud Score</th><th>Risk Level</th></tr></thead><tbody>'+data.results.map(r=>{const score=r.available?r.score:'-';const risk=r.risk||'unknown';const scoreColor=risk==='low'?'#4caf50':risk==='medium'?'#ff9800':risk==='high'||risk==='very high'?'#c62828':'#666';const riskBadge=risk==='low'?'background:#e8f5e9;color:#2e7d32':risk==='medium'?'background:#fff3e0;color:#e65100':risk==='high'||risk==='very high'?'background:#ffebee;color:#c62828':'background:#f5f5f5;color:#666';return'<tr><td><strong>'+r.name+'</strong></td><td style="font-family:monospace">'+r.ip_address+'</td><td style="font-weight:bold;font-size:1.2em;color:'+scoreColor+'">'+score+'</td><td><span style="padding:4px 12px;border-radius:12px;font-size:0.85em;font-weight:600;'+riskBadge+'">'+risk.toUpperCase()+'</span>'+(r.error?' <span style="color:#999;font-size:0.8em">('+r.error+')</span>':'')+'</td></tr>';}).join('')+'</tbody></table><p style="margin-top:15px;color:#888;font-size:0.85em">Scores: 0-25 Low Risk | 26-50 Medium Risk | 51-75 High Risk | 76-100 Very High Risk</p>';}).catch(e=>{btn.disabled=false;btn.textContent='🔍 Check All Proxy IPs';status.textContent='Error: '+e.message;});}function showTab(id){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));document.getElementById(id).classList.add('active');event.target.classList.add('active');}function loadDiagnostics(){fetch('/api/diagnostics').then(r=>r.json()).then(data=>{const s=data.summary;document.getElementById('totalProxies').textContent=s.total_proxies;document.getElementById('healthyCount').textContent=s.healthy_proxies;document.getElementById('degradedCount').textContent=s.degraded_proxies;document.getElementById('brokenCount').textContent=s.broken_proxies;document.getElementById('successRate').textContent=s.overall_success_rate.toFixed(1)+'%';const diagGrid=document.getElementById('diagGrid');if(!data.proxies.length){diagGrid.innerHTML='<div class="loading">No proxy data available yet.</div>';return;}diagGrid.innerHTML=data.proxies.map(p=>{const issueClass=p.issue_type==='none'?'healthy':p.issue_type;const badgeText=p.issue_type==='none'?'Healthy':p.issue_type.charAt(0).toUpperCase()+p.issue_type.slice(1);return'<div class="diag-card '+issueClass+'"><div class="diag-header"><span class="diag-name">'+(p.name||'Proxy #'+(p.index+1))+'</span><span class="diag-badge '+issueClass+'">'+badgeText+'</span></div><div style="color:#888;font-size:0.85em;margin-bottom:10px">'+p.ip_address+'</div><div class="diag-stats"><div class="diag-stat"><div class="diag-stat-value">'+formatNumber(p.total_requests)+'</div><div class="diag-stat-label">Requests</div></div><div class="diag-stat"><div class="diag-stat-value">'+p.success_rate.toFixed(1)+'%</div><div class="diag-stat-label">Success</div></div><div class="diag-stat"><div class="diag-stat-value">'+(p.device_count||0)+'</div><div class="diag-stat-label">Registered</div></div></div>'+(p.issue_details?'<div class="diag-issue '+(p.issue_type==='broken'?'broken':'')+'">'+p.issue_details+'</div>':'')+'</div>';}).join('');const maxReqs=Math.max(...data.proxies.map(p=>p.total_requests));document.getElementById('usageStats').innerHTML='<table class="device-table"><thead><tr><th>Proxy</th><th>Requests</th><th>Usage</th><th>Data In</th><th>Data Out</th></tr></thead><tbody>'+data.proxies.map(p=>{const pct=maxReqs>0?(p.total_requests/maxReqs*100):0;const color=pct>66?'#4caf50':pct>33?'#ff9800':'#f44336';return'<tr><td><strong>'+(p.name||'Proxy #'+(p.index+1))+'</strong><br><span style="color:#888;font-size:0.85em">'+p.ip_address+'</span></td><td>'+formatNumber(p.total_requests)+'</td><td style="width:200px"><div class="usage-bar"><div class="usage-bar-fill" style="width:'+pct+'%;background:'+color+'"></div><div class="usage-bar-label">'+pct.toFixed(0)+'%</div></div></td><td>'+formatBytes(p.bytes_in)+'</td><td>'+formatBytes(p.bytes_out)+'</td></tr>';}).join('')+'</tbody></table>';const devices=data.devices.slice(0,20);document.getElementById('deviceHealth').innerHTML=devices.length?'<table class="device-table"><thead><tr><th>Device</th><th>Proxy</th><th>Requests</th><th>Errors</th><th>Error Rate</th><th>Data</th><th>Status</th></tr></thead><tbody>'+devices.map(d=>{const name=d.name||d.username||d.ip;const errColor=d.error_rate>5?'#c62828':d.error_rate>1?'#e65100':'#666';return'<tr><td><strong>'+name+'</strong><br><span style="color:#888;font-size:0.85em">'+d.ip+'</span></td><td>'+(d.proxy_name||'-')+'</td><td>'+formatNumber(d.request_count)+'</td><td style="color:'+errColor+'">'+formatNumber(d.error_count)+'</td><td style="color:'+errColor+'">'+d.error_rate.toFixed(2)+'%</td><td>↓'+formatBytes(d.bytes_in)+' ↑'+formatBytes(d.bytes_out)+'</td><td><span style="color:'+(d.is_active?'#4caf50':'#999')+'">'+(d.is_active?'● Active':'○ Inactive')+'</span></td></tr>';}).join('')+'</tbody></table>':'<div class="loading">No device data available.</div>';});}loadDiagnostics();setInterval(loadDiagnostics,30000);</script></body></html>`
+<style>` + baseStyles + `.diag-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:20px}.diag-card{background:white;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);border-left:4px solid #ccc}.diag-card.healthy{border-left-color:#4caf50}.diag-card.degraded{border-left-color:#ff9800}.diag-card.broken{border-left-color:#f44336}.diag-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.diag-name{font-size:1.1em;font-weight:bold;color:#333}.diag-badge{padding:4px 10px;border-radius:15px;font-size:0.75em;font-weight:600;text-transform:uppercase}.diag-badge.healthy{background:#e8f5e9;color:#2e7d32}.diag-badge.degraded{background:#fff3e0;color:#e65100}.diag-badge.broken{background:#ffebee;color:#c62828}.diag-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px}.diag-stat{padding:8px;background:#f8f9fa;border-radius:6px;text-align:center}.diag-stat-value{font-size:1.1em;font-weight:bold;color:#667eea}.diag-stat-label{font-size:0.7em;color:#888;text-transform:uppercase}.diag-issue{padding:10px;background:#fff3e0;border-radius:8px;font-size:0.85em;color:#e65100;margin-top:10px}.diag-issue.broken{background:#ffebee;color:#c62828}.device-table{width:100%;border-collapse:collapse}.device-table th,.device-table td{padding:12px;text-align:left;border-bottom:1px solid #eee}.device-table th{background:#f5f5f5;font-weight:600;color:#555;font-size:0.85em;text-transform:uppercase}.device-table tr:hover{background:#f8f9ff}.usage-bar{height:20px;background:#e0e0e0;border-radius:10px;overflow:hidden;position:relative}.usage-bar-fill{height:100%;border-radius:10px;transition:width 0.3s}.usage-bar-label{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-size:0.75em;font-weight:600;color:#333}.tabs{display:flex;gap:5px;margin-bottom:20px}.tab{padding:10px 20px;background:#f5f5f5;border:none;border-radius:8px 8px 0 0;cursor:pointer;font-weight:600;color:#666}.tab.active{background:white;color:#667eea;box-shadow:0 -2px 10px rgba(0,0,0,0.05)}.tab-content{display:none}.tab-content.active{display:block}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>🔬 Diagnostics</h1><p>Proxy usage statistics and device health overview</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Total Proxies</div></div><div class="stat-card"><div class="stat-value" id="healthyCount" style="color:#4caf50">-</div><div class="stat-label">Healthy</div></div><div class="stat-card"><div class="stat-value" id="degradedCount" style="color:#ff9800">-</div><div class="stat-label">Degraded</div></div><div class="stat-card"><div class="stat-value" id="brokenCount" style="color:#f44336">-</div><div class="stat-label">Broken</div></div><div class="stat-card"><div class="stat-value" id="successRate">-</div><div class="stat-label">Success Rate</div></div></div><div class="tabs"><button class="tab active" onclick="showTab('proxies')">🌐 Proxy Status</button><button class="tab" onclick="showTab('usage')">📊 Usage Stats</button><button class="tab" onclick="showTab('devices')">📱 Device Health</button><button class="tab" onclick="showTab('trustscore')">🛡️ IP Trust Score</button></div><div class="card"><button class="btn btn-secondary" onclick="loadDiagnostics()" style="float:right;margin-top:-10px;margin-bottom:10px">🔄 Refresh</button><div id="proxies" class="tab-content active"><h2>Proxy Status</h2><p style="color:#666;margin-bottom:15px">Proxy health based on success rates</p><div id="diagGrid" class="diag-grid"><div class="loading">Loading...</div></div></div><div id="usage" class="tab-content"><h2>Proxy Usage Statistics</h2><p style="color:#666;margin-bottom:15px">Request distribution across all proxies</p><div id="usageStats"><div class="loading">Loading...</div></div></div><div id="devices" class="tab-content"><h2>Device Health Summary</h2><p style="color:#666;margin-bottom:15px">Top devices by activity with error rates</p><div id="deviceHealth"><div class="loading">Loading...</div></div></div><div id="trustscore" class="tab-content"><h2>IP Trust Score</h2><p style="color:#666;margin-bottom:15px">Check proxy IP fraud scores from Scamalytics and IPQualityScore. Lower scores indicate more trustworthy IPs (0-100 scale).</p><div style="margin-bottom:20px"><button class="btn btn-primary" id="checkTrustBtn" onclick="checkTrustScore()">🔍 Check All Proxy IPs</button><span id="trustStatus" style="margin-left:15px;color:#666"></span></div><div id="trustSummary" style="display:none;margin-bottom:20px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:20px"><div style="background:#f8f9fa;padding:15px;border-radius:10px"><h4 style="margin:0 0 10px;color:#667eea">📊 Scamalytics</h4><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center"><div><div style="font-size:1.3em;font-weight:bold;color:#667eea" id="scamAvg">-</div><div style="font-size:0.75em;color:#888">Avg Score</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#4caf50" id="scamLow">-</div><div style="font-size:0.75em;color:#888">Low Risk</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#ff9800" id="scamMed">-</div><div style="font-size:0.75em;color:#888">Medium</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#f44336" id="scamHigh">-</div><div style="font-size:0.75em;color:#888">High Risk</div></div></div></div><div style="background:#f8f9fa;padding:15px;border-radius:10px"><h4 style="margin:0 0 10px;color:#9c27b0">📊 IPQualityScore</h4><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center"><div><div style="font-size:1.3em;font-weight:bold;color:#9c27b0" id="ipqsAvg">-</div><div style="font-size:0.75em;color:#888">Avg Score</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#4caf50" id="ipqsLow">-</div><div style="font-size:0.75em;color:#888">Low Risk</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#ff9800" id="ipqsMed">-</div><div style="font-size:0.75em;color:#888">Medium</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#f44336" id="ipqsHigh">-</div><div style="font-size:0.75em;color:#888">High Risk</div></div></div></div></div><div style="text-align:center;margin-top:10px;font-size:0.9em;color:#666"><span id="trustTotal">0</span> proxies checked</div></div><div id="trustResults"><div style="padding:30px;text-align:center;color:#888">Click the button above to check trust scores for all proxy IPs.</div></div></div></div></div><script>` + baseJS + `document.getElementById('nav-diagnostics').classList.add('active');function checkTrustScore(){const btn=document.getElementById('checkTrustBtn');const status=document.getElementById('trustStatus');btn.disabled=true;btn.textContent='Checking...';status.textContent='Fetching scores from Scamalytics and IPQualityScore...';fetch('/api/check-blacklist').then(r=>r.json()).then(data=>{btn.disabled=false;btn.textContent='🔍 Check All Proxy IPs';status.textContent='Last checked: '+new Date().toLocaleTimeString();document.getElementById('trustSummary').style.display='block';document.getElementById('trustTotal').textContent=data.total_checked;const scam=data.scamalytics||{};const ipqs=data.ipqualityscore||{};document.getElementById('scamAvg').textContent=scam.average_score>=0?scam.average_score:'-';document.getElementById('scamLow').textContent=scam.low_risk_count||0;document.getElementById('scamMed').textContent=scam.medium_risk_count||0;document.getElementById('scamHigh').textContent=scam.high_risk_count||0;document.getElementById('ipqsAvg').textContent=ipqs.average_score>=0?ipqs.average_score:'-';document.getElementById('ipqsLow').textContent=ipqs.low_risk_count||0;document.getElementById('ipqsMed').textContent=ipqs.medium_risk_count||0;document.getElementById('ipqsHigh').textContent=ipqs.high_risk_count||0;if(!data.results||!data.results.length){document.getElementById('trustResults').innerHTML='<div style="padding:30px;text-align:center;color:#888">No proxy IPs to check.</div>';return;}function getScoreDisplay(src){if(!src||!src.available)return{score:'-',color:'#666',badge:'background:#f5f5f5;color:#666',risk:'N/A',error:src?src.error:''};const score=src.score;const risk=src.risk||'unknown';const color=risk==='low'?'#4caf50':risk==='medium'?'#ff9800':risk==='high'||risk==='very high'?'#c62828':'#666';const badge=risk==='low'?'background:#e8f5e9;color:#2e7d32':risk==='medium'?'background:#fff3e0;color:#e65100':risk==='high'||risk==='very high'?'background:#ffebee;color:#c62828':'background:#f5f5f5;color:#666';return{score:score,color:color,badge:badge,risk:risk.toUpperCase(),error:''};}document.getElementById('trustResults').innerHTML='<table class="device-table"><thead><tr><th>Proxy</th><th>IP Address</th><th style="text-align:center">Scamalytics</th><th style="text-align:center">IPQualityScore</th></tr></thead><tbody>'+data.results.map(r=>{const s=getScoreDisplay(r.scamalytics);const i=getScoreDisplay(r.ipqualityscore);return'<tr><td><strong>'+r.name+'</strong></td><td style="font-family:monospace">'+r.ip_address+'</td><td style="text-align:center"><div style="font-weight:bold;font-size:1.3em;color:'+s.color+'">'+s.score+'</div><span style="padding:2px 8px;border-radius:10px;font-size:0.75em;font-weight:600;'+s.badge+'">'+s.risk+'</span>'+(r.scamalytics&&r.scamalytics.error?' <div style="color:#999;font-size:0.7em;margin-top:3px">'+r.scamalytics.error+'</div>':'')+'</td><td style="text-align:center"><div style="font-weight:bold;font-size:1.3em;color:'+i.color+'">'+i.score+'</div><span style="padding:2px 8px;border-radius:10px;font-size:0.75em;font-weight:600;'+i.badge+'">'+i.risk+'</span>'+(r.ipqualityscore&&r.ipqualityscore.error?' <div style="color:#999;font-size:0.7em;margin-top:3px">'+r.ipqualityscore.error+'</div>':'')+'</td></tr>';}).join('')+'</tbody></table><p style="margin-top:15px;color:#888;font-size:0.85em">Scores: 0-25 Low Risk | 26-50 Medium | 51-75 High | 76-100 Very High (lower is better)</p>';}).catch(e=>{btn.disabled=false;btn.textContent='🔍 Check All Proxy IPs';status.textContent='Error: '+e.message;});}function showTab(id){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));document.getElementById(id).classList.add('active');event.target.classList.add('active');}function loadDiagnostics(){fetch('/api/diagnostics').then(r=>r.json()).then(data=>{const s=data.summary;document.getElementById('totalProxies').textContent=s.total_proxies;document.getElementById('healthyCount').textContent=s.healthy_proxies;document.getElementById('degradedCount').textContent=s.degraded_proxies;document.getElementById('brokenCount').textContent=s.broken_proxies;document.getElementById('successRate').textContent=s.overall_success_rate.toFixed(1)+'%';const diagGrid=document.getElementById('diagGrid');if(!data.proxies.length){diagGrid.innerHTML='<div class="loading">No proxy data available yet.</div>';return;}diagGrid.innerHTML=data.proxies.map(p=>{const issueClass=p.issue_type==='none'?'healthy':p.issue_type;const badgeText=p.issue_type==='none'?'Healthy':p.issue_type.charAt(0).toUpperCase()+p.issue_type.slice(1);return'<div class="diag-card '+issueClass+'"><div class="diag-header"><span class="diag-name">'+(p.name||'Proxy #'+(p.index+1))+'</span><span class="diag-badge '+issueClass+'">'+badgeText+'</span></div><div style="color:#888;font-size:0.85em;margin-bottom:10px">'+p.ip_address+'</div><div class="diag-stats"><div class="diag-stat"><div class="diag-stat-value">'+formatNumber(p.total_requests)+'</div><div class="diag-stat-label">Requests</div></div><div class="diag-stat"><div class="diag-stat-value">'+p.success_rate.toFixed(1)+'%</div><div class="diag-stat-label">Success</div></div><div class="diag-stat"><div class="diag-stat-value">'+(p.device_count||0)+'</div><div class="diag-stat-label">Registered</div></div></div>'+(p.issue_details?'<div class="diag-issue '+(p.issue_type==='broken'?'broken':'')+'">'+p.issue_details+'</div>':'')+'</div>';}).join('');const maxReqs=Math.max(...data.proxies.map(p=>p.total_requests));document.getElementById('usageStats').innerHTML='<table class="device-table"><thead><tr><th>Proxy</th><th>Requests</th><th>Usage</th><th>Data In</th><th>Data Out</th></tr></thead><tbody>'+data.proxies.map(p=>{const pct=maxReqs>0?(p.total_requests/maxReqs*100):0;const color=pct>66?'#4caf50':pct>33?'#ff9800':'#f44336';return'<tr><td><strong>'+(p.name||'Proxy #'+(p.index+1))+'</strong><br><span style="color:#888;font-size:0.85em">'+p.ip_address+'</span></td><td>'+formatNumber(p.total_requests)+'</td><td style="width:200px"><div class="usage-bar"><div class="usage-bar-fill" style="width:'+pct+'%;background:'+color+'"></div><div class="usage-bar-label">'+pct.toFixed(0)+'%</div></div></td><td>'+formatBytes(p.bytes_in)+'</td><td>'+formatBytes(p.bytes_out)+'</td></tr>';}).join('')+'</tbody></table>';const devices=data.devices.slice(0,20);document.getElementById('deviceHealth').innerHTML=devices.length?'<table class="device-table"><thead><tr><th>Device</th><th>Proxy</th><th>Requests</th><th>Errors</th><th>Error Rate</th><th>Data</th><th>Status</th></tr></thead><tbody>'+devices.map(d=>{const name=d.name||d.username||d.ip;const errColor=d.error_rate>5?'#c62828':d.error_rate>1?'#e65100':'#666';return'<tr><td><strong>'+name+'</strong><br><span style="color:#888;font-size:0.85em">'+d.ip+'</span></td><td>'+(d.proxy_name||'-')+'</td><td>'+formatNumber(d.request_count)+'</td><td style="color:'+errColor+'">'+formatNumber(d.error_count)+'</td><td style="color:'+errColor+'">'+d.error_rate.toFixed(2)+'%</td><td>↓'+formatBytes(d.bytes_in)+' ↑'+formatBytes(d.bytes_out)+'</td><td><span style="color:'+(d.is_active?'#4caf50':'#999')+'">'+(d.is_active?'● Active':'○ Inactive')+'</span></td></tr>';}).join('')+'</tbody></table>':'<div class="loading">No device data available.</div>';});}loadDiagnostics();setInterval(loadDiagnostics,30000);</script></body></html>`
 
 const analyticsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Analytics</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>` + baseStyles + `.chart-container{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px;overflow:visible}.chart-container h2{margin-bottom:20px}.chart{width:100%;position:relative}.chart-bars{display:flex;align-items:flex-end;height:200px;gap:2px;padding:0 10px;border-bottom:2px solid #e0e0e0}.chart-bar{flex:1;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);border-radius:4px 4px 0 0;min-width:2px;max-width:40px;position:relative;transition:height 0.3s}.chart-bar:hover{opacity:0.8}.chart-bar .tooltip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:#333;color:white;padding:5px 10px;border-radius:4px;font-size:0.8em;white-space:nowrap;opacity:0;transition:opacity 0.2s;pointer-events:none;z-index:10}.chart-bar:hover .tooltip{opacity:1}.chart-labels{display:flex;padding:15px 10px 5px;justify-content:space-between}.chart-label{font-size:0.85em;color:#555;font-weight:500}.time-range{text-align:center;color:#888;font-size:0.9em;margin-top:5px}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📊 Traffic Analytics</h1><p>Historical traffic data and trends</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalData">-</div><div class="stat-label">Total Data</div></div><div class="stat-card"><div class="stat-value" id="totalReqs">-</div><div class="stat-label">Total Requests</div></div><div class="stat-card"><div class="stat-value" id="peakDevices">-</div><div class="stat-label">Peak Devices</div></div><div class="stat-card"><div class="stat-value" id="errorRate">-</div><div class="stat-label">Error Rate</div></div></div><div class="chart-container"><h2>📈 Traffic Over Time</h2><button class="btn btn-secondary" onclick="loadAnalytics()" style="float:right;margin-top:-45px">🔄 Refresh</button><div class="chart"><div class="chart-bars" id="trafficBars"></div><div class="chart-labels" id="trafficLabels"></div><div class="time-range" id="trafficRange"></div></div></div><div class="chart-container"><h2>📊 Active Devices Over Time</h2><div class="chart"><div class="chart-bars" id="deviceBars"></div><div class="chart-labels" id="deviceLabels"></div><div class="time-range" id="deviceRange"></div></div></div></div><script>` + baseJS + `document.getElementById('nav-analytics').classList.add('active');function formatDateTime(d){const date=new Date(d);const day=date.getDate();const month=date.toLocaleString('default',{month:'short'});const time=date.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});return month+' '+day+', '+time;}function loadAnalytics(){fetch('/api/traffic-history').then(r=>r.json()).then(data=>{if(!data||!data.length){document.getElementById('trafficBars').innerHTML='<div class="loading">No data yet. Traffic data is collected every 5 minutes.</div>';return;}const totalBytes=data.reduce((a,d)=>a+(d.total_bytes_in||0)+(d.total_bytes_out||0),0);const totalReqs=data.length>0?data[data.length-1].total_requests:0;const peakDevices=Math.max(...data.map(d=>d.active_devices||0));const totalErrors=data.length>0?data[data.length-1].error_count:0;const errorRate=totalReqs>0?((totalErrors/totalReqs)*100).toFixed(2)+'%':'0%';document.getElementById('totalData').textContent=formatBytes(totalBytes);document.getElementById('totalReqs').textContent=formatNumber(totalReqs);document.getElementById('peakDevices').textContent=peakDevices;document.getElementById('errorRate').textContent=errorRate;const maxBytes=Math.max(...data.map(d=>(d.total_bytes_in||0)+(d.total_bytes_out||0)));const maxDevices=Math.max(...data.map(d=>d.active_devices||0));document.getElementById('trafficBars').innerHTML=data.map(d=>{const bytes=(d.total_bytes_in||0)+(d.total_bytes_out||0);const h=maxBytes>0?(bytes/maxBytes*180):5;return'<div class="chart-bar" style="height:'+h+'px"><span class="tooltip">'+formatDateTime(d.timestamp)+'<br>'+formatBytes(bytes)+'</span></div>';}).join('');const first=new Date(data[0].timestamp);const last=new Date(data[data.length-1].timestamp);document.getElementById('trafficLabels').innerHTML='<span class="chart-label">'+formatDateTime(first)+'</span><span class="chart-label">'+formatDateTime(last)+'</span>';document.getElementById('trafficRange').textContent='Showing '+data.length+' data points over '+(Math.round((last-first)/(1000*60*60)))+' hours';document.getElementById('deviceBars').innerHTML=data.map(d=>{const h=maxDevices>0?(d.active_devices/maxDevices*180):5;return'<div class="chart-bar" style="height:'+h+'px;background:linear-gradient(135deg,#4caf50 0%,#2e7d32 100%)"><span class="tooltip">'+formatDateTime(d.timestamp)+'<br>'+d.active_devices+' devices</span></div>';}).join('');document.getElementById('deviceLabels').innerHTML='<span class="chart-label">'+formatDateTime(first)+'</span><span class="chart-label">'+formatDateTime(last)+'</span>';document.getElementById('deviceRange').textContent='Peak: '+peakDevices+' devices';});}loadAnalytics();setInterval(loadAnalytics,60000);</script></body></html>`
