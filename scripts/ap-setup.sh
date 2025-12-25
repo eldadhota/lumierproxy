@@ -1,11 +1,13 @@
 #!/bin/bash
 #
-# LumierProxy Access Point Setup Script
+# LumierProxy Access Point Setup Script (WPAD/PAC Mode)
 # This script configures your PC as a gateway for the UniFi AP
 #
 # Network: 10.10.10.0/24 (isolated from your office 192.168.50.x network)
 # Gateway: 10.10.10.1 (your PC, on TP-Link UE300 adapter)
 # DHCP:    10.10.10.100 - 10.10.10.200
+#
+# Proxy auto-configuration via WPAD/PAC - devices auto-configure proxy settings
 #
 
 set -e
@@ -26,6 +28,7 @@ AP_NETWORK="10.10.10.0/24"
 DHCP_START="10.10.10.100"
 DHCP_END="10.10.10.200"
 PROXY_PORT="8888"
+DASHBOARD_PORT="8080"
 DHCP_LEASE_FILE="/var/lib/lumier/dnsmasq.leases"
 DNSMASQ_CONFIG="/etc/lumier/dnsmasq-ap.conf"
 LUMIER_DIR="/etc/lumier"
@@ -110,10 +113,10 @@ configure_interface() {
 }
 
 create_dnsmasq_config() {
-    print_status "Creating dnsmasq configuration..."
+    print_status "Creating dnsmasq configuration with WPAD support..."
 
     cat > "$DNSMASQ_CONFIG" << EOF
-# LumierProxy AP DHCP Configuration
+# LumierProxy AP DHCP Configuration (WPAD/PAC Mode)
 # Generated: $(date)
 
 # Interface to listen on
@@ -136,6 +139,10 @@ dhcp-option=3,$AP_GATEWAY
 # DNS server (this PC, will forward to upstream)
 dhcp-option=6,$AP_GATEWAY
 
+# WPAD - Web Proxy Auto-Discovery (Option 252)
+# Tells devices to fetch proxy configuration from this URL
+dhcp-option=252,http://$AP_GATEWAY:$DASHBOARD_PORT/wpad.dat
+
 # Lease file (monitored by LumierProxy for device detection)
 dhcp-leasefile=$DHCP_LEASE_FILE
 
@@ -155,11 +162,11 @@ domain-needed
 bogus-priv
 EOF
 
-    print_success "dnsmasq configuration created at $DNSMASQ_CONFIG"
+    print_success "dnsmasq configuration created with WPAD at $DNSMASQ_CONFIG"
 }
 
 configure_iptables() {
-    print_status "Configuring iptables (STRICT MODE - no traffic leaks)..."
+    print_status "Configuring iptables (WPAD/PAC MODE - explicit proxy)..."
 
     # Enable IP forwarding
     echo 1 > /proc/sys/net/ipv4/ip_forward
@@ -179,17 +186,10 @@ configure_iptables() {
     iptables -N LUMIER_INPUT
 
     # === NAT TABLE ===
-    # Redirect HTTP traffic to transparent proxy
-    iptables -t nat -A LUMIER_NAT -i "$AP_INTERFACE" -p tcp --dport 80 -j REDIRECT --to-port $PROXY_PORT
-
-    # Redirect HTTPS traffic to transparent proxy
-    iptables -t nat -A LUMIER_NAT -i "$AP_INTERFACE" -p tcp --dport 443 -j REDIRECT --to-port $PROXY_PORT
-
-    # NAT for traffic going to internet (after proxy processing)
+    # NAT for traffic going to internet (from proxy server to WAN)
     iptables -t nat -A LUMIER_NAT -o "$WAN_INTERFACE" -j MASQUERADE
 
-    # Insert our NAT chain into PREROUTING and POSTROUTING
-    iptables -t nat -I PREROUTING -j LUMIER_NAT
+    # Insert our NAT chain into POSTROUTING
     iptables -t nat -I POSTROUTING -j LUMIER_NAT
 
     # === FILTER TABLE - INPUT ===
@@ -199,6 +199,9 @@ configure_iptables() {
     # Allow DNS requests from AP clients
     iptables -A LUMIER_INPUT -i "$AP_INTERFACE" -p udp --dport 53 -j ACCEPT
     iptables -A LUMIER_INPUT -i "$AP_INTERFACE" -p tcp --dport 53 -j ACCEPT
+
+    # Allow HTTP to gateway (for PAC file / WPAD)
+    iptables -A LUMIER_INPUT -i "$AP_INTERFACE" -p tcp --dport $DASHBOARD_PORT -j ACCEPT
 
     # Allow proxy connections from AP clients
     iptables -A LUMIER_INPUT -i "$AP_INTERFACE" -p tcp --dport $PROXY_PORT -j ACCEPT
@@ -213,14 +216,12 @@ configure_iptables() {
     iptables -I INPUT -j LUMIER_INPUT
 
     # === FILTER TABLE - FORWARD ===
-    # CRITICAL: Only allow forwarding from proxy server, not direct from clients
+    # CRITICAL: Block all direct forwarding from AP clients
+    # Devices MUST use the explicit proxy - no direct internet access
     # Allow established connections (responses to proxy requests)
     iptables -A LUMIER_FORWARD -i "$WAN_INTERFACE" -o "$AP_INTERFACE" -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-    # Allow traffic from proxy (local) to internet
-    iptables -A LUMIER_FORWARD -i "$AP_INTERFACE" -o "$WAN_INTERFACE" -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-    # DROP all other forwarding (prevents clients from bypassing proxy)
+    # DROP all forwarding from AP interface (no direct internet for clients)
     iptables -A LUMIER_FORWARD -i "$AP_INTERFACE" -j DROP
 
     # Insert our FORWARD chain
@@ -230,11 +231,11 @@ configure_iptables() {
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4
 
-    print_success "iptables configured (STRICT MODE - all traffic must go through proxy)"
+    print_success "iptables configured (WPAD/PAC MODE - devices must use proxy)"
 }
 
 start_dnsmasq() {
-    print_status "Starting dnsmasq for DHCP..."
+    print_status "Starting dnsmasq for DHCP with WPAD..."
 
     # Kill any existing dnsmasq for our config
     pkill -f "dnsmasq.*dnsmasq-ap.conf" 2>/dev/null || true
@@ -243,7 +244,7 @@ start_dnsmasq() {
     # Start dnsmasq with our config
     dnsmasq --conf-file="$DNSMASQ_CONFIG" --pid-file=/var/run/lumier-dnsmasq.pid
 
-    print_success "dnsmasq started"
+    print_success "dnsmasq started with WPAD support"
 }
 
 create_systemd_service() {
@@ -251,7 +252,7 @@ create_systemd_service() {
 
     cat > /etc/systemd/system/lumier-ap.service << EOF
 [Unit]
-Description=LumierProxy Access Point Network
+Description=LumierProxy Access Point Network (WPAD/PAC Mode)
 After=network.target
 Before=lumierproxy.service
 
@@ -275,7 +276,7 @@ save_config() {
     print_status "Saving configuration..."
 
     cat > "$LUMIER_DIR/ap-config.env" << EOF
-# LumierProxy AP Configuration
+# LumierProxy AP Configuration (WPAD/PAC Mode)
 # Generated: $(date)
 AP_INTERFACE=$AP_INTERFACE
 WAN_INTERFACE=$WAN_INTERFACE
@@ -284,7 +285,9 @@ AP_NETWORK=$AP_NETWORK
 DHCP_START=$DHCP_START
 DHCP_END=$DHCP_END
 PROXY_PORT=$PROXY_PORT
+DASHBOARD_PORT=$DASHBOARD_PORT
 DHCP_LEASE_FILE=$DHCP_LEASE_FILE
+WPAD_URL=http://$AP_GATEWAY:$DASHBOARD_PORT/wpad.dat
 EOF
 
     print_success "Configuration saved to $LUMIER_DIR/ap-config.env"
@@ -293,7 +296,7 @@ EOF
 show_status() {
     echo ""
     echo "========================================"
-    echo "       AP NETWORK SETUP COMPLETE"
+    echo "   AP NETWORK SETUP COMPLETE (WPAD/PAC)"
     echo "========================================"
     echo ""
     echo "Network Configuration:"
@@ -302,6 +305,11 @@ show_status() {
     echo "  Gateway IP:      $AP_GATEWAY"
     echo "  DHCP Range:      $DHCP_START - $DHCP_END"
     echo "  Proxy Port:      $PROXY_PORT"
+    echo "  Dashboard Port:  $DASHBOARD_PORT"
+    echo ""
+    echo "WPAD/PAC Auto-Configuration:"
+    echo "  PAC URL:         http://$AP_GATEWAY:$DASHBOARD_PORT/wpad.dat"
+    echo "  Devices will auto-configure proxy settings via DHCP"
     echo ""
     echo "Files Created:"
     echo "  DHCP Config:     $DNSMASQ_CONFIG"
@@ -309,9 +317,9 @@ show_status() {
     echo "  Saved Config:    $LUMIER_DIR/ap-config.env"
     echo ""
     echo "Security:"
-    echo "  - All HTTP/HTTPS traffic redirected to proxy"
-    echo "  - Direct internet access BLOCKED"
-    echo "  - Only DHCP, DNS, and proxy traffic allowed"
+    echo "  - Devices auto-configure proxy via WPAD/PAC"
+    echo "  - Direct internet access BLOCKED (must use proxy)"
+    echo "  - Only DHCP, DNS, dashboard, and proxy traffic allowed"
     echo ""
     echo "Next Steps:"
     echo "  1. Connect UniFi AP to $AP_INTERFACE via PoE injector"
@@ -329,7 +337,7 @@ show_status() {
 main() {
     echo ""
     echo "========================================"
-    echo "   LumierProxy AP Setup Script"
+    echo "   LumierProxy AP Setup (WPAD/PAC Mode)"
     echo "========================================"
     echo ""
 

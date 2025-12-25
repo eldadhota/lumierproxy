@@ -1816,6 +1816,10 @@ func startDashboard() {
 	http.HandleFunc("/api/logout", handleLogoutAPI)
 	http.HandleFunc("/api/session-check", handleSessionCheckAPI)
 
+	// WPAD/PAC file for proxy auto-configuration (no auth required - devices need this)
+	http.HandleFunc("/wpad.dat", handleWPAD)
+	http.HandleFunc("/proxy.pac", handleWPAD) // Alternative PAC file name
+
 	// Access Point management API
 	http.HandleFunc("/access-point", server.requireAuth(handleAccessPointPage))
 	http.HandleFunc("/api/ap/status", server.requireAuth(handleAPStatusAPI))
@@ -2408,6 +2412,50 @@ func handleAPHTTP(w http.ResponseWriter, r *http.Request, device *APDevice, prox
 	server.recordProxySuccess(device.ProxyIndex, duration, 0, bytesOut)
 
 	server.addLog("debug", fmt.Sprintf("[AP] HTTP %s -> %s via %s (%d bytes)", device.Hostname, r.Host, proxyName, bytesOut))
+}
+
+// handleWPAD serves the WPAD/PAC file for automatic proxy configuration
+// This allows devices on the AP network to automatically configure proxy settings
+func handleWPAD(w http.ResponseWriter, r *http.Request) {
+	// Get the client IP to check if it's from the AP network
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	// Log the PAC file request
+	server.addLog("info", fmt.Sprintf("[WPAD] PAC file requested by %s", clientIP))
+
+	// Get gateway IP from config, default to 10.10.10.1
+	gatewayIP := server.apConfig.IPAddress
+	if gatewayIP == "" {
+		gatewayIP = "10.10.10.1"
+	}
+
+	// Proxy port (default 8888)
+	proxyPort := 8888
+
+	// Generate PAC file content
+	// This JavaScript function tells browsers/apps how to route traffic
+	pacContent := fmt.Sprintf(`function FindProxyForURL(url, host) {
+    // Don't proxy local addresses
+    if (isPlainHostName(host) ||
+        shExpMatch(host, "*.local") ||
+        isInNet(dnsResolve(host), "10.0.0.0", "255.0.0.0") ||
+        isInNet(dnsResolve(host), "172.16.0.0", "255.240.0.0") ||
+        isInNet(dnsResolve(host), "192.168.0.0", "255.255.0.0") ||
+        isInNet(dnsResolve(host), "127.0.0.0", "255.0.0.0")) {
+        return "DIRECT";
+    }
+
+    // Route all other traffic through the proxy
+    return "PROXY %s:%d";
+}
+`, gatewayIP, proxyPort)
+
+	// Set appropriate headers for PAC file
+	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
+	w.Header().Set("Content-Disposition", "inline; filename=\"wpad.dat\"")
+	w.Header().Set("Cache-Control", "max-age=3600") // Cache for 1 hour
+
+	w.Write([]byte(pacContent))
 }
 
 // handleAccessPointPage serves the Access Point management page
