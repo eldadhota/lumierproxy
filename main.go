@@ -129,6 +129,9 @@ type PersistentData struct {
 	Supervisors     []Supervisor            `json:"supervisors"`
 	AdminPassword   string                  `json:"admin_password"`
 	ProxyNames      map[int]string          `json:"proxy_names"` // Custom names for proxies (index -> name)
+	// Access Point data
+	APConfig  APConfig              `json:"ap_config"`
+	APDevices map[string]*APDevice  `json:"ap_devices"` // keyed by MAC address
 }
 
 type Supervisor struct {
@@ -140,6 +143,46 @@ type SystemSettings struct {
 	SessionTimeout       int `json:"session_timeout_hours"`
 	TrafficRetentionDays int `json:"traffic_retention_days"`
 	DeviceTimeoutMinutes int `json:"device_timeout_minutes"`
+}
+
+// ============================================================================
+// ACCESS POINT DATA STRUCTURES
+// ============================================================================
+
+// APDevice represents a device connected via the WiFi access point
+type APDevice struct {
+	MAC           string    `json:"mac"`            // Primary identifier
+	IP            string    `json:"ip"`             // Current IP from DHCP
+	Hostname      string    `json:"hostname"`       // Hostname from DHCP lease
+	UpstreamProxy string    `json:"upstream_proxy"` // Assigned proxy string
+	ProxyIndex    int       `json:"proxy_index"`    // Index in proxy pool
+	FirstSeen     time.Time `json:"first_seen"`
+	LastSeen      time.Time `json:"last_seen"`
+	Status        string    `json:"status"`        // online/offline
+	Confirmed     bool      `json:"confirmed"`     // Must be true to access internet
+	ConfirmedAt   time.Time `json:"confirmed_at"`  // When device was approved
+	ConfirmedBy   string    `json:"confirmed_by"`  // Who approved the device
+	BytesIn       int64     `json:"bytes_in"`
+	BytesOut      int64     `json:"bytes_out"`
+	RequestCount  int64     `json:"request_count"`
+	Group         string    `json:"group"`
+	CustomName    string    `json:"custom_name"`
+	Notes         string    `json:"notes"`
+	ErrorCount    int64     `json:"error_count"`
+	LastError     string    `json:"last_error"`
+	LastErrorTime time.Time `json:"last_error_time"`
+}
+
+// APConfig stores access point network configuration
+type APConfig struct {
+	Enabled      bool   `json:"enabled"`
+	Interface    string `json:"interface"`     // eth0 (TP-Link UE300)
+	WANInterface string `json:"wan_interface"` // Internet interface
+	IPAddress    string `json:"ip_address"`    // 10.10.10.1
+	Netmask      string `json:"netmask"`       // 255.255.255.0
+	DHCPStart    string `json:"dhcp_start"`    // 10.10.10.100
+	DHCPEnd      string `json:"dhcp_end"`      // 10.10.10.200
+	LeaseFile    string `json:"lease_file"`    // /var/lib/lumier/dnsmasq.leases
 }
 
 // ============================================================================
@@ -242,7 +285,6 @@ type ProxyServer struct {
 	persistMu       sync.RWMutex
 	dataFile        string
 	sessions        map[string]*Session
-	appSessions     map[string]*Session
 	sessionMu       sync.RWMutex
 	startTime        time.Time
 	logBuffer        []LogEntry
@@ -253,6 +295,11 @@ type ProxyServer struct {
 	deviceActivityMu   sync.RWMutex
 	deviceConnections  map[string][]DeviceConnection // keyed by device IP - recent connections
 	deviceConnectionMu sync.RWMutex
+	// Access Point fields
+	apDevices      map[string]*APDevice // keyed by MAC address (runtime copy)
+	apMu           sync.RWMutex
+	apConfig       APConfig
+	apPoolIndex    int // For round-robin proxy assignment to new AP devices
 }
 
 type LogEntry struct {
@@ -455,17 +502,29 @@ func main() {
 		requireRegister: requireRegister,
 		dataFile:        "device_data.json",
 		sessions:        make(map[string]*Session),
-		appSessions:     make(map[string]*Session),
 		startTime:         time.Now(),
 		logBuffer:         make([]LogEntry, 0, 1000),
 		deviceActivity:    make(map[string][]DeviceActivity),
 		deviceConnections: make(map[string][]DeviceConnection),
+		// Access Point initialization
+		apDevices: make(map[string]*APDevice),
+		apConfig: APConfig{
+			Enabled:      true,
+			Interface:    "eth0",
+			WANInterface: "wlan0",
+			IPAddress:    "10.10.10.1",
+			Netmask:      "255.255.255.0",
+			DHCPStart:    "10.10.10.100",
+			DHCPEnd:      "10.10.10.200",
+			LeaseFile:    "/var/lib/lumier/dnsmasq.leases",
+		},
 		persistentData: PersistentData{
 			DeviceConfigs:   make(map[string]DeviceConfig),
 			Groups:          []string{"Default", "Floor 1", "Floor 2", "Team A", "Team B"},
 			Users:           []UserCredentials{},
 			TrafficHistory:  []TrafficSnapshot{},
 			ProxyHealthData: make(map[int]*ProxyHealth),
+			APDevices:       make(map[string]*APDevice),
 			SystemSettings: SystemSettings{
 				SessionTimeout:       2, // 2 hours default WiFi session timeout
 				TrafficRetentionDays: 7,
@@ -477,15 +536,16 @@ func main() {
 	server.loadPersistentData()
 	server.restoreDevicesFromConfig() // Restore devices so IP-based lookup works after restart
 	server.initializeProxyHealth()
+	server.restoreAPDevices() // Restore AP devices from persistent data
 
 	if len(server.persistentData.Users) == 0 {
 		server.createDefaultAdmin()
 	}
 
 	if len(server.proxyPool) == 0 {
-		log.Println("⚠️  WARNING: No upstream proxies loaded!")
+		log.Println("WARNING: No upstream proxies loaded!")
 	} else {
-		log.Printf("✅ Loaded %d upstream proxies\n", len(server.proxyPool))
+		log.Printf("Loaded %d upstream proxies\n", len(server.proxyPool))
 	}
 
 	go cleanupInactiveDevices()
@@ -494,13 +554,14 @@ func main() {
 	go cleanupExpiredSessions()
 	go proxyHealthChecker()
 	go cpuMonitor()
+	go server.monitorDHCPLeases() // Monitor for AP device connections
 	go startDashboard()
 
 	serverIP := getServerIP()
-	log.Printf("🚀 Proxy server starting on port %d\n", server.proxyPort)
-	log.Printf("📊 Dashboard: http://%s:%d\n", serverIP, server.dashPort)
-	log.Println("🔐 Default login: admin / admin123")
-	log.Printf("📱 Phone setup: Proxy %s:%d\n", serverIP, server.proxyPort)
+	log.Printf("Proxy server starting on port %d\n", server.proxyPort)
+	log.Printf("Dashboard: http://%s:%d\n", serverIP, server.dashPort)
+	log.Println("Default login: admin / admin123")
+	log.Printf("Access Point: Devices on 10.10.10.x network will be proxied\n")
 
 	if err := http.ListenAndServe(fmt.Sprintf("%s:%d", server.bindAddr, server.proxyPort), http.HandlerFunc(handleProxy)); err != nil {
 		log.Fatal(err)
@@ -647,36 +708,6 @@ func (s *ProxyServer) validateSession(token string) (*Session, bool) {
 	return session, true
 }
 
-func (s *ProxyServer) createAppSession(username string) *Session {
-	bytes := make([]byte, 32)
-	rand.Read(bytes)
-	token := base64.URLEncoding.EncodeToString(bytes)
-	s.sessionMu.Lock()
-	s.appSessions[token] = &Session{
-		Token:     token,
-		Username:  username,
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(time.Duration(s.persistentData.SystemSettings.SessionTimeout) * time.Hour),
-	}
-	s.sessionMu.Unlock()
-	return s.appSessions[token]
-}
-
-func (s *ProxyServer) validateAppSession(token, username string) (*Session, bool) {
-	s.sessionMu.RLock()
-	session, ok := s.appSessions[token]
-	s.sessionMu.RUnlock()
-	if !ok || time.Now().After(session.ExpiresAt) || session.Username != username {
-		if ok {
-			s.sessionMu.Lock()
-			delete(s.appSessions, token)
-			s.sessionMu.Unlock()
-		}
-		return nil, false
-	}
-	return session, true
-}
-
 func (s *ProxyServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("session_token")
@@ -699,11 +730,6 @@ func cleanupExpiredSessions() {
 		for token, session := range server.sessions {
 			if now.After(session.ExpiresAt) {
 				delete(server.sessions, token)
-			}
-		}
-		for token, session := range server.appSessions {
-			if now.After(session.ExpiresAt) {
-				delete(server.appSessions, token)
 			}
 		}
 		server.sessionMu.Unlock()
@@ -804,7 +830,47 @@ func (s *ProxyServer) restoreDevicesFromConfig() {
 	}
 
 	if count > 0 {
-		log.Printf("📱 Restored %d registered devices from config\n", count)
+		log.Printf("Restored %d registered devices from config\n", count)
+	}
+}
+
+// restoreAPDevices restores AP devices from persistent data on startup
+func (s *ProxyServer) restoreAPDevices() {
+	s.persistMu.RLock()
+	defer s.persistMu.RUnlock()
+
+	if s.persistentData.APDevices == nil {
+		return
+	}
+
+	count := 0
+	for mac, device := range s.persistentData.APDevices {
+		// Ensure proxy assignment is valid
+		s.poolMu.Lock()
+		if device.ProxyIndex >= 0 && device.ProxyIndex < len(s.proxyPool) {
+			device.UpstreamProxy = s.proxyPool[device.ProxyIndex]
+		} else if len(s.proxyPool) > 0 {
+			device.ProxyIndex = 0
+			device.UpstreamProxy = s.proxyPool[0]
+		}
+		s.poolMu.Unlock()
+
+		// Mark as offline initially (will be updated by DHCP monitoring)
+		device.Status = "offline"
+
+		s.apMu.Lock()
+		s.apDevices[mac] = device
+		s.apMu.Unlock()
+		count++
+	}
+
+	if count > 0 {
+		log.Printf("Restored %d AP devices from config\n", count)
+	}
+
+	// Also restore AP config if set
+	if s.persistentData.APConfig.Interface != "" {
+		s.apConfig = s.persistentData.APConfig
 	}
 }
 
@@ -816,6 +882,16 @@ func (s *ProxyServer) savePersistentData() {
 		s.persistentData.ProxyHealthData[k] = v
 	}
 	s.healthMu.RUnlock()
+
+	// Save AP devices and config
+	s.apMu.RLock()
+	s.persistentData.APDevices = make(map[string]*APDevice)
+	for mac, device := range s.apDevices {
+		s.persistentData.APDevices[mac] = device
+	}
+	s.persistentData.APConfig = s.apConfig
+	s.apMu.RUnlock()
+
 	data, _ := json.MarshalIndent(s.persistentData, "", "  ")
 	s.persistMu.Unlock()
 	os.WriteFile(s.dataFile, data, 0644)
@@ -1451,47 +1527,49 @@ func (s *ProxyServer) saveDeviceConfig(device *Device) {
 func handleProxy(w http.ResponseWriter, r *http.Request) {
 	clientIP := strings.Split(r.RemoteAddr, ":")[0]
 
-	// Allow the mobile app to hit its API on the proxy port (e.g., if the user
-	// enters 8888 instead of the dashboard port). This avoids forwarding the
-	// app's own control calls through an upstream proxy, which would hang or
-	// fail.
-	switch r.URL.Path {
-	case "/api/app/proxies":
-		handleAppProxiesAPI(w, r)
-		return
-	case "/api/app/register":
-		handleAppRegisterAPI(w, r)
-		return
-	case "/api/app/change-proxy":
-		handleAppChangeProxyAPI(w, r)
-		return
-	case "/api/app/authenticate":
-		handleAppAuthenticateAPI(w, r)
-		return
-	case "/api/app/whoami":
-		handleAppWhoAmI(w, r)
-		return
-	case "/api/app/check-ip":
-		handleAppCheckIP(w, r)
-		return
-	case "/api/app/validate-password":
-		handleAppValidatePassword(w, r)
-		return
-	case "/api/app/confirm-connection":
-		handleAppConfirmConnection(w, r)
-		return
-	case "/api/app/device-settings":
-		handleAppDeviceSettings(w, r)
+	// Check if client is from AP network (10.10.10.x)
+	if server.isAPClient(clientIP) {
+		apDevice := server.getAPDeviceByIP(clientIP)
+		if apDevice == nil {
+			// Unknown AP client - should have been detected by DHCP monitoring
+			server.addLog("warn", fmt.Sprintf("[BLOCKED] Unknown AP client %s tried to connect to %s", clientIP, r.Host))
+			http.Error(w, "Device not recognized. Please reconnect to the access point.", http.StatusForbidden)
+			return
+		}
+
+		// Check if device is confirmed (approved in dashboard)
+		if !apDevice.Confirmed {
+			server.addLog("info", fmt.Sprintf("[BLOCKED] Unconfirmed AP device %s (%s) tried to access %s", apDevice.Hostname, apDevice.MAC, r.Host))
+			http.Error(w, "Device pending approval. Please contact administrator.", http.StatusForbidden)
+			return
+		}
+
+		// Update device activity
+		server.apMu.Lock()
+		apDevice.LastSeen = time.Now()
+		apDevice.Status = "online"
+		atomic.AddInt64(&apDevice.RequestCount, 1)
+		server.apMu.Unlock()
+
+		// Get proxy name for logging
+		proxyName := server.getProxyName(apDevice.ProxyIndex)
+
+		if r.Method == http.MethodConnect {
+			handleAPHTTPS(w, r, apDevice, proxyName)
+		} else {
+			handleAPHTTP(w, r, apDevice, proxyName)
+		}
 		return
 	}
 
+	// Legacy device handling (username-based auth)
 	username := parseProxyUsername(r)
 	device, err := server.getOrCreateDevice(clientIP, username)
 	if err != nil {
 		// Log unregistered connection attempt
 		server.addLog("warn", fmt.Sprintf("[BLOCKED] Unregistered device %s (user: %s) tried to connect to %s", clientIP, username, r.Host))
 		server.addDeviceActivity(clientIP, "connection_blocked", "Device not registered", false, "", r.Host)
-		http.Error(w, "Registration required: please authenticate in the app", http.StatusProxyAuthRequired)
+		http.Error(w, "Registration required", http.StatusProxyAuthRequired)
 		return
 	}
 
@@ -1500,7 +1578,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Log session invalid attempt
 		server.addDeviceLog("warn", "session", fmt.Sprintf("[BLOCKED] Session expired/unconfirmed for %s trying to access %s", device.Username, r.Host), device)
 		server.addDeviceActivity(clientIP, "session_blocked", "Session expired or not confirmed", false, "", r.Host)
-		http.Error(w, "Session expired or not confirmed. Please open the app and confirm your connection.", http.StatusProxyAuthRequired)
+		http.Error(w, "Session expired or not confirmed.", http.StatusProxyAuthRequired)
 		return
 	}
 
@@ -1738,15 +1816,14 @@ func startDashboard() {
 	http.HandleFunc("/api/logout", handleLogoutAPI)
 	http.HandleFunc("/api/session-check", handleSessionCheckAPI)
 
-	// Public app API (no auth required)
-	http.HandleFunc("/api/app/proxies", handleAppProxiesAPI)
-	http.HandleFunc("/api/app/register", handleAppRegisterAPI)
-	http.HandleFunc("/api/app/change-proxy", handleAppChangeProxyAPI)
-	http.HandleFunc("/api/app/authenticate", handleAppAuthenticateAPI)
-	http.HandleFunc("/api/app/whoami", handleAppWhoAmI)
-	http.HandleFunc("/api/app/check-ip", handleAppCheckIP)
-	http.HandleFunc("/api/app/validate-password", handleAppValidatePassword)
-	http.HandleFunc("/api/app/device-settings", handleAppDeviceSettings)
+	// Access Point management API
+	http.HandleFunc("/access-point", server.requireAuth(handleAccessPointPage))
+	http.HandleFunc("/api/ap/status", server.requireAuth(handleAPStatusAPI))
+	http.HandleFunc("/api/ap/devices", server.requireAuth(handleAPDevicesAPI))
+	http.HandleFunc("/api/ap/device/confirm", server.requireAuth(handleAPDeviceConfirmAPI))
+	http.HandleFunc("/api/ap/device/proxy", server.requireAuth(handleAPDeviceProxyAPI))
+	http.HandleFunc("/api/ap/device/update", server.requireAuth(handleAPDeviceUpdateAPI))
+	http.HandleFunc("/api/ap/device/delete", server.requireAuth(handleAPDeviceDeleteAPI))
 
 	http.HandleFunc("/dashboard", server.requireAuth(handleDashboard))
 	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
@@ -2045,942 +2122,557 @@ func handleProxiesAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================================
-// APP API (public endpoints for mobile app)
+// ACCESS POINT API
 // ============================================================================
 
-type AppProxyInfo struct {
-	Index int    `json:"index"`
-	Name  string `json:"name"`
+// isAPClient checks if an IP is from the AP network (10.10.10.x)
+func (s *ProxyServer) isAPClient(ip string) bool {
+	return strings.HasPrefix(ip, "10.10.10.")
 }
 
-// handleAppProxiesAPI returns list of proxy names for the mobile app (no auth required)
-func handleAppProxiesAPI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	username := strings.TrimSpace(r.Header.Get("X-App-Username"))
-	if username == "" {
-		username = strings.TrimSpace(r.URL.Query().Get("username"))
-	}
-
-	if !ensureAppAuth(w, r, username) {
-		return
-	}
-
-	server.poolMu.Lock()
-	defer server.poolMu.Unlock()
-
-	proxies := make([]AppProxyInfo, 0)
-	for i := range server.proxyPool {
-		proxies = append(proxies, AppProxyInfo{
-			Index: i,
-			Name:  server.getProxyName(i),
-		})
-	}
-	json.NewEncoder(w).Encode(proxies)
-}
-
-type AppRegisterRequest struct {
-	Username   string `json:"username"`
-	ProxyIndex int    `json:"proxy_index"`
-	Password   string `json:"password,omitempty"`   // Required for registration
-	Supervisor string `json:"supervisor,omitempty"` // Supervisor name for change-proxy logging
-}
-
-// Registration password - devices must provide this to register
-const registrationPassword = "Drnda123"
-
-type AppAuthRequest struct {
-	Username string `json:"username"`
-}
-
-type AppAuthResponse struct {
-	Success    bool   `json:"success"`
-	Message    string `json:"message"`
-	Token      string `json:"token,omitempty"`
-	Username   string `json:"username,omitempty"`
-	ProxyIndex int    `json:"proxy_index,omitempty"`
-	ProxyName  string `json:"proxy_name,omitempty"`
-}
-
-type AppRegisterResponse struct {
-	Success    bool   `json:"success"`
-	Message    string `json:"message"`
-	Username   string `json:"username"`
-	ProxyName  string `json:"proxy_name"`
-	ProxyIndex int    `json:"proxy_index,omitempty"`
-	Token      string `json:"token,omitempty"`
-}
-
-// ensureAppAuth enforces the optional pre-authentication gate for app calls
-func ensureAppAuth(w http.ResponseWriter, r *http.Request, username string) bool {
-	if !server.authRequired {
-		return true
-	}
-
-	if r.Method == http.MethodOptions {
-		return true
-	}
-
-	if strings.TrimSpace(username) == "" {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Authentication required: send username"})
-		return false
-	}
-
-	token := strings.TrimSpace(r.Header.Get("X-App-Token"))
-	if token == "" {
-		token = strings.TrimSpace(r.URL.Query().Get("token"))
-	}
-	if token == "" {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Authentication required"})
-		return false
-	}
-
-	if _, ok := server.validateAppSession(token, username); !ok {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Session expired, please authenticate"})
-		return false
-	}
-
-	return true
-}
-
-// handleAppRegisterAPI registers a device with username and proxy selection (password protected)
-func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Method not allowed"})
-		return
-	}
-
-	var req AppRegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid request"})
-		return
-	}
-
-	username := strings.TrimSpace(req.Username)
-	if username == "" {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
-		return
-	}
-
-	// Validate username contains only safe characters (prevent corrupted registrations)
-	if !isValidUsername(username) {
-		clientIP := strings.Split(r.RemoteAddr, ":")[0]
-		log.Printf("⚠️ App: Registration denied - invalid username characters '%s' (IP: %s)\n", username, clientIP)
-		server.addLog("warning", fmt.Sprintf("App: Registration denied - invalid username '%s' (IP: %s)", username, clientIP))
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid username - use only letters, numbers, underscore, hyphen, dot, space"})
-		return
-	}
-
-	// Validate registration password
-	if req.Password != registrationPassword {
-		clientIP := strings.Split(r.RemoteAddr, ":")[0]
-		log.Printf("⚠️ App: Registration denied - invalid password for username '%s' (IP: %s)\n", username, clientIP)
-		server.addLog("warning", fmt.Sprintf("App: Registration denied - invalid password for '%s' (IP: %s)", username, clientIP))
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid registration password"})
-		return
-	}
-
-	if !ensureAppAuth(w, r, username) {
-		return
-	}
-
-	// Validate proxy index
-	server.poolMu.Lock()
-	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
-		server.poolMu.Unlock()
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid proxy selection"})
-		return
-	}
-	selectedProxy := server.proxyPool[req.ProxyIndex]
-	server.poolMu.Unlock()
-
-	proxyName := fmt.Sprintf("SG%d", req.ProxyIndex+1)
-
-	// Get client IP
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-
-	// Check if device already exists with this username
-	server.mu.Lock()
-	existingDevice := server.findDeviceByUsername(username)
-	if existingDevice != nil {
-		// Update existing device
-		oldIP := existingDevice.IP
-		existingDevice.IP = clientIP
-		existingDevice.UpstreamProxy = selectedProxy
-		existingDevice.LastSeen = time.Now()
-		server.mu.Unlock()
-
-		// Track device registration to proxy
-		server.trackDeviceRegistration(req.ProxyIndex, username)
-
-		// Auto-confirm session on registration
-		server.confirmDeviceSession(existingDevice)
-
-		go server.saveDeviceConfig(existingDevice)
-		log.Printf("📱 App: Device '%s' updated -> %s (session auto-confirmed)\n", username, proxyName)
-		server.addDeviceLog("info", "config", fmt.Sprintf("[UPDATED] Device re-registered from IP %s (was %s) with %s - session confirmed", clientIP, oldIP, proxyName), existingDevice)
-		server.addDeviceActivity(clientIP, "device_updated", fmt.Sprintf("Re-registered with %s (session confirmed)", proxyName), true, proxyName, "")
-	} else {
-		// Create new device
-		device := &Device{
-			ID:            fmt.Sprintf("device-%s", username),
-			IP:            clientIP,
-			Username:      username,
-			Name:          username,
-			Group:         "Default",
-			UpstreamProxy: selectedProxy,
-			Status:        "active",
-			FirstSeen:     time.Now(),
-			LastSeen:      time.Now(),
+// getAPDeviceByIP finds an AP device by its current IP address
+func (s *ProxyServer) getAPDeviceByIP(ip string) *APDevice {
+	s.apMu.RLock()
+	defer s.apMu.RUnlock()
+	for _, device := range s.apDevices {
+		if device.IP == ip {
+			return device
 		}
-		server.devices[username] = device
-		server.mu.Unlock()
-
-		// Track device registration to proxy
-		server.trackDeviceRegistration(req.ProxyIndex, username)
-
-		// Auto-confirm session on registration
-		server.confirmDeviceSession(device)
-
-		go server.saveDeviceConfig(device)
-		log.Printf("📱 App: New device '%s' registered -> %s (session auto-confirmed)\n", username, proxyName)
-		server.addDeviceLog("info", "config", fmt.Sprintf("[REGISTERED] New device '%s' from IP %s with %s - session confirmed", username, clientIP, proxyName), device)
-		server.addDeviceActivity(clientIP, "device_registered", fmt.Sprintf("New device registered with %s (session confirmed)", proxyName), true, proxyName, "")
 	}
-
-	json.NewEncoder(w).Encode(AppRegisterResponse{
-		Success:    true,
-		Message:    "Device registered",
-		Username:   username,
-		ProxyName:  proxyName,
-		ProxyIndex: req.ProxyIndex,
-	})
+	return nil
 }
 
-// handleAppChangeProxyAPI updates a device's proxy selection (only for existing registered devices)
-func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Method not allowed"})
-		return
-	}
-
-	var req AppRegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid request"})
-		return
-	}
-
-	username := strings.TrimSpace(req.Username)
-	if username == "" {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
-		return
-	}
-
-	server.poolMu.Lock()
-	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
-		server.poolMu.Unlock()
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid proxy selection"})
-		return
-	}
-	selectedProxy := server.proxyPool[req.ProxyIndex]
-	server.poolMu.Unlock()
-
-	proxyName := fmt.Sprintf("SG%d", req.ProxyIndex+1)
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-
-	// Only allow changing proxy for existing registered devices
-	server.mu.Lock()
-	device := server.findDeviceByUsername(username)
-	if device == nil {
-		server.mu.Unlock()
-		log.Printf("⚠️ App: Change proxy failed - username '%s' not registered\n", username)
-		server.addLog("warning", fmt.Sprintf("App: Change proxy denied - username '%s' not registered (IP: %s)", username, clientIP))
-		json.NewEncoder(w).Encode(AppRegisterResponse{
-			Success: false,
-			Message: "Username not registered. Please register first using the Register button.",
-		})
-		return
-	}
-
-	// Log the proxy change with old and new proxy info
-	oldProxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
-	oldProxyName := fmt.Sprintf("SG%d", oldProxyIndex+1)
-
-	device.IP = clientIP
-	device.UpstreamProxy = selectedProxy
-	device.LastSeen = time.Now()
-	server.mu.Unlock()
-
-	// Track device registration to proxy
-	server.trackDeviceRegistration(req.ProxyIndex, username)
-
-	// Auto-confirm session on proxy change
-	server.confirmDeviceSession(device)
-
-	go server.saveDeviceConfig(device)
-
-	// Log proxy change with supervisor name if provided
-	supervisorInfo := ""
-	if req.Supervisor != "" {
-		supervisorInfo = fmt.Sprintf(" by Supervisor %s", req.Supervisor)
-	}
-	log.Printf("📱 App: Device '%s' proxy changed: %s -> %s%s (IP: %s) - session confirmed\n", username, oldProxyName, proxyName, supervisorInfo, clientIP)
-	server.addDeviceLog("info", "config", fmt.Sprintf("[PROXY CHANGED] %s: %s -> %s%s - session confirmed", username, oldProxyName, proxyName, supervisorInfo), device)
-	server.addDeviceActivity(clientIP, "proxy_changed", fmt.Sprintf("Changed from %s to %s%s (session confirmed)", oldProxyName, proxyName, supervisorInfo), true, proxyName, "")
-
-	json.NewEncoder(w).Encode(AppRegisterResponse{
-		Success:    true,
-		Message:    "Proxy updated",
-		Username:   username,
-		ProxyName:  proxyName,
-		ProxyIndex: req.ProxyIndex,
-	})
+// getAPDeviceByMAC finds an AP device by its MAC address
+func (s *ProxyServer) getAPDeviceByMAC(mac string) *APDevice {
+	s.apMu.RLock()
+	defer s.apMu.RUnlock()
+	return s.apDevices[strings.ToLower(mac)]
 }
 
-// handleAppAuthenticateAPI issues a short-lived session token keyed by username
-func handleAppAuthenticateAPI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+// assignProxyToAPDevice assigns the next available proxy to a new AP device
+func (s *ProxyServer) assignProxyToAPDevice(device *APDevice) {
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
 
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
+	if len(s.proxyPool) == 0 {
 		return
 	}
 
-	if r.Method != http.MethodPost {
-		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Method not allowed"})
-		return
-	}
-
-	var req AppAuthRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Invalid request"})
-		return
-	}
-
-	username := strings.TrimSpace(req.Username)
-	if username == "" {
-		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Username required"})
-		return
-	}
-
-	server.poolMu.Lock()
-	if len(server.proxyPool) == 0 {
-		server.poolMu.Unlock()
-		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "No upstream proxies configured"})
-		return
-	}
-	server.poolMu.Unlock()
-
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-
-	server.persistMu.RLock()
-	cfg, hasCfg := server.persistentData.DeviceConfigs[username]
-	server.persistMu.RUnlock()
-
-	proxyIndex := 0
-	if hasCfg && cfg.ProxyIndex >= 0 {
-		proxyIndex = cfg.ProxyIndex
-	}
-
-	server.poolMu.Lock()
-	if proxyIndex >= len(server.proxyPool) {
-		proxyIndex = 0
-	}
-	selectedProxy := server.proxyPool[proxyIndex]
-	proxyName := fmt.Sprintf("SG%d", proxyIndex+1)
-	server.poolMu.Unlock()
-
-	server.mu.Lock()
-	device := server.findDeviceByUsername(username)
-	if device == nil {
-		device = &Device{
-			ID:            fmt.Sprintf("device-%s", username),
-			IP:            clientIP,
-			Username:      username,
-			Name:          username,
-			Group:         "Default",
-			UpstreamProxy: selectedProxy,
-			Status:        "active",
-			FirstSeen:     time.Now(),
-			LastSeen:      time.Now(),
-		}
-		server.devices[username] = device
-	} else {
-		device.IP = clientIP
-		if device.UpstreamProxy == "" {
-			device.UpstreamProxy = selectedProxy
-		}
-		device.LastSeen = time.Now()
-	}
-	server.mu.Unlock()
-
-	// Auto-confirm session on connect/authenticate
-	server.confirmDeviceSession(device)
-
-	go server.saveDeviceConfig(device)
-	session := server.createAppSession(username)
-
-	json.NewEncoder(w).Encode(AppAuthResponse{
-		Success:    true,
-		Message:    "Authenticated",
-		Token:      session.Token,
-		Username:   username,
-		ProxyIndex: proxyIndex,
-		ProxyName:  proxyName,
-	})
+	device.ProxyIndex = s.apPoolIndex
+	device.UpstreamProxy = s.proxyPool[s.apPoolIndex]
+	s.apPoolIndex = (s.apPoolIndex + 1) % len(s.proxyPool)
 }
 
-// fetchPublicIPThroughProxy fetches the public IP by making a request through the SOCKS5 proxy
-func fetchPublicIPThroughProxy(proxyStr string) (string, error) {
-	if proxyStr == "" {
-		return "", fmt.Errorf("no proxy configured")
+// monitorDHCPLeases monitors the DHCP lease file for connected devices
+func (s *ProxyServer) monitorDHCPLeases() {
+	leaseFile := s.apConfig.LeaseFile
+	if leaseFile == "" {
+		leaseFile = "/var/lib/lumier/dnsmasq.leases"
 	}
 
-	parts := strings.Split(proxyStr, ":")
-	if len(parts) < 4 {
-		return "", fmt.Errorf("invalid proxy format")
-	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
-	auth := &proxy.Auth{User: parts[2], Password: strings.Join(parts[3:], ":")}
-	dialer, err := proxy.SOCKS5("tcp", parts[0]+":"+parts[1], auth, &net.Dialer{Timeout: 10 * time.Second})
+	for range ticker.C {
+		s.parseDHCPLeases(leaseFile)
+		s.updateAPDeviceStatus()
+	}
+}
+
+// parseDHCPLeases reads and parses the dnsmasq lease file
+func (s *ProxyServer) parseDHCPLeases(leaseFile string) {
+	file, err := os.Open(leaseFile)
 	if err != nil {
-		return "", fmt.Errorf("failed to create SOCKS5 dialer: %v", err)
+		// File might not exist yet, that's OK
+		return
 	}
+	defer file.Close()
 
-	// Create HTTP client with SOCKS5 transport
-	transport := &http.Transport{
-		Dial: dialer.Dial,
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   15 * time.Second,
-	}
+	currentLeases := make(map[string]bool)
+	scanner := bufio.NewScanner(file)
 
-	// Try multiple IP check services
-	ipServices := []string{
-		"https://api.ipify.org",
-		"https://icanhazip.com",
-		"https://ifconfig.me/ip",
-	}
-
-	for _, service := range ipServices {
-		resp, err := client.Get(service)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Fields(line)
+		if len(parts) < 4 {
 			continue
 		}
 
-		ip := strings.TrimSpace(string(body))
-		if ip != "" && net.ParseIP(ip) != nil {
-			return ip, nil
+		// Format: timestamp mac ip hostname [client-id]
+		mac := strings.ToLower(parts[1])
+		ip := parts[2]
+		hostname := parts[3]
+		if hostname == "*" {
+			hostname = ""
 		}
-	}
 
-	return "", fmt.Errorf("failed to fetch public IP from all services")
-}
+		currentLeases[mac] = true
 
-// fetchPublicIPAndGeoThroughProxy fetches the public IP and geolocation through the SOCKS5 proxy
-func fetchPublicIPAndGeoThroughProxy(proxyStr string) (ip, country, city string, err error) {
-	if proxyStr == "" {
-		return "", "", "", fmt.Errorf("no proxy configured")
-	}
-
-	parts := strings.Split(proxyStr, ":")
-	if len(parts) < 4 {
-		return "", "", "", fmt.Errorf("invalid proxy format")
-	}
-
-	auth := &proxy.Auth{User: parts[2], Password: strings.Join(parts[3:], ":")}
-	dialer, err := proxy.SOCKS5("tcp", parts[0]+":"+parts[1], auth, &net.Dialer{Timeout: 10 * time.Second})
-	if err != nil {
-		return "", "", "", fmt.Errorf("failed to create SOCKS5 dialer: %v", err)
-	}
-
-	transport := &http.Transport{Dial: dialer.Dial}
-	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
-
-	// Try ip-api.com first for IP + geolocation in one request
-	resp, err := client.Get("http://ip-api.com/json/?fields=status,message,country,city,query")
-	if err == nil {
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err == nil {
-			var result struct {
-				Status  string `json:"status"`
-				Message string `json:"message"`
-				Country string `json:"country"`
-				City    string `json:"city"`
-				Query   string `json:"query"` // This is the IP
+		s.apMu.Lock()
+		if device, exists := s.apDevices[mac]; exists {
+			// Update existing device
+			device.IP = ip
+			device.Hostname = hostname
+			device.LastSeen = time.Now()
+			device.Status = "online"
+		} else {
+			// New device detected
+			now := time.Now()
+			newDevice := &APDevice{
+				MAC:       mac,
+				IP:        ip,
+				Hostname:  hostname,
+				FirstSeen: now,
+				LastSeen:  now,
+				Status:    "online",
+				Confirmed: false, // Must be confirmed in dashboard!
 			}
-			if json.Unmarshal(body, &result) == nil && result.Status == "success" {
-				return result.Query, result.Country, result.City, nil
+			s.assignProxyToAPDevice(newDevice)
+			s.apDevices[mac] = newDevice
+
+			// Also save to persistent data
+			s.persistMu.Lock()
+			if s.persistentData.APDevices == nil {
+				s.persistentData.APDevices = make(map[string]*APDevice)
+			}
+			s.persistentData.APDevices[mac] = newDevice
+			s.persistMu.Unlock()
+
+			s.addLog("info", fmt.Sprintf("[AP] New device detected: %s (%s) - %s - awaiting approval", hostname, mac, ip))
+		}
+		s.apMu.Unlock()
+	}
+
+	// Mark devices not in current leases as offline
+	s.apMu.Lock()
+	for mac, device := range s.apDevices {
+		if !currentLeases[mac] && device.Status == "online" {
+			// Check if device was seen recently (within 2 minutes)
+			if time.Since(device.LastSeen) > 2*time.Minute {
+				device.Status = "offline"
 			}
 		}
 	}
-
-	// Fallback: get IP from simple services, then lookup geo separately
-	ipServices := []string{
-		"https://api.ipify.org",
-		"https://icanhazip.com",
-		"https://ifconfig.me/ip",
-	}
-
-	for _, service := range ipServices {
-		resp, err := client.Get(service)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			continue
-		}
-
-		fetchedIP := strings.TrimSpace(string(body))
-		if fetchedIP != "" && net.ParseIP(fetchedIP) != nil {
-			// Try to get geolocation for this IP
-			geoCountry, geoCity := fetchGeoForIP(client, fetchedIP)
-			return fetchedIP, geoCountry, geoCity, nil
-		}
-	}
-
-	return "", "", "", fmt.Errorf("failed to fetch public IP from all services")
+	s.apMu.Unlock()
 }
 
-// fetchGeoForIP looks up geolocation for an IP address
-func fetchGeoForIP(client *http.Client, ip string) (country, city string) {
-	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=status,country,city", ip))
+// updateAPDeviceStatus marks devices as offline if not seen recently
+func (s *ProxyServer) updateAPDeviceStatus() {
+	s.apMu.Lock()
+	defer s.apMu.Unlock()
+
+	for _, device := range s.apDevices {
+		if device.Status == "online" && time.Since(device.LastSeen) > 5*time.Minute {
+			device.Status = "offline"
+		}
+	}
+}
+
+// handleAPHTTPS handles HTTPS traffic for AP devices
+func handleAPHTTPS(w http.ResponseWriter, r *http.Request, device *APDevice, proxyName string) {
+	target := r.Host
+	if !strings.Contains(target, ":") {
+		target += ":443"
+	}
+
+	// Block WebRTC leak sources
+	if isWebRTCLeakHost(target) {
+		http.Error(w, "Connection refused", http.StatusForbidden)
+		return
+	}
+
+	startTime := time.Now()
+
+	upstream, err := dialThroughSOCKS5(device.UpstreamProxy, target)
 	if err != nil {
-		return "", ""
+		server.apMu.Lock()
+		atomic.AddInt64(&device.ErrorCount, 1)
+		device.LastError = err.Error()
+		device.LastErrorTime = time.Now()
+		server.apMu.Unlock()
+		http.Error(w, "Failed to connect to upstream proxy", http.StatusBadGateway)
+		return
+	}
+	defer upstream.Close()
+
+	// Hijack the connection
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer clientConn.Close()
+
+	// Send 200 Connection Established
+	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// Bidirectional copy
+	var bytesIn, bytesOut int64
+	done := make(chan bool, 2)
+
+	go func() {
+		n, _ := io.Copy(upstream, clientConn)
+		bytesOut = n
+		done <- true
+	}()
+
+	go func() {
+		n, _ := io.Copy(clientConn, upstream)
+		bytesIn = n
+		done <- true
+	}()
+
+	<-done
+	<-done
+
+	// Update stats
+	server.apMu.Lock()
+	atomic.AddInt64(&device.BytesIn, bytesIn)
+	atomic.AddInt64(&device.BytesOut, bytesOut)
+	server.apMu.Unlock()
+
+	// Update proxy health
+	duration := time.Since(startTime)
+	server.recordProxySuccess(device.ProxyIndex, duration, bytesIn, bytesOut)
+
+	// Log connection
+	server.addLog("debug", fmt.Sprintf("[AP] HTTPS %s -> %s via %s (%d bytes)", device.Hostname, target, proxyName, bytesIn+bytesOut))
+}
+
+// handleAPHTTP handles HTTP traffic for AP devices
+func handleAPHTTP(w http.ResponseWriter, r *http.Request, device *APDevice, proxyName string) {
+	// Block WebRTC leak sources
+	if isWebRTCLeakHost(r.Host) {
+		http.Error(w, "Connection refused", http.StatusForbidden)
+		return
+	}
+
+	startTime := time.Now()
+
+	// Connect through SOCKS5 proxy
+	target := r.Host
+	if !strings.Contains(target, ":") {
+		target += ":80"
+	}
+
+	upstream, err := dialThroughSOCKS5(device.UpstreamProxy, target)
+	if err != nil {
+		server.apMu.Lock()
+		atomic.AddInt64(&device.ErrorCount, 1)
+		device.LastError = err.Error()
+		device.LastErrorTime = time.Now()
+		server.apMu.Unlock()
+		http.Error(w, "Failed to connect to upstream proxy", http.StatusBadGateway)
+		return
+	}
+	defer upstream.Close()
+
+	// Forward the request
+	if err := r.Write(upstream); err != nil {
+		http.Error(w, "Failed to forward request", http.StatusBadGateway)
+		return
+	}
+
+	// Read response
+	resp, err := http.ReadResponse(bufio.NewReader(upstream), r)
+	if err != nil {
+		http.Error(w, "Failed to read response", http.StatusBadGateway)
+		return
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", ""
-	}
-
-	var result struct {
-		Status  string `json:"status"`
-		Country string `json:"country"`
-		City    string `json:"city"`
-	}
-	if json.Unmarshal(body, &result) == nil && result.Status == "success" {
-		return result.Country, result.City
-	}
-	return "", ""
-}
-
-// handleAppWhoAmI reports the public IP as seen through the device's assigned proxy
-func handleAppWhoAmI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
-		return
-	}
-
-	username := strings.TrimSpace(r.Header.Get("X-App-Username"))
-	if username == "" {
-		username = strings.TrimSpace(r.URL.Query().Get("username"))
-	}
-
-	if !ensureAppAuth(w, r, username) {
-		return
-	}
-
-	// Look up the device to get its assigned proxy
-	server.mu.RLock()
-	device := server.findDeviceByUsername(username)
-	var proxyStr string
-	if device != nil {
-		proxyStr = device.UpstreamProxy
-	}
-	server.mu.RUnlock()
-
-	if proxyStr == "" {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"ip":      "",
-			"country": "",
-			"error":   "No proxy assigned - please register first",
-		})
-		return
-	}
-
-	// Fetch public IP and geolocation through the proxy
-	publicIP, country, city, err := fetchPublicIPAndGeoThroughProxy(proxyStr)
-	if err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"ip":      "",
-			"country": "",
-			"city":    "",
-			"error":   fmt.Sprintf("Failed to check IP: %v", err),
-		})
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string]string{
-		"ip":      publicIP,
-		"country": country,
-		"city":    city,
-	})
-}
-
-// extractIPFromProxyString extracts the IP address embedded in a proxy string
-// Format: host:port:username:password where username may contain ip-X.X.X.X
-func extractIPFromProxyString(proxyStr string) string {
-	// Look for pattern like ip-XXX.XXX.XXX.XXX in the proxy string
-	re := regexp.MustCompile(`ip-(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
-	matches := re.FindStringSubmatch(proxyStr)
-	if len(matches) >= 2 {
-		return matches[1]
-	}
-	return ""
-}
-
-// handleAppCheckIP checks which proxy an IP belongs to
-func handleAppCheckIP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		return
-	}
-
-	// Get IP from query param or JSON body
-	ipToCheck := r.URL.Query().Get("ip")
-	if ipToCheck == "" && r.Method == http.MethodPost {
-		var req struct {
-			IP string `json:"ip"`
-		}
-		json.NewDecoder(r.Body).Decode(&req)
-		ipToCheck = req.IP
-	}
-
-	if ipToCheck == "" {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":    false,
-			"message":    "IP address required",
-			"proxy_name": "",
-			"matched":    false,
-		})
-		return
-	}
-
-	// Search through proxies to find one with matching IP
-	server.poolMu.Lock()
-	var matchedIndex int = -1
-	for i, proxy := range server.proxyPool {
-		proxyIP := extractIPFromProxyString(proxy)
-		if proxyIP == ipToCheck {
-			matchedIndex = i
-			break
+	// Copy response headers
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
 		}
 	}
-	server.poolMu.Unlock()
+	w.WriteHeader(resp.StatusCode)
 
-	if matchedIndex >= 0 {
-		proxyName := fmt.Sprintf("SG%d", matchedIndex+1)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":     true,
-			"matched":     true,
-			"proxy_name":  proxyName,
-			"proxy_index": matchedIndex,
-			"message":     fmt.Sprintf("IP belongs to %s", proxyName),
-		})
-	} else {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":    true,
-			"matched":    false,
-			"proxy_name": "",
-			"message":    "WARNING: IP does not match any configured proxy!",
-		})
-	}
+	// Copy response body
+	bytesOut, _ := io.Copy(w, resp.Body)
+
+	// Update stats
+	server.apMu.Lock()
+	atomic.AddInt64(&device.BytesOut, bytesOut)
+	server.apMu.Unlock()
+
+	// Update proxy health
+	duration := time.Since(startTime)
+	server.recordProxySuccess(device.ProxyIndex, duration, 0, bytesOut)
+
+	server.addLog("debug", fmt.Sprintf("[AP] HTTP %s -> %s via %s (%d bytes)", device.Hostname, r.Host, proxyName, bytesOut))
 }
 
-// handleAppValidatePassword validates admin or supervisor password from the Android app
-func handleAppValidatePassword(w http.ResponseWriter, r *http.Request) {
+// handleAccessPointPage serves the Access Point management page
+func handleAccessPointPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, accessPointPageHTML)
+}
+
+// handleAPStatusAPI returns the current AP network status
+func handleAPStatusAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"valid":   false,
-			"message": "Method not allowed",
-		})
-		return
-	}
-
-	var req struct {
-		Password string `json:"password"`
-		Type     string `json:"type"` // "admin" or "supervisor"
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"valid":   false,
-			"message": "Invalid request",
-		})
-		return
-	}
-
-	server.persistMu.RLock()
-	defer server.persistMu.RUnlock()
-
-	if req.Type == "admin" {
-		// Validate admin password
-		if req.Password == server.persistentData.AdminPassword {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"valid": true,
-				"name":  "Admin",
-			})
+	server.apMu.RLock()
+	totalDevices := len(server.apDevices)
+	onlineDevices := 0
+	confirmedDevices := 0
+	pendingDevices := 0
+	for _, device := range server.apDevices {
+		if device.Status == "online" {
+			onlineDevices++
+		}
+		if device.Confirmed {
+			confirmedDevices++
 		} else {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"valid":   false,
-				"message": "Invalid admin password",
-			})
-		}
-		return
-	}
-
-	// Validate supervisor password
-	for _, s := range server.persistentData.Supervisors {
-		if s.Password == req.Password {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"valid": true,
-				"name":  s.Name,
-			})
-			return
+			pendingDevices++
 		}
 	}
+	server.apMu.RUnlock()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"valid":   false,
-		"message": "Invalid supervisor password",
+		"enabled":           server.apConfig.Enabled,
+		"interface":         server.apConfig.Interface,
+		"ip_address":        server.apConfig.IPAddress,
+		"dhcp_range":        fmt.Sprintf("%s - %s", server.apConfig.DHCPStart, server.apConfig.DHCPEnd),
+		"total_devices":     totalDevices,
+		"online_devices":    onlineDevices,
+		"confirmed_devices": confirmedDevices,
+		"pending_devices":   pendingDevices,
 	})
 }
 
-// handleAppConfirmConnection confirms that a device is connected to the correct proxy
-func handleAppConfirmConnection(w http.ResponseWriter, r *http.Request) {
+// handleAPDevicesAPI returns list of all AP devices
+func handleAPDevicesAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		return
+	server.apMu.RLock()
+	devices := make([]*APDevice, 0, len(server.apDevices))
+	for _, device := range server.apDevices {
+		devices = append(devices, device)
+	}
+	server.apMu.RUnlock()
+
+	// Sort by FirstSeen (newest first)
+	sort.Slice(devices, func(i, j int) bool {
+		return devices[i].FirstSeen.After(devices[j].FirstSeen)
+	})
+
+	// Add proxy names
+	type DeviceWithProxyName struct {
+		*APDevice
+		ProxyName string `json:"proxy_name"`
 	}
 
+	result := make([]DeviceWithProxyName, len(devices))
+	for i, device := range devices {
+		result[i] = DeviceWithProxyName{
+			APDevice:  device,
+			ProxyName: server.getProxyName(device.ProxyIndex),
+		}
+	}
+
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleAPDeviceConfirmAPI confirms (approves) or unconfirms an AP device
+func handleAPDeviceConfirmAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Method not allowed",
-		})
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req struct {
-		Username  string `json:"username"`
-		ProxyName string `json:"proxy_name"` // The proxy name the device claims to be using
+		MAC       string `json:"mac"`
+		Confirmed bool   `json:"confirmed"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Invalid request",
-		})
+		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
 
-	if req.Username == "" {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Username required",
-		})
-		return
-	}
+	mac := strings.ToLower(req.MAC)
 
-	// Find the device
-	server.mu.Lock()
-	device, exists := server.devices[req.Username]
+	server.apMu.Lock()
+	device, exists := server.apDevices[mac]
 	if !exists {
-		// Try by IP
-		clientIP := strings.Split(r.RemoteAddr, ":")[0]
-		device, exists = server.devices[clientIP]
-	}
-	server.mu.Unlock()
-
-	if !exists || device == nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Device not found. Please register first.",
-		})
+		server.apMu.Unlock()
+		http.Error(w, "Device not found", http.StatusNotFound)
 		return
 	}
 
-	// Get the expected proxy name for this device
-	server.poolMu.Lock()
-	proxyIndex := -1
-	for i, p := range server.proxyPool {
-		if p == device.UpstreamProxy {
-			proxyIndex = i
-			break
-		}
+	device.Confirmed = req.Confirmed
+	if req.Confirmed {
+		device.ConfirmedAt = time.Now()
+		device.ConfirmedBy = "admin" // Could get from session
+		server.addLog("info", fmt.Sprintf("[AP] Device approved: %s (%s)", device.Hostname, device.MAC))
+	} else {
+		server.addLog("info", fmt.Sprintf("[AP] Device access revoked: %s (%s)", device.Hostname, device.MAC))
 	}
-	server.poolMu.Unlock()
+	server.apMu.Unlock()
 
-	expectedProxyName := server.getProxyName(proxyIndex)
-
-	// Verify the proxy matches (if proxy_name was provided)
-	if req.ProxyName != "" && req.ProxyName != expectedProxyName {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":        false,
-			"message":        fmt.Sprintf("Proxy mismatch! Expected %s but you reported %s", expectedProxyName, req.ProxyName),
-			"expected_proxy": expectedProxyName,
-		})
-		return
+	// Save to persistent data
+	server.persistMu.Lock()
+	if server.persistentData.APDevices == nil {
+		server.persistentData.APDevices = make(map[string]*APDevice)
 	}
+	server.persistentData.APDevices[mac] = device
+	server.persistMu.Unlock()
 
-	// Confirm the session
-	server.confirmDeviceSession(device)
-
-	// Get session timeout for response
-	server.persistMu.RLock()
-	sessionTimeout := server.persistentData.SystemSettings.SessionTimeout
-	server.persistMu.RUnlock()
-
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-	log.Printf("✅ Device '%s' confirmed connection to %s (session: %dh)\n", req.Username, expectedProxyName, sessionTimeout)
-	server.addDeviceLog("info", "session", fmt.Sprintf("[SESSION CONFIRMED] %s confirmed connection to %s (valid for %dh)", req.Username, expectedProxyName, sessionTimeout), device)
-	server.addDeviceActivity(clientIP, "session_confirmed", fmt.Sprintf("Session confirmed via %s (valid for %dh)", expectedProxyName, sessionTimeout), true, expectedProxyName, "")
-
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":         true,
-		"confirmed":       true,
-		"message":         fmt.Sprintf("Connection confirmed! Session valid for %d hours.", sessionTimeout),
-		"proxy_name":      expectedProxyName,
-		"timeout_hours":   sessionTimeout,
-		"session_expires": device.SessionStart.Add(time.Duration(sessionTimeout) * time.Hour).Format(time.RFC3339),
+		"success":   true,
+		"confirmed": device.Confirmed,
 	})
 }
 
-// handleAppDeviceSettings returns the current device settings from the server
-// This allows the app to sync settings that were changed from the dashboard
-func handleAppDeviceSettings(w http.ResponseWriter, r *http.Request) {
+// handleAPDeviceProxyAPI changes the proxy assignment for an AP device
+func handleAPDeviceProxyAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		MAC        string `json:"mac"`
+		ProxyIndex int    `json:"proxy_index"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	mac := strings.ToLower(req.MAC)
+
+	server.poolMu.Lock()
+	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
+		server.poolMu.Unlock()
+		http.Error(w, "Invalid proxy index", http.StatusBadRequest)
+		return
+	}
+	proxyStr := server.proxyPool[req.ProxyIndex]
+	server.poolMu.Unlock()
+
+	server.apMu.Lock()
+	device, exists := server.apDevices[mac]
+	if !exists {
+		server.apMu.Unlock()
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	oldProxy := device.ProxyIndex
+	device.ProxyIndex = req.ProxyIndex
+	device.UpstreamProxy = proxyStr
+	server.apMu.Unlock()
+
+	// Save to persistent data
+	server.persistMu.Lock()
+	server.persistentData.APDevices[mac] = device
+	server.persistMu.Unlock()
+
+	server.addLog("info", fmt.Sprintf("[AP] Proxy changed for %s (%s): %s -> %s",
+		device.Hostname, device.MAC,
+		server.getProxyName(oldProxy),
+		server.getProxyName(req.ProxyIndex)))
+
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
-		return
-	}
-
-	if r.Method != http.MethodGet {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Method not allowed",
-		})
-		return
-	}
-
-	// Get username from query params or header
-	username := r.URL.Query().Get("username")
-	if username == "" {
-		username = r.Header.Get("X-App-Username")
-	}
-
-	if username == "" {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Username required",
-		})
-		return
-	}
-
-	// Look up device config
-	server.persistMu.RLock()
-	cfg, hasCfg := server.persistentData.DeviceConfigs[username]
-	sessionTimeout := server.persistentData.SystemSettings.SessionTimeout
-	server.persistMu.RUnlock()
-
-	if sessionTimeout <= 0 {
-		sessionTimeout = 2
-	}
-
-	if !hasCfg {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Device not registered",
-		})
-		return
-	}
-
-	// Get proxy name
-	proxyName := server.getProxyName(cfg.ProxyIndex)
-
-	// Check device session status
-	server.mu.RLock()
-	device := server.findDeviceByUsername(username)
-	var sessionValid bool
-	var sessionExpires string
-	if device != nil {
-		sessionValid = server.isDeviceSessionValid(device)
-		if device.Confirmed && !device.SessionStart.IsZero() {
-			sessionExpires = device.SessionStart.Add(time.Duration(sessionTimeout) * time.Hour).Format(time.RFC3339)
-		}
-	}
-	server.mu.RUnlock()
-
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":          true,
-		"username":         username,
-		"proxy_index":      cfg.ProxyIndex,
-		"proxy_name":       proxyName,
-		"custom_name":      cfg.CustomName,
-		"group":            cfg.Group,
-		"notes":            cfg.Notes,
-		"session_valid":    sessionValid,
-		"session_timeout":  sessionTimeout,
-		"session_expires":  sessionExpires,
+		"success":     true,
+		"proxy_index": req.ProxyIndex,
+		"proxy_name":  server.getProxyName(req.ProxyIndex),
+	})
+}
+
+// handleAPDeviceUpdateAPI updates device name, group, or notes
+func handleAPDeviceUpdateAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		MAC        string `json:"mac"`
+		CustomName string `json:"custom_name"`
+		Group      string `json:"group"`
+		Notes      string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	mac := strings.ToLower(req.MAC)
+
+	server.apMu.Lock()
+	device, exists := server.apDevices[mac]
+	if !exists {
+		server.apMu.Unlock()
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	device.CustomName = req.CustomName
+	device.Group = req.Group
+	device.Notes = req.Notes
+	server.apMu.Unlock()
+
+	// Save to persistent data
+	server.persistMu.Lock()
+	server.persistentData.APDevices[mac] = device
+	server.persistMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+// handleAPDeviceDeleteAPI removes an AP device from the system
+func handleAPDeviceDeleteAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		MAC string `json:"mac"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	mac := strings.ToLower(req.MAC)
+
+	server.apMu.Lock()
+	device, exists := server.apDevices[mac]
+	if !exists {
+		server.apMu.Unlock()
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	delete(server.apDevices, mac)
+	server.apMu.Unlock()
+
+	// Remove from persistent data
+	server.persistMu.Lock()
+	delete(server.persistentData.APDevices, mac)
+	server.persistMu.Unlock()
+
+	server.addLog("info", fmt.Sprintf("[AP] Device removed: %s (%s)", device.Hostname, device.MAC))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
 	})
 }
 
@@ -4688,7 +4380,7 @@ const loginPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Login
 <body><div class="login-container"><div class="logo"><h1>🌐 Lumier Dynamics</h1><p>Enterprise Proxy Management v3.0</p></div><div class="error-msg" id="errorMsg"></div><form onsubmit="return handleLogin(event)"><div class="form-group"><label>Username</label><input type="text" id="username" placeholder="Enter username" required autofocus></div><div class="form-group"><label>Password</label><input type="password" id="password" placeholder="Enter password" required></div><button type="submit" class="login-btn" id="loginBtn">Sign In</button></form></div>
 <script>async function handleLogin(e){e.preventDefault();const btn=document.getElementById('loginBtn'),err=document.getElementById('errorMsg');btn.disabled=true;btn.textContent='Signing in...';err.classList.remove('show');try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});if(r.ok)window.location.href='/dashboard';else{err.textContent='Invalid username or password';err.classList.add('show');btn.disabled=false;btn.textContent='Sign In';}}catch(e){err.textContent='Connection error';err.classList.add('show');btn.disabled=false;btn.textContent='Sign In';}return false;}</script></body></html>`
 
-const navHTML = `<nav style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:15px 30px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:1.5em">🌐</span><span style="color:white;font-size:1.3em;font-weight:bold">Lumier Dynamics</span></div><div style="display:flex;gap:5px;flex-wrap:wrap"><a href="/dashboard" class="nav-link" id="nav-dashboard">📱 Devices</a><a href="/health" class="nav-link" id="nav-health">💚 Health</a><a href="/diagnostics" class="nav-link" id="nav-diagnostics">🔬 Diagnostics</a><a href="/analytics" class="nav-link" id="nav-analytics">📊 Analytics</a><a href="/activity" class="nav-link" id="nav-activity">📋 Activity</a><a href="/monitoring" class="nav-link" id="nav-monitoring">🖥️ Monitor</a><a href="/settings" class="nav-link" id="nav-settings">⚙️ Settings</a></div><div style="display:flex;align-items:center;gap:15px;color:white"><span id="currentUser">Admin</span><button onclick="logout()" style="background:rgba(255,255,255,0.2);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500">Logout</button></div></nav>`
+const navHTML = `<nav style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:15px 30px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:1.5em">🌐</span><span style="color:white;font-size:1.3em;font-weight:bold">Lumier Dynamics</span></div><div style="display:flex;gap:5px;flex-wrap:wrap"><a href="/access-point" class="nav-link" id="nav-ap">📡 AP Devices</a><a href="/dashboard" class="nav-link" id="nav-dashboard">📱 Devices</a><a href="/health" class="nav-link" id="nav-health">💚 Health</a><a href="/diagnostics" class="nav-link" id="nav-diagnostics">🔬 Diagnostics</a><a href="/analytics" class="nav-link" id="nav-analytics">📊 Analytics</a><a href="/activity" class="nav-link" id="nav-activity">📋 Activity</a><a href="/monitoring" class="nav-link" id="nav-monitoring">🖥️ Monitor</a><a href="/settings" class="nav-link" id="nav-settings">⚙️ Settings</a></div><div style="display:flex;align-items:center;gap:15px;color:white"><span id="currentUser">Admin</span><button onclick="logout()" style="background:rgba(255,255,255,0.2);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500">Logout</button></div></nav>`
 
 const baseStyles = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f7fa;min-height:100vh}.nav-link{color:rgba(255,255,255,0.85);text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:500}.nav-link:hover,.nav-link.active{background:rgba(255,255,255,0.2);color:white}.container{max-width:1600px;margin:0 auto;padding:25px}.page-header{margin-bottom:25px}.page-header h1{color:#333;font-size:1.8em;margin-bottom:5px}.page-header p{color:#666}.card{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.card h2{color:#333;font-size:1.3em;margin-bottom:15px;padding-bottom:10px;border-bottom:2px solid #f0f0f0}.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:20px;margin-bottom:25px}.stat-card{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);text-align:center;cursor:pointer;transition:transform 0.2s}.stat-card:hover{transform:translateY(-3px)}.stat-value{font-size:2.2em;font-weight:bold;color:#667eea;margin-bottom:5px}.stat-label{color:#666;font-size:0.85em;text-transform:uppercase;letter-spacing:1px}.btn{padding:10px 18px;border:none;border-radius:8px;cursor:pointer;font-size:0.95em;font-weight:600;transition:all 0.2s}.btn-primary{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white}.btn-primary:hover{opacity:0.9}.btn-secondary{background:#f5f5f5;color:#333;border:2px solid #e0e0e0}.btn-secondary:hover{background:#e8e8e8}.toast{position:fixed;bottom:30px;right:30px;background:#333;color:white;padding:15px 25px;border-radius:10px;z-index:1001;animation:slideIn 0.3s ease}.toast.success{background:#4caf50}.toast.error{background:#f44336}@keyframes slideIn{from{transform:translateX(100px);opacity:0}to{transform:translateX(0);opacity:1}}.loading{text-align:center;padding:40px;color:#666}`
 
@@ -4714,3 +4406,6 @@ const settingsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Se
 
 const monitoringPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Network Monitor</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>` + baseStyles + `.monitor-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:15px;margin-bottom:25px}.monitor-stat{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);text-align:center}.monitor-stat .value{font-size:2em;font-weight:bold}.monitor-stat .label{color:#666;font-size:0.85em;text-transform:uppercase;margin-top:5px}.devices-section{background:white;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);overflow:hidden;margin-bottom:20px}.devices-header{background:#667eea;color:white;padding:15px 20px;display:flex;justify-content:space-between;align-items:center}.devices-header h2{margin:0;font-size:1.1em}.device-card{padding:15px 20px;border-bottom:1px solid #f0f0f0;display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:15px;align-items:center;cursor:pointer;transition:background 0.2s}.device-card:hover{background:#f8f9ff}.device-card.active{border-left:4px solid #4caf50}.device-card.inactive{border-left:4px solid #ccc}.device-info{display:flex;flex-direction:column;gap:3px}.device-name{font-weight:600;color:#333}.device-ip{font-size:0.85em;color:#888;font-family:monospace}.device-status{display:flex;flex-direction:column;gap:3px}.status-indicator{font-size:0.85em;display:flex;align-items:center;gap:6px}.status-dot{width:8px;height:8px;border-radius:50%}.device-data{text-align:right}.data-value{font-weight:600;color:#667eea}.data-label{font-size:0.75em;color:#888}.device-expiry{text-align:right}.expiry-time{font-weight:600;font-size:1.1em}.expiry-label{font-size:0.75em;color:#888}.connections-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center}.connections-modal.show{display:flex}.modal-content{background:white;border-radius:12px;width:90%;max-width:700px;max-height:80vh;overflow:hidden}.modal-header{background:#333;color:white;padding:15px 20px;display:flex;justify-content:space-between;align-items:center}.modal-header h3{margin:0}.modal-close{background:none;border:none;color:white;font-size:1.5em;cursor:pointer;padding:0 10px}.modal-body{padding:20px;max-height:60vh;overflow-y:auto}.conn-table{width:100%;border-collapse:collapse}.conn-table th,.conn-table td{padding:10px;text-align:left;border-bottom:1px solid #eee}.conn-table th{background:#f5f5f5;font-weight:600;color:#555;font-size:0.85em}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>🖥️ Network Monitor</h1><p>Real-time network activity and device overview</p></div><div class="monitor-stats"><div class="monitor-stat"><div class="value" style="color:#667eea" id="totalDevices">-</div><div class="label">Online Devices</div></div><div class="monitor-stat"><div class="value" style="color:#4caf50" id="activeNow">-</div><div class="label">Active Now</div></div><div class="monitor-stat"><div class="value" style="color:#2196F3" id="totalDataIn">-</div><div class="label">Data In</div></div><div class="monitor-stat"><div class="value" style="color:#9c27b0" id="totalDataOut">-</div><div class="label">Data Out</div></div><div class="monitor-stat"><div class="value" style="color:#ff9800" id="uptimeValue">-</div><div class="label">Uptime</div></div></div><div class="devices-section"><div class="devices-header"><h2>📱 Device Activity (Last 30 min)</h2><button class="btn btn-secondary" onclick="loadOverview()" style="padding:6px 12px;font-size:0.85em">🔄 Refresh</button></div><div id="devicesList"><div style="padding:40px;text-align:center;color:#666">Loading devices...</div></div></div></div><div class="connections-modal" id="connModal" onclick="if(event.target===this)closeModal()"><div class="modal-content"><div class="modal-header"><h3 id="modalTitle">Device Connections</h3><button class="modal-close" onclick="closeModal()">&times;</button></div><div class="modal-body"><div id="connList">Loading...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-monitoring').classList.add('active');function loadOverview(){fetch('/api/network-overview').then(r=>r.json()).then(data=>{document.getElementById('totalDevices').textContent=data.total_devices;document.getElementById('activeNow').textContent=data.active_count;document.getElementById('totalDataIn').textContent=formatBytes(data.total_bytes_in);document.getElementById('totalDataOut').textContent=formatBytes(data.total_bytes_out);const list=document.getElementById('devicesList');if(!data.devices||!data.devices.length){list.innerHTML='<div style="padding:40px;text-align:center;color:#666">No active devices in the last 30 minutes.</div>';return;}list.innerHTML=data.devices.map(d=>{const statusClass=d.is_active?'active':'inactive';const statusColor=d.is_active?'#4caf50':'#999';const statusText=d.is_active?'Active':'Idle';const expiryColor=d.session_expiry==='Expired'?'#c62828':d.session_expiry.includes('m')&&!d.session_expiry.includes('h')?'#ff9800':'#333';const hosts=d.recent_hosts&&d.recent_hosts.length?d.recent_hosts.slice(0,3).join(', '):'No recent activity';return'<div class="device-card '+statusClass+'" onclick="showConnections(\''+d.ip+'\',\''+d.name+'\')"><div class="device-info"><span class="device-name">'+d.name+'</span><span class="device-ip">'+d.ip+'</span><span style="font-size:0.8em;color:#888;margin-top:3px">'+hosts+'</span></div><div class="device-status"><span class="status-indicator"><span class="status-dot" style="background:'+statusColor+'"></span>'+statusText+'</span><span style="font-size:0.85em;color:#888">'+(d.is_active?'Active now':Math.round(d.last_active_min)+' min ago')+'</span></div><div class="device-data"><div class="data-value">'+formatBytes(d.bytes_in+d.bytes_out)+'</div><div class="data-label">Total Data</div><div style="font-size:0.85em;color:#888;margin-top:5px">'+formatNumber(d.request_count)+' reqs</div></div><div class="device-expiry"><div class="expiry-time" style="color:'+expiryColor+'">'+d.session_expiry+'</div><div class="expiry-label">Session Expiry</div></div></div>';}).join('');});fetch('/api/system-stats').then(r=>r.json()).then(d=>{document.getElementById('uptimeValue').textContent=d.uptime_formatted;});}function showConnections(ip,name){document.getElementById('modalTitle').textContent=name+' - Recent Connections';document.getElementById('connList').innerHTML='<div style="text-align:center;padding:20px">Loading...</div>';document.getElementById('connModal').classList.add('show');fetch('/api/device-connections?device_ip='+encodeURIComponent(ip)).then(r=>r.json()).then(conns=>{if(!conns||!conns.length){document.getElementById('connList').innerHTML='<div style="text-align:center;color:#666;padding:20px">No recent connections recorded.</div>';return;}document.getElementById('connList').innerHTML='<table class="conn-table"><thead><tr><th>Time</th><th>Host</th><th>Protocol</th><th>Data</th></tr></thead><tbody>'+conns.map(c=>{const time=new Date(c.timestamp).toLocaleTimeString();return'<tr><td>'+time+'</td><td style="font-family:monospace">'+c.host+'</td><td>'+c.protocol+'</td><td>↓'+formatBytes(c.bytes_in)+' ↑'+formatBytes(c.bytes_out)+'</td></tr>';}).join('')+'</tbody></table>';});}function closeModal(){document.getElementById('connModal').classList.remove('show');}loadOverview();setInterval(loadOverview,5000);</script></body></html>`
+
+const accessPointPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Access Point</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>` + baseStyles + `.ap-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:15px;margin-bottom:25px}.ap-stat{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);text-align:center}.ap-stat .value{font-size:2em;font-weight:bold}.ap-stat .label{color:#666;font-size:0.85em;text-transform:uppercase;margin-top:5px}.devices-section{background:white;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);overflow:hidden;margin-bottom:20px}.devices-header{background:#667eea;color:white;padding:15px 20px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}.devices-header h2{margin:0;font-size:1.1em}.device-row{padding:15px 20px;border-bottom:1px solid #f0f0f0;display:grid;grid-template-columns:auto 1fr 1fr 1fr auto;gap:15px;align-items:center}.device-row:hover{background:#f8f9ff}.device-row.pending{background:#fff3e0;border-left:4px solid #ff9800}.device-row.confirmed{border-left:4px solid #4caf50}.device-row.offline{opacity:0.6}.device-status{width:12px;height:12px;border-radius:50%}.device-info{display:flex;flex-direction:column;gap:3px}.device-name{font-weight:600;color:#333}.device-mac{font-size:0.8em;color:#888;font-family:monospace}.device-ip{font-size:0.85em;color:#666;font-family:monospace}.device-proxy{text-align:center}.proxy-badge{background:#e3f2fd;color:#1976d2;padding:5px 12px;border-radius:15px;font-size:0.85em;font-weight:500}.device-data{text-align:right;font-size:0.85em;color:#666}.device-actions{display:flex;gap:8px}.btn-approve{background:#4caf50;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500}.btn-approve:hover{background:#43a047}.btn-revoke{background:#ff9800;color:white;border:none;padding:8px 12px;border-radius:6px;cursor:pointer}.btn-delete{background:#f44336;color:white;border:none;padding:8px 12px;border-radius:6px;cursor:pointer}.filter-tabs{display:flex;gap:5px;flex-wrap:wrap}.filter-tab{background:rgba(255,255,255,0.2);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500}.filter-tab.active{background:white;color:#667eea}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📡 Access Point Devices</h1><p>Manage devices connected via the WiFi access point</p></div><div class="ap-stats"><div class="ap-stat"><div class="value" style="color:#ff9800" id="pendingCount">-</div><div class="label">Pending Approval</div></div><div class="ap-stat"><div class="value" style="color:#4caf50" id="confirmedCount">-</div><div class="label">Approved</div></div><div class="ap-stat"><div class="value" style="color:#2196F3" id="onlineCount">-</div><div class="label">Online Now</div></div><div class="ap-stat"><div class="value" style="color:#667eea" id="totalCount">-</div><div class="label">Total Devices</div></div></div><div class="devices-section"><div class="devices-header"><h2>Connected Devices</h2><div class="filter-tabs"><button class="filter-tab active" onclick="setFilter('all')">All</button><button class="filter-tab" onclick="setFilter('pending')">Pending</button><button class="filter-tab" onclick="setFilter('confirmed')">Approved</button><button class="filter-tab" onclick="setFilter('online')">Online</button></div><button class="btn btn-secondary" onclick="loadDevices()" style="padding:6px 12px;font-size:0.85em">🔄 Refresh</button></div><div id="devicesList"><div style="padding:40px;text-align:center;color:#666">Loading devices...</div></div></div><div class="card"><h2>ℹ️ Access Point Network</h2><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-top:15px"><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Network:</strong> 10.10.10.0/24</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Gateway:</strong> 10.10.10.1</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>DHCP Range:</strong> 10.10.10.100-200</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Proxy Port:</strong> 8888</div></div><p style="margin-top:15px;color:#666;font-size:0.9em"><strong>Security:</strong> New devices are blocked until approved. All traffic must go through the proxy.</p></div></div><script>` + baseJS + `document.getElementById('nav-ap').classList.add('active');let currentFilter='all';let allDevices=[];function setFilter(f){currentFilter=f;document.querySelectorAll('.filter-tab').forEach(t=>t.classList.remove('active'));event.target.classList.add('active');renderDevices();}function loadDevices(){fetch('/api/ap/status').then(r=>r.json()).then(s=>{document.getElementById('pendingCount').textContent=s.pending_devices;document.getElementById('confirmedCount').textContent=s.confirmed_devices;document.getElementById('onlineCount').textContent=s.online_devices;document.getElementById('totalCount').textContent=s.total_devices;});fetch('/api/ap/devices').then(r=>r.json()).then(devices=>{allDevices=devices;renderDevices();});}function renderDevices(){const list=document.getElementById('devicesList');let filtered=allDevices;if(currentFilter==='pending')filtered=allDevices.filter(d=>!d.confirmed);else if(currentFilter==='confirmed')filtered=allDevices.filter(d=>d.confirmed);else if(currentFilter==='online')filtered=allDevices.filter(d=>d.status==='online');if(!filtered.length){list.innerHTML='<div style="padding:40px;text-align:center;color:#666">No devices found.</div>';return;}list.innerHTML=filtered.map(d=>{const statusColor=d.status==='online'?'#4caf50':'#ccc';const rowClass=(d.confirmed?'confirmed':'pending')+' '+(d.status==='offline'?'offline':'');const name=d.custom_name||d.hostname||'Unknown Device';return'<div class="device-row '+rowClass+'"><div class="device-status" style="background:'+statusColor+'" title="'+d.status+'"></div><div class="device-info"><span class="device-name">'+name+'</span><span class="device-mac">'+d.mac+'</span><span class="device-ip">'+d.ip+'</span></div><div class="device-proxy"><span class="proxy-badge">'+d.proxy_name+'</span><select onchange="changeProxy(\''+d.mac+'\',this.value)" style="margin-top:8px;padding:5px;border:1px solid #ddd;border-radius:4px;font-size:0.85em" id="proxy-'+d.mac.replace(/:/g,'')+'"></select></div><div class="device-data"><div>'+formatBytes(d.bytes_in+d.bytes_out)+' total</div><div>'+formatNumber(d.request_count)+' requests</div><div style="margin-top:5px;color:#888">'+d.group+'</div></div><div class="device-actions">'+(d.confirmed?'<button class="btn-revoke" onclick="toggleConfirm(\''+d.mac+'\',false)" title="Revoke access">⛔</button>':'<button class="btn-approve" onclick="toggleConfirm(\''+d.mac+'\',true)">✓ Approve</button>')+'<button class="btn-delete" onclick="deleteDevice(\''+d.mac+'\')" title="Delete">🗑️</button></div></div>';}).join('');loadProxyOptions();}function loadProxyOptions(){fetch('/api/proxies').then(r=>r.json()).then(proxies=>{allDevices.forEach(d=>{const sel=document.getElementById('proxy-'+d.mac.replace(/:/g,''));if(sel){sel.innerHTML=proxies.map((p,i)=>'<option value="'+i+'"'+(i===d.proxy_index?' selected':'')+'>'+p.custom_name+'</option>').join('');}});});}function toggleConfirm(mac,confirmed){fetch('/api/ap/device/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mac:mac,confirmed:confirmed})}).then(r=>r.json()).then(d=>{if(d.success){showToast(confirmed?'Device approved':'Access revoked','success');loadDevices();}else{showToast('Failed','error');}});}function changeProxy(mac,idx){fetch('/api/ap/device/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mac:mac,proxy_index:parseInt(idx)})}).then(r=>r.json()).then(d=>{if(d.success){showToast('Proxy changed to '+d.proxy_name,'success');loadDevices();}});}function deleteDevice(mac){if(!confirm('Delete this device? It will reappear if it reconnects.'))return;fetch('/api/ap/device/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mac:mac})}).then(r=>r.json()).then(d=>{if(d.success){showToast('Device deleted','success');loadDevices();}});}loadDevices();setInterval(loadDevices,10000);</script></body></html>`
