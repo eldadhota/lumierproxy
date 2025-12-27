@@ -16,23 +16,20 @@ import (
 	"time"
 )
 
-// BrowserProfile represents a browser profile from the server
-type BrowserProfile struct {
+// ClientDevice represents a device available for selection
+type ClientDevice struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	ProxyIndex    int    `json:"proxy_index"`
-	UpstreamProxy string `json:"upstream_proxy"`
 	ProxyName     string `json:"proxy_name"`
-	Color         string `json:"color"`
-	Notes         string `json:"notes"`
-	SessionCount  int64  `json:"session_count"`
+	UpstreamProxy string `json:"upstream_proxy"`
+	Group         string `json:"group"`
+	DeviceType    string `json:"device_type"` // "ap" or "legacy"
 }
 
-// ProfilesResponse is the response from the API
-type ProfilesResponse struct {
-	Profiles      []BrowserProfile `json:"profiles"`
-	TotalSessions int              `json:"total_sessions"`
-	SessionsToday int              `json:"sessions_today"`
+// DevicesResponse is the response from the API
+type DevicesResponse struct {
+	Devices []ClientDevice `json:"devices"`
 }
 
 // Config holds client configuration
@@ -46,7 +43,7 @@ var configPath string
 
 func main() {
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
-	fmt.Println("║           LUMIER DYNAMICS - Browser Profile Launcher       ║")
+	fmt.Println("║           LUMIER DYNAMICS - Device Browser Launcher        ║")
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -76,10 +73,10 @@ func main() {
 			continue
 		}
 
-		// Fetch and display profiles
-		profiles, err := fetchProfiles()
+		// Fetch and display devices
+		devices, err := fetchDevices()
 		if err != nil {
-			fmt.Printf("❌ Error fetching profiles: %v\n", err)
+			fmt.Printf("❌ Error fetching devices: %v\n", err)
 			fmt.Println()
 			fmt.Println("Options:")
 			fmt.Println("  [R] Retry")
@@ -100,9 +97,9 @@ func main() {
 			continue
 		}
 
-		if len(profiles) == 0 {
-			fmt.Println("No browser profiles configured on the server.")
-			fmt.Println("Please create profiles in the dashboard first.")
+		if len(devices) == 0 {
+			fmt.Println("No approved devices found on the server.")
+			fmt.Println("Please approve devices in the dashboard first.")
 			fmt.Println()
 			fmt.Println("  [R] Retry")
 			fmt.Println("  [Q] Quit")
@@ -114,25 +111,28 @@ func main() {
 			continue
 		}
 
-		// Display profiles
+		// Display devices
 		fmt.Println("╔════════════════════════════════════════════════════════════╗")
-		fmt.Println("║                    Available Profiles                      ║")
+		fmt.Println("║                    Available Devices                       ║")
 		fmt.Println("╠════════════════════════════════════════════════════════════╣")
-		for i, p := range profiles {
-			color := getColorName(p.Color)
-			proxy := p.ProxyName
+		for i, d := range devices {
+			proxy := d.ProxyName
 			if proxy == "" {
-				proxy = fmt.Sprintf("Proxy #%d", p.ProxyIndex+1)
+				proxy = fmt.Sprintf("Proxy #%d", d.ProxyIndex+1)
 			}
-			fmt.Printf("║  [%2d] %-20s │ %-15s │ %s\n", i+1, truncate(p.Name, 20), truncate(proxy, 15), color)
+			group := d.Group
+			if group == "" {
+				group = "Default"
+			}
+			fmt.Printf("║  [%2d] %-22s │ %-12s │ %s\n", i+1, truncate(d.Name, 22), truncate(proxy, 12), truncate(group, 10))
 		}
 		fmt.Println("╠════════════════════════════════════════════════════════════╣")
-		fmt.Printf("║  [U] Change user (current: %-30s ║\n", truncate(config.Username+")", 30))
-		fmt.Println("║  [C] Change server URL                                     ║")
-		fmt.Println("║  [R] Refresh list                                          ║")
+		fmt.Printf("║  User: %-50s ║\n", truncate(config.Username, 50))
+		fmt.Println("╠════════════════════════════════════════════════════════════╣")
+		fmt.Println("║  [U] Change user    [C] Change server    [R] Refresh      ║")
 		fmt.Println("║  [Q] Quit                                                  ║")
 		fmt.Println("╚════════════════════════════════════════════════════════════╝")
-		fmt.Print("Select profile number: ")
+		fmt.Print("Select device number: ")
 
 		choice := readLine()
 
@@ -150,16 +150,16 @@ func main() {
 			return
 		}
 
-		// Parse profile selection
+		// Parse device selection
 		num, err := strconv.Atoi(choice)
-		if err != nil || num < 1 || num > len(profiles) {
+		if err != nil || num < 1 || num > len(devices) {
 			fmt.Println("Invalid selection. Please enter a number from the list.")
 			time.Sleep(time.Second)
 			continue
 		}
 
-		profile := profiles[num-1]
-		launchProfile(profile, firefoxPath)
+		device := devices[num-1]
+		launchDevice(device, firefoxPath)
 	}
 }
 
@@ -254,7 +254,7 @@ func configureUsername() {
 	fmt.Printf("✓ Username set to: %s\n\n", username)
 }
 
-func fetchProfiles() ([]BrowserProfile, error) {
+func fetchDevices() ([]ClientDevice, error) {
 	resp, err := http.Get(config.ServerURL + "/api/client/profiles")
 	if err != nil {
 		return nil, err
@@ -266,29 +266,29 @@ func fetchProfiles() ([]BrowserProfile, error) {
 		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result ProfilesResponse
+	var result DevicesResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
 
-	return result.Profiles, nil
+	return result.Devices, nil
 }
 
-func launchProfile(profile BrowserProfile, firefoxPath string) {
+func launchDevice(device ClientDevice, firefoxPath string) {
 	fmt.Println()
-	fmt.Printf("🚀 Launching profile: %s\n", profile.Name)
-	fmt.Printf("   Proxy: %s\n", profile.ProxyName)
+	fmt.Printf("🚀 Launching browser for device: %s\n", device.Name)
+	fmt.Printf("   Proxy: %s\n", device.ProxyName)
 	fmt.Println()
 
-	// Create a unique profile directory for this browser profile
-	profileDir := getProfileDir(profile.ID)
+	// Create a unique profile directory for this device
+	profileDir := getProfileDir(device.ID)
 	os.MkdirAll(profileDir, 0755)
 
 	// Configure Firefox preferences for proxy
-	configureFirefoxPrefs(profileDir, profile)
+	configureFirefoxPrefs(profileDir, device)
 
 	// Start session
-	sessionID := startSession(profile.ID)
+	sessionID := startSession(device)
 
 	// Launch Firefox
 	fmt.Println("Starting Firefox... (close the browser to end session)")
@@ -312,7 +312,7 @@ func launchProfile(profile BrowserProfile, firefoxPath string) {
 	}
 
 	// End session
-	endSession(profile.ID, sessionID, int64(duration.Seconds()))
+	endSession(device, sessionID, int64(duration.Seconds()))
 
 	fmt.Println()
 	fmt.Printf("✓ Session ended. Duration: %s\n", formatDuration(int64(duration.Seconds())))
@@ -331,14 +331,14 @@ func getProfileDir(profileID string) string {
 	return filepath.Join(home, ".lumier-client", "profiles", profileID)
 }
 
-func configureFirefoxPrefs(profileDir string, profile BrowserProfile) {
+func configureFirefoxPrefs(profileDir string, device ClientDevice) {
 	// Parse the proxy string (format: host:port or host:port:user:pass)
 	proxyHost := ""
 	proxyPort := 0
 	proxyUser := ""
 	proxyPass := ""
 
-	parts := strings.Split(profile.UpstreamProxy, ":")
+	parts := strings.Split(device.UpstreamProxy, ":")
 	if len(parts) >= 2 {
 		proxyHost = parts[0]
 		proxyPort, _ = strconv.Atoi(parts[1])
@@ -349,8 +349,8 @@ func configureFirefoxPrefs(profileDir string, profile BrowserProfile) {
 	}
 
 	// Create prefs.js for Firefox
-	prefs := fmt.Sprintf(`// Lumier Dynamics Browser Profile Configuration
-// Profile: %s
+	prefs := fmt.Sprintf(`// Lumier Dynamics Browser Configuration
+// Device: %s
 // Proxy: %s
 
 // Use manual proxy configuration
@@ -392,7 +392,7 @@ user_pref("browser.aboutConfig.showWarning", false);
 // Homepage
 user_pref("browser.startup.homepage", "about:blank");
 user_pref("browser.newtabpage.enabled", false);
-`, profile.Name, profile.ProxyName, proxyHost, proxyPort)
+`, device.Name, device.ProxyName, proxyHost, proxyPort)
 
 	// Add proxy authentication if provided
 	if proxyUser != "" && proxyPass != "" {
@@ -413,12 +413,14 @@ user_pref("signon.autologin.proxy", true);
 	os.WriteFile(userJsPath, []byte(prefs), 0644)
 }
 
-func startSession(profileID string) string {
+func startSession(device ClientDevice) string {
 	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
 
 	data := url.Values{}
 	data.Set("action", "start")
-	data.Set("profile_id", profileID)
+	data.Set("device_id", device.ID)
+	data.Set("device_name", device.Name)
+	data.Set("proxy_name", device.ProxyName)
 	data.Set("username", config.Username)
 	data.Set("session_id", sessionID)
 
@@ -432,10 +434,12 @@ func startSession(profileID string) string {
 	return sessionID
 }
 
-func endSession(profileID string, sessionID string, durationSeconds int64) {
+func endSession(device ClientDevice, sessionID string, durationSeconds int64) {
 	data := url.Values{}
 	data.Set("action", "stop")
-	data.Set("profile_id", profileID)
+	data.Set("device_id", device.ID)
+	data.Set("device_name", device.Name)
+	data.Set("proxy_name", device.ProxyName)
 	data.Set("username", config.Username)
 	data.Set("session_id", sessionID)
 	data.Set("duration", strconv.FormatInt(durationSeconds, 10))
