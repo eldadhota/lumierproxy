@@ -805,6 +805,15 @@ func (s *ProxyServer) loadPersistentData() {
 	if s.persistentData.ProxyNames == nil {
 		s.persistentData.ProxyNames = make(map[int]string)
 	}
+	// Restore browser profiles to runtime map
+	if s.persistentData.BrowserProfiles != nil {
+		s.browserMu.Lock()
+		for id, profile := range s.persistentData.BrowserProfiles {
+			s.browserProfiles[id] = profile
+		}
+		s.browserMu.Unlock()
+		log.Printf("Restored %d browser profiles from storage\n", len(s.persistentData.BrowserProfiles))
+	}
 }
 
 // getProxyName returns the custom name for a proxy or the default "SG{n}" format
@@ -1870,6 +1879,10 @@ func startDashboard() {
 	http.HandleFunc("/api/browser-profiles/delete", server.requireAuth(handleDeleteBrowserProfileAPI))
 	http.HandleFunc("/api/browser-profiles/session", server.requireAuth(handleBrowserSessionAPI))
 	http.HandleFunc("/api/browser-profiles/client-download", handleClientDownload)
+
+	// Client API (no auth required - for Windows client app)
+	http.HandleFunc("/api/client/profiles", handleClientProfilesAPI)
+	http.HandleFunc("/api/client/session", handleClientSessionAPI)
 
 	http.HandleFunc("/dashboard", server.requireAuth(handleDashboard))
 	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
@@ -3248,6 +3261,101 @@ Contact your administrator for the pre-built executable.
 func handleBrowserProfilesPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	fmt.Fprint(w, browserProfilesPageHTML)
+}
+
+// ============================================================================
+// CLIENT API HANDLERS (No auth required - for Windows client app)
+// ============================================================================
+
+// handleClientProfilesAPI returns profiles for the Windows client (no auth)
+func handleClientProfilesAPI(w http.ResponseWriter, r *http.Request) {
+	server.browserMu.RLock()
+	profiles := make([]*BrowserProfile, 0, len(server.browserProfiles))
+	for _, p := range server.browserProfiles {
+		p.ProxyName = server.getProxyName(p.ProxyIndex)
+		profiles = append(profiles, p)
+	}
+	server.browserMu.RUnlock()
+
+	sort.Slice(profiles, func(i, j int) bool {
+		return profiles[i].Name < profiles[j].Name
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"profiles": profiles,
+	})
+}
+
+// handleClientSessionAPI logs sessions from the Windows client (no auth)
+func handleClientSessionAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	r.ParseForm()
+	profileID := r.FormValue("profile_id")
+	action := r.FormValue("action")
+	username := r.FormValue("username")
+	duration, _ := strconv.ParseInt(r.FormValue("duration"), 10, 64)
+
+	server.browserMu.Lock()
+	profile, exists := server.browserProfiles[profileID]
+	if !exists {
+		server.browserMu.Unlock()
+		http.Error(w, "Profile not found", http.StatusNotFound)
+		return
+	}
+
+	if action == "start" {
+		profile.LastUsedAt = time.Now()
+		profile.LastUsedBy = username
+		profile.SessionCount++
+
+		session := BrowserSession{
+			ID:        fmt.Sprintf("bs-%d", time.Now().UnixNano()),
+			ProfileID: profileID,
+			Username:  username,
+			StartedAt: time.Now(),
+		}
+
+		server.persistMu.Lock()
+		server.persistentData.BrowserSessions = append(server.persistentData.BrowserSessions, session)
+		if len(server.persistentData.BrowserSessions) > 500 {
+			server.persistentData.BrowserSessions = server.persistentData.BrowserSessions[len(server.persistentData.BrowserSessions)-500:]
+		}
+		server.persistMu.Unlock()
+
+		server.addLog("info", fmt.Sprintf("[Client] Session started: %s by %s", profile.Name, username))
+	} else if action == "stop" {
+		if duration > 0 {
+			server.persistMu.Lock()
+			for i := len(server.persistentData.BrowserSessions) - 1; i >= 0; i-- {
+				s := &server.persistentData.BrowserSessions[i]
+				if s.ProfileID == profileID && s.Username == username && s.Duration == 0 {
+					s.EndedAt = time.Now()
+					s.Duration = duration
+					break
+				}
+			}
+			server.persistMu.Unlock()
+		}
+		server.addLog("info", fmt.Sprintf("[Client] Session ended: %s by %s (duration: %ds)", profile.Name, username, duration))
+	}
+	server.browserMu.Unlock()
+
+	server.persistMu.Lock()
+	if server.persistentData.BrowserProfiles == nil {
+		server.persistentData.BrowserProfiles = make(map[string]*BrowserProfile)
+	}
+	server.persistentData.BrowserProfiles[profileID] = profile
+	server.persistMu.Unlock()
+
+	server.savePersistentData()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
 // handleBulkImportProxiesAPI imports multiple proxies at once

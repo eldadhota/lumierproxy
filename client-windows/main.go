@@ -255,7 +255,7 @@ func configureUsername() {
 }
 
 func fetchProfiles() ([]BrowserProfile, error) {
-	resp, err := http.Get(config.ServerURL + "/api/browser-profiles")
+	resp, err := http.Get(config.ServerURL + "/api/client/profiles")
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +422,7 @@ func startSession(profileID string) string {
 	data.Set("username", config.Username)
 	data.Set("session_id", sessionID)
 
-	resp, err := http.PostForm(config.ServerURL+"/api/browser-profiles/session", data)
+	resp, err := http.PostForm(config.ServerURL+"/api/client/session", data)
 	if err != nil {
 		fmt.Printf("Warning: Could not log session start: %v\n", err)
 		return sessionID
@@ -440,7 +440,7 @@ func endSession(profileID string, sessionID string, durationSeconds int64) {
 	data.Set("session_id", sessionID)
 	data.Set("duration", strconv.FormatInt(durationSeconds, 10))
 
-	resp, err := http.PostForm(config.ServerURL+"/api/browser-profiles/session", data)
+	resp, err := http.PostForm(config.ServerURL+"/api/client/session", data)
 	if err != nil {
 		fmt.Printf("Warning: Could not log session end: %v\n", err)
 		return
