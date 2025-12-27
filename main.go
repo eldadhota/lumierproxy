@@ -194,6 +194,7 @@ type BrowserProfile struct {
 	Name          string    `json:"name"`           // Display name (e.g., "Shop Account 1")
 	ProxyIndex    int       `json:"proxy_index"`    // Assigned proxy index
 	UpstreamProxy string    `json:"upstream_proxy"` // Full proxy string
+	ProxyName     string    `json:"proxy_name"`     // Display name of the proxy
 	Color         string    `json:"color"`          // Color label for visual identification
 	Notes         string    `json:"notes"`          // Optional notes
 	CreatedAt     time.Time `json:"created_at"`
@@ -2805,6 +2806,8 @@ func handleBrowserProfilesAPI(w http.ResponseWriter, r *http.Request) {
 	server.browserMu.RLock()
 	profiles := make([]*BrowserProfile, 0, len(server.browserProfiles))
 	for _, p := range server.browserProfiles {
+		// Add proxy name
+		p.ProxyName = server.getProxyName(p.ProxyIndex)
 		profiles = append(profiles, p)
 	}
 	server.browserMu.RUnlock()
@@ -2814,8 +2817,24 @@ func handleBrowserProfilesAPI(w http.ResponseWriter, r *http.Request) {
 		return profiles[i].Name < profiles[j].Name
 	})
 
+	// Count sessions today
+	sessionsToday := 0
+	today := time.Now().Truncate(24 * time.Hour)
+	server.persistMu.RLock()
+	totalSessions := len(server.persistentData.BrowserSessions)
+	for _, s := range server.persistentData.BrowserSessions {
+		if s.StartedAt.After(today) {
+			sessionsToday++
+		}
+	}
+	server.persistMu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(profiles)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"profiles":       profiles,
+		"total_sessions": totalSessions,
+		"sessions_today": sessionsToday,
+	})
 }
 
 // handleCreateBrowserProfileAPI creates a new browser profile
