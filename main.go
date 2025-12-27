@@ -31,31 +31,6 @@ import (
 // DATA STRUCTURES
 // ============================================================================
 
-type Device struct {
-	ID            string    `json:"id"`
-	IP            string    `json:"ip"`
-	Username      string    `json:"username"`
-	Name          string    `json:"name"`
-	CustomName    string    `json:"custom_name"`
-	Group         string    `json:"group"`
-	UpstreamProxy string    `json:"upstream_proxy"`
-	Status        string    `json:"status"`
-	FirstSeen     time.Time `json:"first_seen"`
-	LastSeen      time.Time `json:"last_seen"`
-	LastActive    time.Time `json:"last_active"`
-	RequestCount  int64     `json:"request_count"`
-	BytesIn       int64     `json:"bytes_in"`
-	BytesOut      int64     `json:"bytes_out"`
-	Notes         string    `json:"notes"`
-	ErrorCount    int64     `json:"error_count"`
-	LastError     string    `json:"last_error"`
-	LastErrorTime time.Time `json:"last_error_time"`
-	// Session confirmation fields
-	Confirmed     bool      `json:"confirmed"`
-	ConfirmedAt   time.Time `json:"confirmed_at"`
-	SessionStart  time.Time `json:"session_start"`
-}
-
 // DeviceConnection tracks a recent connection made by a device
 type DeviceConnection struct {
 	Timestamp time.Time `json:"timestamp"`
@@ -268,38 +243,7 @@ func isValidUsername(username string) bool {
 	return true
 }
 
-// findDeviceByUsername looks up a device by its username (primary identifier)
-func (s *ProxyServer) findDeviceByUsername(username string) *Device {
-	for _, device := range s.devices {
-		if device.Username == username {
-			return device
-		}
-	}
-	return nil
-}
-
-// findDeviceByIP looks up a device by its current IP address
-func (s *ProxyServer) findDeviceByIP(ip string) *Device {
-	for _, device := range s.devices {
-		if device.IP == ip {
-			return device
-		}
-	}
-	return nil
-}
-
-// findAnonymousDeviceByIP looks up an anonymous device (no username) by IP
-func (s *ProxyServer) findAnonymousDeviceByIP(ip string) *Device {
-	for _, device := range s.devices {
-		if device.IP == ip && device.Username == "" {
-			return device
-		}
-	}
-	return nil
-}
-
 type ProxyServer struct {
-	devices         map[string]*Device
 	mu              sync.RWMutex
 	proxyPool       []string
 	proxyHealth     map[int]*ProxyHealth
@@ -364,11 +308,6 @@ type ProxyInfo struct {
 	Pass       string `json:"pass"`
 	Full       string `json:"full"`
 	CustomName string `json:"custom_name"`
-}
-
-type changeProxyRequest struct {
-	DeviceIP   string `json:"device_ip"`
-	ProxyIndex int    `json:"proxy_index"`
 }
 
 // ============================================================================
@@ -444,19 +383,6 @@ func isWebRTCLeakHost(hostPort string) bool {
 	return false
 }
 
-type updateDeviceRequest struct {
-	DeviceIP   string `json:"device_ip"`
-	CustomName string `json:"custom_name"`
-	Group      string `json:"group"`
-	Notes      string `json:"notes"`
-	Username   string `json:"username"`
-}
-
-type bulkChangeProxyRequest struct {
-	DeviceIPs  []string `json:"device_ips"`
-	ProxyIndex int      `json:"proxy_index"`
-}
-
 type addGroupRequest struct {
 	GroupName string `json:"group_name"`
 }
@@ -471,11 +397,6 @@ type addProxyRequest struct {
 
 type deleteProxyRequest struct {
 	ProxyIndex int `json:"proxy_index"`
-}
-
-type deleteDeviceRequest struct {
-	DeviceIP string `json:"device_ip"`
-	Username string `json:"username"` // Preferred - delete by username for accuracy
 }
 
 type loginRequest struct {
@@ -525,7 +446,6 @@ func main() {
 	requireRegister := parseEnvBool("REQUIRE_REGISTER", true) // Default: require app registration
 
 	server = &ProxyServer{
-		devices:         make(map[string]*Device),
 		proxyPool:       loadProxyPool(),
 		proxyHealth:     make(map[int]*ProxyHealth),
 		proxyPort:       proxyPort,
@@ -569,7 +489,6 @@ func main() {
 	}
 
 	server.loadPersistentData()
-	server.restoreDevicesFromConfig() // Restore devices so IP-based lookup works after restart
 	server.initializeProxyHealth()
 	server.restoreAPDevices() // Restore AP devices from persistent data
 
@@ -583,7 +502,6 @@ func main() {
 		log.Printf("Loaded %d upstream proxies\n", len(server.proxyPool))
 	}
 
-	go cleanupInactiveDevices()
 	go autoSaveData()
 	go collectTrafficSnapshots()
 	go cleanupExpiredSessions()
@@ -828,56 +746,6 @@ func (s *ProxyServer) getProxyName(index int) string {
 	return fmt.Sprintf("SG%d", index+1)
 }
 
-// restoreDevicesFromConfig recreates device objects from saved configs so that
-// IP-based lookup works immediately after a server restart. Without this,
-// registered devices would be blocked until they re-register because the
-// in-memory devices map would be empty.
-func (s *ProxyServer) restoreDevicesFromConfig() {
-	s.persistMu.RLock()
-	defer s.persistMu.RUnlock()
-
-	count := 0
-	for username, cfg := range s.persistentData.DeviceConfigs {
-		// Skip IP-keyed entries (used for allowIPFallback mode)
-		if cfg.Username == "" || cfg.Username != username {
-			continue
-		}
-
-		// Determine upstream proxy
-		var upstreamProxy string
-		s.poolMu.Lock()
-		if cfg.ProxyIndex >= 0 && cfg.ProxyIndex < len(s.proxyPool) {
-			upstreamProxy = s.proxyPool[cfg.ProxyIndex]
-		} else if len(s.proxyPool) > 0 {
-			upstreamProxy = s.proxyPool[0]
-		}
-		s.poolMu.Unlock()
-
-		device := &Device{
-			ID:            fmt.Sprintf("device-%s", username),
-			IP:            cfg.LastIP, // Restore last known IP
-			Username:      username,
-			Name:          username,
-			CustomName:    cfg.CustomName,
-			Group:         cfg.Group,
-			Notes:         cfg.Notes,
-			UpstreamProxy: upstreamProxy,
-			Status:        "active",
-			FirstSeen:     time.Now(),
-			LastSeen:      time.Now(),
-		}
-
-		s.mu.Lock()
-		s.devices[username] = device
-		s.mu.Unlock()
-		count++
-	}
-
-	if count > 0 {
-		log.Printf("Restored %d registered devices from config\n", count)
-	}
-}
-
 // restoreAPDevices restores AP devices from persistent data on startup
 func (s *ProxyServer) restoreAPDevices() {
 	s.persistMu.RLock()
@@ -953,19 +821,19 @@ func autoSaveData() {
 
 func collectTrafficSnapshots() {
 	for range time.NewTicker(5 * time.Minute).C {
-		server.mu.RLock()
+		server.apMu.RLock()
 		var totalBytesIn, totalBytesOut, totalRequests, totalErrors int64
 		activeDevices := 0
-		for _, device := range server.devices {
+		for _, device := range server.apDevices {
 			totalBytesIn += device.BytesIn
 			totalBytesOut += device.BytesOut
 			totalRequests += device.RequestCount
 			totalErrors += device.ErrorCount
-			if time.Since(device.LastSeen) < 5*time.Minute {
+			if device.Confirmed && time.Since(device.LastSeen) < 5*time.Minute {
 				activeDevices++
 			}
 		}
-		server.mu.RUnlock()
+		server.apMu.RUnlock()
 
 		snapshot := TrafficSnapshot{
 			Timestamp:     time.Now(),
@@ -1102,17 +970,14 @@ func (s *ProxyServer) getProxyIndexByString(proxyStr string) int {
 
 func proxyHealthChecker() {
 	for range time.NewTicker(1 * time.Minute).C {
-		server.mu.RLock()
+		server.apMu.RLock()
 		proxyCounts := make(map[int]int)
-		for _, device := range server.devices {
-			if time.Since(device.LastSeen) < 5*time.Minute {
-				idx := server.getProxyIndexByString(device.UpstreamProxy)
-				if idx >= 0 {
-					proxyCounts[idx]++
-				}
+		for _, device := range server.apDevices {
+			if device.Confirmed && time.Since(device.LastSeen) < 5*time.Minute {
+				proxyCounts[device.ProxyIndex]++
 			}
 		}
-		server.mu.RUnlock()
+		server.apMu.RUnlock()
 
 		server.healthMu.Lock()
 		for idx, health := range server.proxyHealth {
@@ -1177,37 +1042,6 @@ func (s *ProxyServer) addLog(level, message string) {
 	s.logMu.Lock()
 	s.logBuffer = append(s.logBuffer, entry)
 	// Keep only last 1000 entries
-	if len(s.logBuffer) > 1000 {
-		s.logBuffer = s.logBuffer[len(s.logBuffer)-1000:]
-	}
-	s.logMu.Unlock()
-}
-
-// addDeviceLog adds a detailed log entry with device information
-func (s *ProxyServer) addDeviceLog(level, category, message string, device *Device) {
-	deviceIP := ""
-	deviceName := ""
-	username := ""
-	if device != nil {
-		deviceIP = device.IP
-		deviceName = device.CustomName
-		if deviceName == "" {
-			deviceName = device.Name
-		}
-		username = device.Username
-	}
-
-	entry := LogEntry{
-		Timestamp:  time.Now(),
-		Level:      level,
-		Message:    message,
-		DeviceIP:   deviceIP,
-		DeviceName: deviceName,
-		Username:   username,
-		Category:   category,
-	}
-	s.logMu.Lock()
-	s.logBuffer = append(s.logBuffer, entry)
 	if len(s.logBuffer) > 1000 {
 		s.logBuffer = s.logBuffer[len(s.logBuffer)-1000:]
 	}
@@ -1281,20 +1115,16 @@ func (s *ProxyServer) trackDeviceConnection(deviceIP string, host string, protoc
 	}
 	s.deviceConnectionMu.Unlock()
 
-	// Update device's LastActive on successful connections
+	// Update AP device's LastActive on successful connections
 	if success {
-		s.mu.Lock()
-		if device, ok := s.devices[deviceIP]; ok {
-			device.LastActive = time.Now()
-		}
-		// Also try by username
-		for _, device := range s.devices {
-			if device.IP == deviceIP {
-				device.LastActive = time.Now()
+		s.apMu.Lock()
+		for _, apDevice := range s.apDevices {
+			if apDevice.IP == deviceIP {
+				apDevice.LastSeen = time.Now()
 				break
 			}
 		}
-		s.mu.Unlock()
+		s.apMu.Unlock()
 	}
 }
 
@@ -1345,229 +1175,6 @@ func (s *ProxyServer) getNextProxy() string {
 	return proxy
 }
 
-func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) (*Device, error) {
-	// Optionally recover the username from the last saved config for this IP if
-	// IP-based fallback is explicitly allowed.
-	if username == "" && s.allowIPFallback {
-		s.persistMu.RLock()
-		if cfg, ok := s.persistentData.DeviceConfigs[clientIP]; ok && cfg.Username != "" {
-			username = cfg.Username
-		}
-		s.persistMu.RUnlock()
-	}
-
-	// When no username is provided (e.g., Android WiFi proxy which can't send
-	// Proxy-Authorization headers), look up if there's a registered device with
-	// this IP. This allows registered devices to use the proxy without needing
-	// to send credentials with every request.
-	if username == "" && s.requireRegister {
-		s.mu.RLock()
-		existingDevice := s.findDeviceByIP(clientIP)
-		if existingDevice != nil && existingDevice.Username != "" {
-			// Found a registered device with this IP - use it directly
-			// Note: LastSeen is updated AFTER session validation in handleProxy()
-			s.mu.RUnlock()
-			return existingDevice, nil
-		}
-		s.mu.RUnlock()
-		// No registered device found for this IP
-		return nil, fmt.Errorf("registration required: no username presented")
-	}
-
-	// Check persistence for a registered profile when required.
-	s.persistMu.RLock()
-	var savedConfig DeviceConfig
-	var hasSavedConfig bool
-	if username != "" {
-		savedConfig, hasSavedConfig = s.persistentData.DeviceConfigs[username]
-	}
-	s.persistMu.RUnlock()
-
-	if username != "" && s.requireRegister && !hasSavedConfig {
-		return nil, fmt.Errorf("registration required: unknown username '%s'", username)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// First, try to find device by username (primary identifier)
-	if username != "" {
-		if device := s.findDeviceByUsername(username); device != nil {
-			// Update IP if it changed (device got new IP from DHCP)
-			if device.IP != clientIP {
-				oldIP := device.IP
-				device.IP = clientIP
-				log.Printf("📱 Device '%s' IP changed: %s -> %s\n", username, oldIP, clientIP)
-				s.addLog("info", fmt.Sprintf("Device '%s' IP changed: %s -> %s", username, oldIP, clientIP))
-			}
-			// Note: LastSeen is updated AFTER session validation in handleProxy()
-			return device, nil
-		}
-	}
-
-	// For requests without username, optionally allow IP-based reuse for
-	// backwards compatibility when explicitly enabled.
-	if username == "" && s.allowIPFallback {
-		if device := s.findDeviceByIP(clientIP); device != nil {
-			// Note: LastSeen is updated AFTER session validation in handleProxy()
-			return device, nil
-		}
-	}
-
-	var upstreamProxy, customName, group, notes string = s.getNextProxy(), "", "Default", ""
-	if hasSavedConfig {
-		if savedConfig.ProxyIndex >= 0 && savedConfig.ProxyIndex < len(s.proxyPool) {
-			upstreamProxy = s.proxyPool[savedConfig.ProxyIndex]
-		}
-		customName, group, notes = savedConfig.CustomName, savedConfig.Group, savedConfig.Notes
-	}
-
-	// If registration is required and there is still no username, deny the
-	// request instead of creating an anonymous device.
-	if username == "" && s.requireRegister {
-		return nil, fmt.Errorf("registration required: no username mapping found")
-	}
-
-	// Generate device ID based on username if available
-	var deviceID, deviceName string
-	if username != "" {
-		deviceID = fmt.Sprintf("device-%s", username)
-		deviceName = username
-	} else {
-		deviceID = fmt.Sprintf("device-%d", len(s.devices)+1)
-		deviceName = fmt.Sprintf("Anonymous-%s", clientIP)
-	}
-
-	device := &Device{
-		ID:            deviceID,
-		IP:            clientIP,
-		Username:      username,
-		Name:          deviceName,
-		CustomName:    customName,
-		Group:         group,
-		Notes:         notes,
-		UpstreamProxy: upstreamProxy,
-		Status:        "active",
-		FirstSeen:     time.Now(),
-		LastSeen:      time.Now(),
-	}
-
-	// Store by username if available, otherwise by IP
-	if username != "" {
-		s.devices[username] = device
-		log.Printf("📱 New device: '%s' (%s) -> %s\n", username, clientIP, extractProxyIP(upstreamProxy))
-		s.addLog("info", fmt.Sprintf("New device connected: '%s' (%s) -> Proxy %s", username, clientIP, extractProxyIP(upstreamProxy)))
-	} else {
-		s.devices[clientIP] = device
-		log.Printf("📱 New anonymous device: %s -> %s\n", clientIP, extractProxyIP(upstreamProxy))
-		s.addLog("info", fmt.Sprintf("New anonymous device: %s -> Proxy %s", clientIP, extractProxyIP(upstreamProxy)))
-	}
-
-	// Save new device config for persistence
-	go s.saveDeviceConfig(device)
-
-	return device, nil
-}
-
-// isDeviceSessionValid checks if a device has a valid confirmed session
-func (s *ProxyServer) isDeviceSessionValid(device *Device) bool {
-	// Get session timeout in hours
-	s.persistMu.RLock()
-	sessionTimeoutHours := s.persistentData.SystemSettings.SessionTimeout
-	s.persistMu.RUnlock()
-
-	if sessionTimeoutHours <= 0 {
-		sessionTimeoutHours = 2 // Default to 2 hours if not set
-	}
-
-	// Device must be confirmed
-	if !device.Confirmed {
-		return false
-	}
-
-	// Check if session has expired
-	sessionDuration := time.Duration(sessionTimeoutHours) * time.Hour
-	if time.Since(device.SessionStart) > sessionDuration {
-		// Session expired - require re-confirmation
-		device.Confirmed = false
-		return false
-	}
-
-	return true
-}
-
-// confirmDeviceSession marks a device as confirmed and starts a new session
-func (s *ProxyServer) confirmDeviceSession(device *Device) {
-	now := time.Now()
-	device.Confirmed = true
-	device.ConfirmedAt = now
-	device.SessionStart = now
-
-	// Save to persistent config
-	s.persistMu.Lock()
-	if cfg, ok := s.persistentData.DeviceConfigs[device.Username]; ok {
-		cfg.LastConfirmed = now
-		cfg.LastSessionStart = now
-		s.persistentData.DeviceConfigs[device.Username] = cfg
-	} else if cfg, ok := s.persistentData.DeviceConfigs[device.IP]; ok {
-		cfg.LastConfirmed = now
-		cfg.LastSessionStart = now
-		s.persistentData.DeviceConfigs[device.IP] = cfg
-	}
-	s.persistMu.Unlock()
-
-	go s.savePersistentData()
-}
-
-// saveDeviceConfig saves a device's config to persistent storage
-func (s *ProxyServer) saveDeviceConfig(device *Device) {
-	// Read device fields under lock to avoid race conditions
-	s.mu.RLock()
-	upstreamProxy := device.UpstreamProxy
-	username := device.Username
-	customName := device.CustomName
-	group := device.Group
-	notes := device.Notes
-	deviceIP := device.IP
-	s.mu.RUnlock()
-
-	// Find proxy index under pool lock
-	s.poolMu.Lock()
-	proxyIndex := 0
-	for i, p := range s.proxyPool {
-		if p == upstreamProxy {
-			proxyIndex = i
-			break
-		}
-	}
-	s.poolMu.Unlock()
-
-	cfg := DeviceConfig{
-		Username:   username,
-		CustomName: customName,
-		Group:      group,
-		Notes:      notes,
-		ProxyIndex: proxyIndex,
-		LastIP:     deviceIP,
-	}
-
-	s.persistMu.Lock()
-	// Persist profiles by username as the primary key. When IP-based
-	// fallback is enabled, also store the latest IP as an alias so that
-	// proxy requests that arrive without auth headers can still be bound
-	// to the correct username/profile instead of creating anonymous
-	// devices for the same phone.
-	if username != "" {
-		s.persistentData.DeviceConfigs[username] = cfg
-		if s.allowIPFallback && deviceIP != "" {
-			s.persistentData.DeviceConfigs[deviceIP] = cfg
-		}
-	}
-	s.persistMu.Unlock()
-
-	go s.savePersistentData()
-}
-
 func handleProxy(w http.ResponseWriter, r *http.Request) {
 	clientIP := strings.Split(r.RemoteAddr, ":")[0]
 
@@ -1606,217 +1213,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Legacy device handling (username-based auth)
-	username := parseProxyUsername(r)
-	device, err := server.getOrCreateDevice(clientIP, username)
-	if err != nil {
-		// Log unregistered connection attempt
-		server.addLog("warn", fmt.Sprintf("[BLOCKED] Unregistered device %s (user: %s) tried to connect to %s", clientIP, username, r.Host))
-		server.addDeviceActivity(clientIP, "connection_blocked", "Device not registered", false, "", r.Host)
-		http.Error(w, "Registration required", http.StatusProxyAuthRequired)
-		return
-	}
-
-	// Check if device session is confirmed and valid
-	if !server.isDeviceSessionValid(device) {
-		// Log session invalid attempt
-		server.addDeviceLog("warn", "session", fmt.Sprintf("[BLOCKED] Session expired/unconfirmed for %s trying to access %s", device.Username, r.Host), device)
-		server.addDeviceActivity(clientIP, "session_blocked", "Session expired or not confirmed", false, "", r.Host)
-		http.Error(w, "Session expired or not confirmed.", http.StatusProxyAuthRequired)
-		return
-	}
-
-	// Update LastSeen only AFTER session validation passes
-	// This prevents blocked/expired devices from appearing "active" in the dashboard
-	server.mu.Lock()
-	device.LastSeen = time.Now()
-	server.mu.Unlock()
-
-	atomic.AddInt64(&device.RequestCount, 1)
-
-	// Get proxy name for logging
-	proxyName := ""
-	proxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
-	if proxyIndex >= 0 {
-		server.persistMu.RLock()
-		if name, ok := server.persistentData.ProxyNames[proxyIndex]; ok {
-			proxyName = name
-		} else {
-			proxyName = fmt.Sprintf("Proxy #%d", proxyIndex+1)
-		}
-		server.persistMu.RUnlock()
-	}
-
-	if r.Method == http.MethodConnect {
-		handleHTTPS(w, r, device, proxyName)
-	} else {
-		handleHTTP(w, r, device, proxyName)
-	}
-}
-
-func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device, proxyName string) {
-	target := r.Host
-	if !strings.Contains(target, ":") {
-		target += ":443"
-	}
-
-	// Block WebRTC leak sources (STUN/TURN servers)
-	if isWebRTCLeakHost(target) {
-		// Silently block to prevent WebRTC IP leaks - return connection refused
-		http.Error(w, "Connection refused", http.StatusForbidden)
-		return
-	}
-
-	startTime := time.Now()
-	proxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
-
-	targetConn, err := dialThroughSOCKS5(target, device.UpstreamProxy)
-	if err != nil {
-		errMsg := err.Error()
-		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, errMsg)
-		}
-		// Only count as device error if it's not a proxy-side issue
-		if !isProxySideError(errMsg) {
-			atomic.AddInt64(&device.ErrorCount, 1)
-			server.mu.Lock()
-			device.LastError = errMsg
-			device.LastErrorTime = time.Now()
-			server.mu.Unlock()
-			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] HTTPS connection failed to %s via %s: %s", target, proxyName, errMsg), device)
-			server.addDeviceActivity(device.IP, "connection_error", fmt.Sprintf("HTTPS to %s failed: %s", target, errMsg), false, proxyName, target)
-		}
-		// Skip logging proxy-side errors (ruleset blocks, etc) - they're normal behavior
-		http.Error(w, "Failed to connect", http.StatusBadGateway)
-		return
-	}
-	defer targetConn.Close()
-
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	defer clientConn.Close()
-
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	// Log successful connection (only for first few requests to avoid spam)
-	reqCount := atomic.LoadInt64(&device.RequestCount)
-	if reqCount <= 5 || reqCount%100 == 0 {
-		server.addDeviceActivity(device.IP, "https_connect", fmt.Sprintf("Connected to %s", target), true, proxyName, target)
-	}
-
-	done := make(chan bool, 2)
-	var bytesOut, bytesIn int64
-
-	go func() {
-		n, _ := io.Copy(targetConn, clientConn)
-		bytesOut = n
-		atomic.AddInt64(&device.BytesOut, n)
-		done <- true
-	}()
-
-	go func() {
-		n, _ := io.Copy(clientConn, targetConn)
-		bytesIn = n
-		atomic.AddInt64(&device.BytesIn, n)
-		done <- true
-	}()
-
-	<-done
-	if proxyIndex >= 0 {
-		server.recordProxySuccess(proxyIndex, time.Since(startTime), bytesIn, bytesOut)
-	}
-	// Track connection for real-time monitoring
-	server.trackDeviceConnection(device.IP, target, "HTTPS", bytesIn, bytesOut, true)
-}
-
-func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device, proxyName string) {
-	host := r.Host
-	if !strings.Contains(host, ":") {
-		host += ":80"
-	}
-
-	// Block WebRTC leak sources (STUN/TURN servers)
-	if isWebRTCLeakHost(host) {
-		// Silently block to prevent WebRTC IP leaks
-		http.Error(w, "Connection refused", http.StatusForbidden)
-		return
-	}
-
-	startTime := time.Now()
-	proxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
-
-	targetConn, err := dialThroughSOCKS5(host, device.UpstreamProxy)
-	if err != nil {
-		errMsg := err.Error()
-		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, errMsg)
-		}
-		if !isProxySideError(errMsg) {
-			atomic.AddInt64(&device.ErrorCount, 1)
-			server.mu.Lock()
-			device.LastError = errMsg
-			server.mu.Unlock()
-			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] HTTP connection failed to %s via %s: %s", host, proxyName, errMsg), device)
-			server.addDeviceActivity(device.IP, "connection_error", fmt.Sprintf("HTTP to %s failed: %s", host, errMsg), false, proxyName, host)
-		}
-		// Skip logging proxy-side errors (ruleset blocks, etc) - they're normal behavior
-		http.Error(w, "Failed to connect", http.StatusBadGateway)
-		return
-	}
-	defer targetConn.Close()
-
-	r.RequestURI = ""
-	if err := r.Write(targetConn); err != nil {
-		errMsg := err.Error()
-		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, errMsg)
-		}
-		if !isProxySideError(errMsg) {
-			atomic.AddInt64(&device.ErrorCount, 1)
-			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] Failed to send HTTP request to %s: %s", host, errMsg), device)
-		}
-		http.Error(w, "Failed to send request", http.StatusBadGateway)
-		return
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(targetConn), r)
-	if err != nil {
-		errMsg := err.Error()
-		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, errMsg)
-		}
-		if !isProxySideError(errMsg) {
-			atomic.AddInt64(&device.ErrorCount, 1)
-			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] Failed to read HTTP response from %s: %s", host, errMsg), device)
-		}
-		http.Error(w, "Failed to read response", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	n, _ := io.Copy(w, resp.Body)
-	atomic.AddInt64(&device.BytesIn, n)
-
-	if proxyIndex >= 0 {
-		server.recordProxySuccess(proxyIndex, time.Since(startTime), n, 0)
-	}
-	// Track connection for real-time monitoring
-	server.trackDeviceConnection(device.IP, host, "HTTP", n, 0, true)
+	// Non-AP devices are not allowed - must connect through the Access Point
+	server.addLog("warn", fmt.Sprintf("[BLOCKED] Non-AP client %s tried to connect to %s", clientIP, r.Host))
+	http.Error(w, "Access denied. Please connect through the Access Point.", http.StatusForbidden)
 }
 
 func dialThroughSOCKS5(target, proxyStr string) (net.Conn, error) {
@@ -1835,19 +1234,6 @@ func dialThroughSOCKS5(target, proxyStr string) (net.Conn, error) {
 		return nil, err
 	}
 	return dialer.Dial("tcp", target)
-}
-
-func cleanupInactiveDevices() {
-	for range time.NewTicker(10 * time.Minute).C {
-		timeout := time.Duration(server.persistentData.SystemSettings.DeviceTimeoutMinutes) * time.Minute
-		server.mu.Lock()
-		for ip, device := range server.devices {
-			if time.Since(device.LastSeen) > timeout {
-				delete(server.devices, ip)
-			}
-		}
-		server.mu.Unlock()
-	}
 }
 
 // ============================================================================
@@ -1894,19 +1280,14 @@ func startDashboard() {
 	http.HandleFunc("/settings", server.requireAuth(handleSettingsPage))
 	http.HandleFunc("/monitoring", server.requireAuth(handleMonitoringPage))
 
-	http.HandleFunc("/api/devices", server.requireAuth(handleDevicesAPI))
 	http.HandleFunc("/api/stats", server.requireAuth(handleStatsAPI))
 	http.HandleFunc("/api/server-ip", server.requireAuth(handleServerIPAPI))
 	http.HandleFunc("/api/proxies", server.requireAuth(handleProxiesAPI))
-	http.HandleFunc("/api/change-proxy", server.requireAuth(handleChangeProxyAPI))
-	http.HandleFunc("/api/update-device", server.requireAuth(handleUpdateDeviceAPI))
-	http.HandleFunc("/api/bulk-change-proxy", server.requireAuth(handleBulkChangeProxyAPI))
 	http.HandleFunc("/api/groups", server.requireAuth(handleGroupsAPI))
 	http.HandleFunc("/api/add-group", server.requireAuth(handleAddGroupAPI))
 	http.HandleFunc("/api/delete-group", server.requireAuth(handleDeleteGroupAPI))
 	http.HandleFunc("/api/add-proxy", server.requireAuth(handleAddProxyAPI))
 	http.HandleFunc("/api/delete-proxy", server.requireAuth(handleDeleteProxyAPI))
-	http.HandleFunc("/api/delete-device", server.requireAuth(handleDeleteDeviceAPI))
 	http.HandleFunc("/api/export", server.requireAuth(handleExportAPI))
 	http.HandleFunc("/api/bulk-import-proxies", server.requireAuth(handleBulkImportProxiesAPI))
 	http.HandleFunc("/api/proxy-health", server.requireAuth(handleProxyHealthAPI))
@@ -2048,82 +1429,12 @@ func handleChangePasswordAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
-// DeviceWithStatus extends Device with online status for API response
-type DeviceWithStatus struct {
-	*Device
-	Online bool `json:"online"`
-}
-
-func handleDevicesAPI(w http.ResponseWriter, r *http.Request) {
-	// Check if we want to include offline devices
-	includeOffline := r.URL.Query().Get("include_offline") == "true"
-
-	server.mu.RLock()
-	activeUsernames := make(map[string]bool)
-	devices := make([]DeviceWithStatus, 0)
-
-	// Add all active devices
-	for _, d := range server.devices {
-		isOnline := time.Since(d.LastSeen) < 5*time.Minute
-		devices = append(devices, DeviceWithStatus{Device: d, Online: isOnline})
-		if d.Username != "" {
-			activeUsernames[d.Username] = true
-		}
-	}
-	server.mu.RUnlock()
-
-	// Add offline registered devices from persistent config
-	if includeOffline {
-		server.persistMu.RLock()
-		for username, cfg := range server.persistentData.DeviceConfigs {
-			// Skip if already in active devices or if it's an IP-keyed entry
-			if activeUsernames[username] || cfg.Username == "" || cfg.Username != username {
-				continue
-			}
-
-			// Get proxy string
-			var upstreamProxy string
-			server.poolMu.Lock()
-			if cfg.ProxyIndex >= 0 && cfg.ProxyIndex < len(server.proxyPool) {
-				upstreamProxy = server.proxyPool[cfg.ProxyIndex]
-			}
-			server.poolMu.Unlock()
-
-			offlineDevice := &Device{
-				ID:            fmt.Sprintf("device-%s", username),
-				IP:            cfg.LastIP,
-				Username:      username,
-				Name:          username,
-				CustomName:    cfg.CustomName,
-				Group:         cfg.Group,
-				Notes:         cfg.Notes,
-				UpstreamProxy: upstreamProxy,
-				Status:        "offline",
-			}
-			devices = append(devices, DeviceWithStatus{Device: offlineDevice, Online: false})
-		}
-		server.persistMu.RUnlock()
-	}
-
-	sort.Slice(devices, func(i, j int) bool {
-		ni, nj := devices[i].CustomName, devices[j].CustomName
-		if ni == "" {
-			ni = devices[i].Name
-		}
-		if nj == "" {
-			nj = devices[j].Name
-		}
-		return ni < nj
-	})
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(devices)
-}
-
 func handleStatsAPI(w http.ResponseWriter, r *http.Request) {
-	server.mu.RLock()
+	// Stats from AP devices only
+	server.apMu.RLock()
 	activeCount, totalRequests, totalErrors, totalBytesIn, totalBytesOut := 0, int64(0), int64(0), int64(0), int64(0)
-	for _, d := range server.devices {
-		if time.Since(d.LastSeen) < 5*time.Minute {
+	for _, d := range server.apDevices {
+		if d.Confirmed && time.Since(d.LastSeen) < 5*time.Minute {
 			activeCount++
 		}
 		totalRequests += d.RequestCount
@@ -2131,8 +1442,8 @@ func handleStatsAPI(w http.ResponseWriter, r *http.Request) {
 		totalBytesIn += d.BytesIn
 		totalBytesOut += d.BytesOut
 	}
-	totalDevices := len(server.devices)
-	server.mu.RUnlock()
+	totalDevices := len(server.apDevices)
+	server.apMu.RUnlock()
 
 	server.healthMu.RLock()
 	healthyProxies := 0
@@ -3308,41 +2619,6 @@ func handleClientProfilesAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	server.apMu.RUnlock()
 
-	// Get legacy devices (confirmed only)
-	server.mu.RLock()
-	for _, d := range server.devices {
-		if d.Confirmed && d.UpstreamProxy != "" {
-			name := d.CustomName
-			if name == "" {
-				name = d.Name
-			}
-			if name == "" {
-				name = d.Username
-			}
-			// Find proxy index from upstream proxy string
-			proxyIndex := -1
-			server.poolMu.Lock()
-			for i, p := range server.proxyPool {
-				if p == d.UpstreamProxy {
-					proxyIndex = i
-					break
-				}
-			}
-			server.poolMu.Unlock()
-
-			devices = append(devices, ClientDevice{
-				ID:            d.Username,
-				Name:          name,
-				ProxyIndex:    proxyIndex,
-				ProxyName:     server.getProxyName(proxyIndex),
-				UpstreamProxy: d.UpstreamProxy,
-				Group:         d.Group,
-				DeviceType:    "legacy",
-			})
-		}
-	}
-	server.mu.RUnlock()
-
 	// Sort by name
 	sort.Slice(devices, func(i, j int) bool {
 		return devices[i].Name < devices[j].Name
@@ -3566,13 +2842,16 @@ func handleDiagnosticsAPI(w http.ResponseWriter, r *http.Request) {
 		return proxyDiagnostics[i]["index"].(int) < proxyDiagnostics[j]["index"].(int)
 	})
 
-	// Collect device health summary
-	server.mu.RLock()
+	// Collect device health summary from AP devices
+	server.apMu.RLock()
 	var activeDevices, inactiveDevices, errorDevices int
 	var totalDeviceRequests, totalDeviceErrors int64
 	deviceHealthSummary := make([]map[string]interface{}, 0)
 
-	for _, device := range server.devices {
+	for _, device := range server.apDevices {
+		if !device.Confirmed {
+			continue // Skip unconfirmed devices
+		}
 		isActive := time.Since(device.LastSeen) < 5*time.Minute
 		if isActive {
 			activeDevices++
@@ -3586,8 +2865,7 @@ func handleDiagnosticsAPI(w http.ResponseWriter, r *http.Request) {
 		totalDeviceErrors += device.ErrorCount
 
 		// Get proxy name for this device
-		proxyIdx := server.getProxyIndexByString(device.UpstreamProxy)
-		proxyName := server.getProxyName(proxyIdx)
+		proxyName := server.getProxyName(device.ProxyIndex)
 
 		// Calculate device error rate
 		var errorRate float64
@@ -3595,9 +2873,14 @@ func handleDiagnosticsAPI(w http.ResponseWriter, r *http.Request) {
 			errorRate = float64(device.ErrorCount) / float64(device.RequestCount) * 100
 		}
 
+		name := device.CustomName
+		if name == "" {
+			name = device.Hostname
+		}
+
 		deviceHealthSummary = append(deviceHealthSummary, map[string]interface{}{
-			"username":      device.Username,
-			"name":          device.CustomName,
+			"mac":           device.MAC,
+			"name":          name,
 			"ip":            device.IP,
 			"proxy_name":    proxyName,
 			"request_count": device.RequestCount,
@@ -3610,7 +2893,7 @@ func handleDiagnosticsAPI(w http.ResponseWriter, r *http.Request) {
 			"last_error":    device.LastError,
 		})
 	}
-	server.mu.RUnlock()
+	server.apMu.RUnlock()
 
 	// Sort devices by request count (most active first)
 	sort.Slice(deviceHealthSummary, func(i, j int) bool {
@@ -3667,144 +2950,6 @@ func handleTrafficHistoryAPI(w http.ResponseWriter, r *http.Request) {
 	server.persistMu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(history)
-}
-
-func handleChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req changeProxyRequest
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	// Find device by IP (the UI sends IP as device identifier)
-	server.mu.Lock()
-	device := server.findDeviceByIP(req.DeviceIP)
-	server.mu.Unlock()
-	if device == nil {
-		http.Error(w, "device not found", http.StatusNotFound)
-		return
-	}
-	server.poolMu.Lock()
-	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
-		server.poolMu.Unlock()
-		http.Error(w, "invalid proxy index", http.StatusBadRequest)
-		return
-	}
-	newProxy := server.proxyPool[req.ProxyIndex]
-	server.poolMu.Unlock()
-
-	server.mu.Lock()
-	device.UpstreamProxy = newProxy
-	device.LastSeen = time.Now()
-	server.mu.Unlock()
-
-	go server.saveDeviceConfig(device)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
-}
-
-func handleUpdateDeviceAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req updateDeviceRequest
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	// Find device by IP (the UI sends IP as device identifier)
-	server.mu.Lock()
-	device := server.findDeviceByIP(req.DeviceIP)
-	if device == nil {
-		server.mu.Unlock()
-		http.Error(w, "device not found", http.StatusNotFound)
-		return
-	}
-
-	// Get old key for re-keying if username changes
-	oldKey := device.Username
-
-	// Update device fields
-	device.CustomName = req.CustomName
-	device.Group = req.Group
-	device.Notes = req.Notes
-
-	// Handle username change
-	newUsername := strings.TrimSpace(req.Username)
-	usernameChanged := device.Username != newUsername
-
-	if usernameChanged {
-		// Remove device from old key
-		delete(server.devices, oldKey)
-
-		// Update username and name
-		device.Username = newUsername
-		if newUsername != "" {
-			device.Name = newUsername
-		} else {
-			device.Name = fmt.Sprintf("Anonymous-%s", device.IP)
-		}
-
-		// Add device with new key
-		newKey := newUsername
-		if newKey == "" {
-			newKey = device.IP
-		}
-		server.devices[newKey] = device
-	}
-	server.mu.Unlock()
-
-	// Update persistent data for username only
-	server.persistMu.Lock()
-	if usernameChanged && oldKey != "" {
-		delete(server.persistentData.DeviceConfigs, oldKey)
-	}
-	server.persistMu.Unlock()
-
-	go server.saveDeviceConfig(device)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
-}
-
-func handleBulkChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req bulkChangeProxyRequest
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	server.poolMu.Lock()
-	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
-		server.poolMu.Unlock()
-		http.Error(w, "invalid proxy index", http.StatusBadRequest)
-		return
-	}
-	newProxy := server.proxyPool[req.ProxyIndex]
-	server.poolMu.Unlock()
-
-	updated := 0
-	for _, ip := range req.DeviceIPs {
-		server.mu.Lock()
-		device := server.findDeviceByIP(ip)
-		if device != nil {
-			device.UpstreamProxy = newProxy
-			updated++
-			server.mu.Unlock()
-			go server.saveDeviceConfig(device)
-		} else {
-			server.mu.Unlock()
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "updated": updated})
 }
 
 func handleGroupsAPI(w http.ResponseWriter, r *http.Request) {
@@ -3876,14 +3021,14 @@ func handleDeleteGroupAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	server.persistMu.Unlock()
-	// Also update in-memory devices
-	server.mu.Lock()
-	for _, device := range server.devices {
+	// Also update in-memory AP devices
+	server.apMu.Lock()
+	for _, device := range server.apDevices {
 		if device.Group == req.GroupName {
 			device.Group = "Default"
 		}
 	}
-	server.mu.Unlock()
+	server.apMu.Unlock()
 	go server.savePersistentData()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "deleted": deleted})
@@ -3950,18 +3095,18 @@ func handleDeleteProxyAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid proxy index", http.StatusBadRequest)
 		return
 	}
-	// Check if any devices are using this proxy
+	// Check if any AP devices are using this proxy
 	deletedProxy := server.proxyPool[req.ProxyIndex]
 	server.poolMu.Unlock()
 
-	server.mu.RLock()
+	server.apMu.RLock()
 	devicesUsingProxy := 0
-	for _, device := range server.devices {
+	for _, device := range server.apDevices {
 		if device.UpstreamProxy == deletedProxy {
 			devicesUsingProxy++
 		}
 	}
-	server.mu.RUnlock()
+	server.apMu.RUnlock()
 
 	if devicesUsingProxy > 0 {
 		http.Error(w, fmt.Sprintf("Cannot delete: %d device(s) are using this proxy. Reassign them first.", devicesUsingProxy), http.StatusBadRequest)
@@ -4006,62 +3151,6 @@ func handleDeleteProxyAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "deleted": true})
 }
 
-func handleDeleteDeviceAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req deleteDeviceRequest
-	if json.NewDecoder(r.Body).Decode(&req) != nil || (req.DeviceIP == "" && req.Username == "") {
-		http.Error(w, "invalid request - need device_ip or username", http.StatusBadRequest)
-		return
-	}
-
-	// Find device - prefer username lookup for accuracy
-	server.mu.Lock()
-	var device *Device
-	var deviceKey string
-
-	if req.Username != "" {
-		// Try by username first (most accurate)
-		device = server.findDeviceByUsername(req.Username)
-		if device != nil {
-			deviceKey = req.Username
-		}
-	}
-
-	if device == nil && req.DeviceIP != "" {
-		// Fall back to IP lookup
-		device = server.findDeviceByIP(req.DeviceIP)
-		if device != nil {
-			if device.Username != "" {
-				deviceKey = device.Username
-			} else {
-				deviceKey = device.IP
-			}
-		}
-	}
-
-	exists := device != nil
-	if device != nil {
-		delete(server.devices, deviceKey)
-	}
-	server.mu.Unlock()
-
-	// Delete from persistent data
-	server.persistMu.Lock()
-	if req.Username != "" {
-		delete(server.persistentData.DeviceConfigs, req.Username)
-	} else if device != nil && device.Username != "" {
-		delete(server.persistentData.DeviceConfigs, device.Username)
-	}
-	server.persistMu.Unlock()
-
-	go server.savePersistentData()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "deleted": exists})
-}
-
 func saveProxyPool() {
 	server.poolMu.Lock()
 	defer server.poolMu.Unlock()
@@ -4074,12 +3163,12 @@ func saveProxyPool() {
 }
 
 func handleExportAPI(w http.ResponseWriter, r *http.Request) {
-	server.mu.RLock()
-	devices := make([]*Device, 0)
-	for _, d := range server.devices {
+	server.apMu.RLock()
+	devices := make([]*APDevice, 0)
+	for _, d := range server.apDevices {
 		devices = append(devices, d)
 	}
-	server.mu.RUnlock()
+	server.apMu.RUnlock()
 	server.healthMu.RLock()
 	healthData := make([]*ProxyHealth, 0)
 	for _, h := range server.proxyHealth {
@@ -4153,19 +3242,19 @@ func handleSystemStatsAPI(w http.ResponseWriter, r *http.Request) {
 	cpuUsage := server.cpuUsage
 	server.cpuMu.RUnlock()
 
-	server.mu.RLock()
+	server.apMu.RLock()
 	var totalBytesIn, totalBytesOut, totalRequests int64
 	activeDevices := 0
-	for _, d := range server.devices {
+	for _, d := range server.apDevices {
 		totalBytesIn += d.BytesIn
 		totalBytesOut += d.BytesOut
 		totalRequests += d.RequestCount
-		if time.Since(d.LastSeen) < 5*time.Minute {
+		if d.Confirmed && time.Since(d.LastSeen) < 5*time.Minute {
 			activeDevices++
 		}
 	}
-	totalDevices := len(server.devices)
-	server.mu.RUnlock()
+	totalDevices := len(server.apDevices)
+	server.apMu.RUnlock()
 
 	uptime := time.Since(server.startTime)
 
@@ -4283,18 +3372,17 @@ func handleActivityLogAPI(w http.ResponseWriter, r *http.Request) {
 	// Get all logs (up to 1000)
 	allLogs := server.getLogs(1000)
 
-	// Build a set of registered device usernames/IPs for filtering
+	// Build a set of registered device IPs/MACs for filtering
 	registeredDevices := make(map[string]bool)
 	if registeredOnly {
-		server.mu.RLock()
-		for key, device := range server.devices {
-			registeredDevices[key] = true
-			registeredDevices[device.IP] = true
-			if device.Username != "" {
-				registeredDevices[device.Username] = true
+		server.apMu.RLock()
+		for _, device := range server.apDevices {
+			if device.Confirmed {
+				registeredDevices[device.MAC] = true
+				registeredDevices[device.IP] = true
 			}
 		}
-		server.mu.RUnlock()
+		server.apMu.RUnlock()
 	}
 
 	// Build response with filtering
@@ -5008,38 +4096,23 @@ func handleDeviceConnectionsAPI(w http.ResponseWriter, r *http.Request) {
 func handleNetworkOverviewAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	server.mu.RLock()
-	defer server.mu.RUnlock()
+	server.apMu.RLock()
+	defer server.apMu.RUnlock()
 
-	// Gather active devices with their current activity
+	// Gather active AP devices with their current activity
 	activeDevices := make([]map[string]interface{}, 0)
 	now := time.Now()
 
-	for _, device := range server.devices {
-		timeSinceActive := now.Sub(device.LastActive).Minutes()
+	for _, device := range server.apDevices {
+		if !device.Confirmed {
+			continue
+		}
+
 		timeSinceSeen := now.Sub(device.LastSeen).Minutes()
 
 		// Only include devices seen in last 30 minutes
 		if timeSinceSeen > 30 {
 			continue
-		}
-
-		// Get session expiration time
-		sessionHours := server.persistentData.SystemSettings.SessionTimeout
-		if sessionHours == 0 {
-			sessionHours = 2
-		}
-		sessionExpiry := device.SessionStart.Add(time.Duration(sessionHours) * time.Hour)
-		timeUntilExpiry := sessionExpiry.Sub(now)
-		expiryStr := ""
-		if timeUntilExpiry > 0 {
-			if timeUntilExpiry.Hours() >= 1 {
-				expiryStr = fmt.Sprintf("%.0fh %.0fm", timeUntilExpiry.Hours(), float64(int(timeUntilExpiry.Minutes())%60))
-			} else {
-				expiryStr = fmt.Sprintf("%.0fm", timeUntilExpiry.Minutes())
-			}
-		} else {
-			expiryStr = "Expired"
 		}
 
 		// Get recent connections for this device
@@ -5052,15 +4125,15 @@ func handleNetworkOverviewAPI(w http.ResponseWriter, r *http.Request) {
 			recentHosts = append(recentHosts, conn.Host)
 		}
 
-		// Calculate current data rate (bytes per minute over last activity)
+		// Calculate current data rate (bytes per minute over last seen)
 		dataRate := int64(0)
-		if timeSinceActive < 5 && timeSinceActive > 0 {
-			dataRate = int64(float64(device.BytesIn+device.BytesOut) / timeSinceActive)
+		if timeSinceSeen < 5 && timeSinceSeen > 0 {
+			dataRate = int64(float64(device.BytesIn+device.BytesOut) / timeSinceSeen)
 		}
 
 		name := device.CustomName
 		if name == "" {
-			name = device.Username
+			name = device.Hostname
 		}
 		if name == "" {
 			name = device.IP
@@ -5068,13 +4141,11 @@ func handleNetworkOverviewAPI(w http.ResponseWriter, r *http.Request) {
 
 		activeDevices = append(activeDevices, map[string]interface{}{
 			"ip":              device.IP,
-			"username":        device.Username,
+			"mac":             device.MAC,
 			"name":            name,
 			"group":           device.Group,
-			"is_active":       timeSinceActive < 5,
-			"last_active_min": timeSinceActive,
+			"is_active":       timeSinceSeen < 5,
 			"last_seen_min":   timeSinceSeen,
-			"session_expiry":  expiryStr,
 			"bytes_in":        device.BytesIn,
 			"bytes_out":       device.BytesOut,
 			"data_rate":       dataRate,
@@ -5085,11 +4156,11 @@ func handleNetworkOverviewAPI(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Sort by activity (most active first)
+	// Sort by activity (most recently seen first)
 	sort.Slice(activeDevices, func(i, j int) bool {
-		iActive := activeDevices[i]["last_active_min"].(float64)
-		jActive := activeDevices[j]["last_active_min"].(float64)
-		return iActive < jActive
+		iSeen := activeDevices[i]["last_seen_min"].(float64)
+		jSeen := activeDevices[j]["last_seen_min"].(float64)
+		return iSeen < jSeen
 	})
 
 	// Calculate totals
