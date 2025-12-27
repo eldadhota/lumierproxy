@@ -31,7 +31,7 @@ This guide walks you through migrating from the Android proxy app system to the 
 - Devices connect to this WiFi and are automatically proxied
 - No app needed - all traffic goes through proxy
 - Dashboard approval required for new devices
-- Browser Profiles available for PC proxy switching
+- Windows client available for PC users to use approved device proxies
 
 ### Architecture Diagram
 
@@ -192,8 +192,8 @@ Run through this checklist BEFORE deployment day:
 
    The script will ask for:
    - The USB ethernet interface name (e.g., `enxaabbccddeeff`)
-   - WiFi network name (default: `LumierProxy`)
-   - WiFi password
+
+   Note: WiFi settings are configured on the UniFi AP in Phase 4, not here.
 
 2. **Verify network is up:**
    ```bash
@@ -285,8 +285,7 @@ Run through this checklist BEFORE deployment day:
 2. **Login with your admin credentials**
 
 3. **You should see the dashboard with:**
-   - Devices tab (unified view)
-   - Browsers tab (new)
+   - Devices tab (AP devices and pending approvals)
    - Health, Analytics, Activity, Settings tabs
 
 ---
@@ -351,7 +350,7 @@ curl -I http://localhost:8080
    - Browse to whatismyip.com
    - Confirm it shows the assigned proxy IP
 
-### For PC Users (Browser Profiles):
+### For PC Users (Windows Client):
 
 1. **Download the Windows client:**
    - Go to `http://YOUR_SERVER:8080/browsers`
@@ -367,7 +366,7 @@ curl -I http://localhost:8080
    - Double-click `lumier-client.exe`
    - Enter server URL when prompted
    - Enter username for logging
-   - Select profile to launch
+   - Select an approved device to use its proxy
 
 ---
 
@@ -518,18 +517,25 @@ Print this and keep it handy:
 
 ## Appendix: Rollback Procedure
 
-If something goes wrong and you need to go back to the Android app system:
+If something goes wrong and you need to restore service:
 
-1. **Stop the new system:**
+1. **Restart services:**
    ```bash
-   sudo systemctl stop lumierproxy
-   sudo systemctl stop dnsmasq
+   sudo systemctl restart lumierproxy
+   sudo systemctl restart dnsmasq
    ```
 
-2. **Unplug the USB ethernet adapter**
+2. **Reapply network rules:**
+   ```bash
+   sudo ./deploy/setup-network.sh --fix-rules
+   ```
 
-3. **Reinstall Android apps on devices**
+3. **If USB adapter was disconnected/reconnected:**
+   - Re-run `sudo ./deploy/setup-network.sh` to reconfigure
 
-4. **Configure proxy settings in apps as before**
+4. **Check connectivity:**
+   ```bash
+   sudo ./deploy/status.sh
+   ```
 
-The old device registrations should still work if you kept the same `device_data.json`.
+Note: All devices must connect through the Access Point. There is no fallback to the old Android app system.
