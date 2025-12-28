@@ -48,10 +48,12 @@ func startDashboard() {
 	http.HandleFunc("/diagnostics", server.requireAuth(handleDiagnosticsPage))
 	http.HandleFunc("/analytics", server.requireAuth(handleAnalyticsPage))
 	http.HandleFunc("/activity", server.requireAuth(handleActivityPage))
+	http.HandleFunc("/device-monitor", server.requireAuth(handleDeviceMonitorPage))
 	http.HandleFunc("/settings", server.requireAuth(handleSettingsPage))
 	http.HandleFunc("/monitoring", server.requireAuth(handleMonitoringPage))
 
 	http.HandleFunc("/api/stats", server.requireAuth(handleStatsAPI))
+	http.HandleFunc("/api/devices", server.requireAuth(handleDevicesAPI))
 	http.HandleFunc("/api/server-ip", server.requireAuth(handleServerIPAPI))
 	http.HandleFunc("/api/proxies", server.requireAuth(handleProxiesAPI))
 	http.HandleFunc("/api/groups", server.requireAuth(handleGroupsAPI))

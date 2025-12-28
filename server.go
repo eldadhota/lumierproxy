@@ -294,7 +294,7 @@ type ClientDevice struct {
 	DeviceType    string `json:"device_type"`
 }
 
-// TrustScoreResult contains the fraud score and risk assessment for an IP from a single source
+// TrustScoreResult contains the fraud score and risk assessment for an IP
 type TrustScoreResult struct {
 	Score     int    `json:"score"`
 	Risk      string `json:"risk"`
@@ -302,10 +302,35 @@ type TrustScoreResult struct {
 	Error     string `json:"error"`
 }
 
+// IPQSResult contains detailed fraud data from IPQualityScore API
+type IPQSResult struct {
+	Available      bool    `json:"available"`
+	Error          string  `json:"error,omitempty"`
+	FraudScore     int     `json:"fraud_score"`
+	Risk           string  `json:"risk"`
+	CountryCode    string  `json:"country_code"`
+	City           string  `json:"city"`
+	ISP            string  `json:"isp"`
+	ASN            int     `json:"asn"`
+	Organization   string  `json:"organization"`
+	Proxy          bool    `json:"proxy"`
+	VPN            bool    `json:"vpn"`
+	TOR            bool    `json:"tor"`
+	ActiveVPN      bool    `json:"active_vpn"`
+	ActiveTOR      bool    `json:"active_tor"`
+	RecentAbuse    bool    `json:"recent_abuse"`
+	BotStatus      bool    `json:"bot_status"`
+	ConnectionType string  `json:"connection_type"`
+	AbuseVelocity  string  `json:"abuse_velocity"`
+	IsCrawler      bool    `json:"is_crawler"`
+	Mobile         bool    `json:"mobile"`
+	Host           string  `json:"host"`
+}
+
 // CombinedTrustScore contains fraud scores from multiple sources
 type CombinedTrustScore struct {
-	Scamalytics    TrustScoreResult `json:"scamalytics"`
-	IPQualityScore TrustScoreResult `json:"ipqualityscore"`
+	IPQS           IPQSResult       `json:"ipqs"`
+	IPQualityScore TrustScoreResult `json:"ipqualityscore"` // Legacy field for IP-API fallback
 }
 
 // ============================================================================

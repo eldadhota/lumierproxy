@@ -1,7 +1,6 @@
 package main
 
 import (
-	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -356,6 +354,12 @@ func handleAPStatusAPI(w http.ResponseWriter, r *http.Request) {
 		"confirmed_devices": confirmedDevices,
 		"pending_devices":   pendingDevices,
 	})
+}
+
+// handleDevicesAPI returns list of legacy devices (empty - system is now AP-based)
+func handleDevicesAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte("[]"))
 }
 
 // handleAPDevicesAPI returns list of all AP devices
@@ -1694,6 +1698,11 @@ func handleActivityPage(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(activityPageHTML))
 }
 
+func handleDeviceMonitorPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write(deviceMonitorPageHTML)
+}
+
 func handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(settingsPageHTML))
@@ -2173,96 +2182,107 @@ func handleSessionSettingsAPI(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }
 
-// getScamalyticsScore fetches the fraud score from Scamalytics for an IP
-func getScamalyticsScore(ip string) TrustScoreResult {
+// IPQS API Key - IPQualityScore.com
+const ipqsAPIKey = "NukTNg3uaNw1R565afWGc9i2ebC"
+
+// getIPQSScore fetches fraud data from IPQualityScore API
+func getIPQSScore(ip string) IPQSResult {
 	// Validate IP format
 	if net.ParseIP(ip) == nil {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "invalid IP"}
+		return IPQSResult{Available: false, Error: "invalid IP"}
 	}
 
 	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil // Follow redirects
-		},
-	}
+	client := &http.Client{Timeout: 15 * time.Second}
 
-	// Fetch the Scamalytics page
-	url := "https://scamalytics.com/ip/" + ip
-	req, err := createBrowserRequest(url)
+	// IPQS API endpoint
+	apiURL := fmt.Sprintf("https://www.ipqualityscore.com/api/json/ip/%s/%s?strictness=1&allow_public_access_points=true",
+		ipqsAPIKey, ip)
+
+	resp, err := client.Get(apiURL)
 	if err != nil {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "request error"}
-	}
-
-	// Add referer to look more legitimate
-	req.Header.Set("Referer", "https://scamalytics.com/")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "fetch error"}
+		return IPQSResult{Available: false, Error: "fetch error"}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "status " + strconv.Itoa(resp.StatusCode)}
+		return IPQSResult{Available: false, Error: "HTTP " + strconv.Itoa(resp.StatusCode)}
 	}
 
-	// Read response body (handle gzip if needed)
-	var body []byte
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		reader, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			body, _ = io.ReadAll(resp.Body)
-		} else {
-			defer reader.Close()
-			body, err = io.ReadAll(reader)
-			if err != nil {
-				return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "gzip read error"}
-			}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return IPQSResult{Available: false, Error: "read error"}
+	}
+
+	// Parse IPQS response
+	var ipqsResp struct {
+		Success        bool    `json:"success"`
+		Message        string  `json:"message"`
+		FraudScore     float64 `json:"fraud_score"`
+		CountryCode    string  `json:"country_code"`
+		City           string  `json:"city"`
+		ISP            string  `json:"ISP"`
+		ASN            int     `json:"ASN"`
+		Organization   string  `json:"organization"`
+		Proxy          bool    `json:"proxy"`
+		VPN            bool    `json:"vpn"`
+		TOR            bool    `json:"tor"`
+		ActiveVPN      bool    `json:"active_vpn"`
+		ActiveTOR      bool    `json:"active_tor"`
+		RecentAbuse    bool    `json:"recent_abuse"`
+		BotStatus      bool    `json:"bot_status"`
+		ConnectionType string  `json:"connection_type"`
+		AbuseVelocity  string  `json:"abuse_velocity"`
+		IsCrawler      bool    `json:"is_crawler"`
+		Mobile         bool    `json:"mobile"`
+		Host           string  `json:"host"`
+	}
+
+	if err := json.Unmarshal(body, &ipqsResp); err != nil {
+		return IPQSResult{Available: false, Error: "parse error"}
+	}
+
+	if !ipqsResp.Success {
+		errMsg := ipqsResp.Message
+		if errMsg == "" {
+			errMsg = "API error"
 		}
-	} else {
-		body, err = io.ReadAll(resp.Body)
-		if err != nil {
-			return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "read error"}
-		}
+		return IPQSResult{Available: false, Error: errMsg}
 	}
 
-	html := string(body)
-	score := -1
-
-	// Updated patterns for current Scamalytics HTML structure
-	patterns := []string{
-		`"score"\s*:\s*(\d+)`,                               // JSON-like score
-		`(?i)fraud\s*score[:\s]*</?\w+[^>]*>\s*(\d+)`,       // Fraud Score: <span>XX</span>
-		`(?i)<div[^>]*class="[^"]*score[^"]*"[^>]*>(\d+)<`,  // <div class="score">XX</div>
-		`(?i)>(\d+)</div>\s*</div>\s*<div[^>]*score`,        // Score in nested div
-		`(?i)fraud[^<]*<[^>]+>\s*(\d+)\s*<`,                 // Fraud ... <tag>XX</tag>
-		`(?i)risk[:\s]*(\d+)%`,                              // Risk: XX%
-		`data-score="(\d+)"`,                                // data-score attribute
-		`(?i)score[^>]*>\s*(\d+)\s*<`,                       // Generic score pattern
+	// Calculate risk level
+	score := int(ipqsResp.FraudScore)
+	risk := "low"
+	if score >= 90 {
+		risk = "very high"
+	} else if score >= 75 {
+		risk = "high"
+	} else if score >= 50 {
+		risk = "medium"
 	}
 
-	for _, pattern := range patterns {
-		re := regexp.MustCompile(pattern)
-		matches := re.FindStringSubmatch(html)
-		if len(matches) > 1 {
-			if s, err := strconv.Atoi(matches[1]); err == nil && s >= 0 && s <= 100 {
-				score = s
-				break
-			}
-		}
+	return IPQSResult{
+		Available:      true,
+		FraudScore:     score,
+		Risk:           risk,
+		CountryCode:    ipqsResp.CountryCode,
+		City:           ipqsResp.City,
+		ISP:            ipqsResp.ISP,
+		ASN:            ipqsResp.ASN,
+		Organization:   ipqsResp.Organization,
+		Proxy:          ipqsResp.Proxy,
+		VPN:            ipqsResp.VPN,
+		TOR:            ipqsResp.TOR,
+		ActiveVPN:      ipqsResp.ActiveVPN,
+		ActiveTOR:      ipqsResp.ActiveTOR,
+		RecentAbuse:    ipqsResp.RecentAbuse,
+		BotStatus:      ipqsResp.BotStatus,
+		ConnectionType: ipqsResp.ConnectionType,
+		AbuseVelocity:  ipqsResp.AbuseVelocity,
+		IsCrawler:      ipqsResp.IsCrawler,
+		Mobile:         ipqsResp.Mobile,
+		Host:           ipqsResp.Host,
 	}
-
-	if score == -1 {
-		// Check if we got a Cloudflare or bot protection page
-		if strings.Contains(html, "cloudflare") || strings.Contains(html, "challenge") || strings.Contains(html, "captcha") {
-			return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "bot protection"}
-		}
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "parse error"}
-	}
-
-	return TrustScoreResult{Score: score, Risk: getRiskLevel(score), Available: true}
 }
 
 // getIPQualityScore fetches the fraud score from IPQualityScore for an IP
@@ -2337,23 +2357,24 @@ func getIPQualityScore(ip string) TrustScoreResult {
 // getCombinedTrustScore fetches fraud scores from both Scamalytics and IPQualityScore
 func getCombinedTrustScore(ip string) CombinedTrustScore {
 	// Fetch from both sources concurrently
-	var scamResult, ipqsResult TrustScoreResult
+	var ipqsDetailedResult IPQSResult
+	var ipAPIResult TrustScoreResult
 	var wg sync.WaitGroup
 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		scamResult = getScamalyticsScore(ip)
+		ipqsDetailedResult = getIPQSScore(ip)
 	}()
 	go func() {
 		defer wg.Done()
-		ipqsResult = getIPQualityScore(ip)
+		ipAPIResult = getIPQualityScore(ip) // IP-API fallback
 	}()
 	wg.Wait()
 
 	return CombinedTrustScore{
-		Scamalytics:    scamResult,
-		IPQualityScore: ipqsResult,
+		IPQS:           ipqsDetailedResult,
+		IPQualityScore: ipAPIResult,
 	}
 }
 
@@ -2392,35 +2413,21 @@ func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
 		return proxies[i].Index < proxies[j].Index
 	})
 
-	// Check each proxy IP for trust score from both sources
+	// Check each proxy IP for trust score
 	results := make([]map[string]interface{}, 0)
-	scamLowRisk, scamMedRisk, scamHighRisk := 0, 0, 0
 	ipqsLowRisk, ipqsMedRisk, ipqsHighRisk := 0, 0, 0
-	scamTotalScore, ipqsTotalScore := 0, 0
-	scamScoredCount, ipqsScoredCount := 0, 0
+	ipqsTotalScore := 0
+	ipqsScoredCount := 0
+	proxyCount, vpnCount, torCount := 0, 0, 0
 
 	for _, p := range proxies {
 		combined := getCombinedTrustScore(p.IPAddress)
 
-		// Track Scamalytics stats
-		if combined.Scamalytics.Available {
-			scamTotalScore += combined.Scamalytics.Score
-			scamScoredCount++
-			switch combined.Scamalytics.Risk {
-			case "low":
-				scamLowRisk++
-			case "medium":
-				scamMedRisk++
-			case "high", "very high":
-				scamHighRisk++
-			}
-		}
-
-		// Track IPQualityScore stats
-		if combined.IPQualityScore.Available {
-			ipqsTotalScore += combined.IPQualityScore.Score
+		// Track IPQS stats
+		if combined.IPQS.Available {
+			ipqsTotalScore += combined.IPQS.FraudScore
 			ipqsScoredCount++
-			switch combined.IPQualityScore.Risk {
+			switch combined.IPQS.Risk {
 			case "low":
 				ipqsLowRisk++
 			case "medium":
@@ -2428,18 +2435,45 @@ func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
 			case "high", "very high":
 				ipqsHighRisk++
 			}
+			if combined.IPQS.Proxy {
+				proxyCount++
+			}
+			if combined.IPQS.VPN {
+				vpnCount++
+			}
+			if combined.IPQS.TOR {
+				torCount++
+			}
 		}
 
 		results = append(results, map[string]interface{}{
 			"index":      p.Index,
 			"name":       p.Name,
 			"ip_address": p.IPAddress,
-			"scamalytics": map[string]interface{}{
-				"score":     combined.Scamalytics.Score,
-				"risk":      combined.Scamalytics.Risk,
-				"available": combined.Scamalytics.Available,
-				"error":     combined.Scamalytics.Error,
+			"ipqs": map[string]interface{}{
+				"available":       combined.IPQS.Available,
+				"error":           combined.IPQS.Error,
+				"fraud_score":     combined.IPQS.FraudScore,
+				"risk":            combined.IPQS.Risk,
+				"country_code":    combined.IPQS.CountryCode,
+				"city":            combined.IPQS.City,
+				"isp":             combined.IPQS.ISP,
+				"asn":             combined.IPQS.ASN,
+				"organization":    combined.IPQS.Organization,
+				"proxy":           combined.IPQS.Proxy,
+				"vpn":             combined.IPQS.VPN,
+				"tor":             combined.IPQS.TOR,
+				"active_vpn":      combined.IPQS.ActiveVPN,
+				"active_tor":      combined.IPQS.ActiveTOR,
+				"recent_abuse":    combined.IPQS.RecentAbuse,
+				"bot_status":      combined.IPQS.BotStatus,
+				"connection_type": combined.IPQS.ConnectionType,
+				"abuse_velocity":  combined.IPQS.AbuseVelocity,
+				"is_crawler":      combined.IPQS.IsCrawler,
+				"mobile":          combined.IPQS.Mobile,
+				"host":            combined.IPQS.Host,
 			},
+			// Legacy field for backward compatibility
 			"ipqualityscore": map[string]interface{}{
 				"score":     combined.IPQualityScore.Score,
 				"risk":      combined.IPQualityScore.Risk,
@@ -2449,10 +2483,6 @@ func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	scamAvgScore := -1
-	if scamScoredCount > 0 {
-		scamAvgScore = scamTotalScore / scamScoredCount
-	}
 	ipqsAvgScore := -1
 	if ipqsScoredCount > 0 {
 		ipqsAvgScore = ipqsTotalScore / ipqsScoredCount
@@ -2461,19 +2491,15 @@ func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":       true,
 		"total_checked": len(proxies),
-		"scamalytics": map[string]interface{}{
-			"low_risk_count":    scamLowRisk,
-			"medium_risk_count": scamMedRisk,
-			"high_risk_count":   scamHighRisk,
-			"average_score":     scamAvgScore,
-			"scored_count":      scamScoredCount,
-		},
-		"ipqualityscore": map[string]interface{}{
+		"ipqs_summary": map[string]interface{}{
 			"low_risk_count":    ipqsLowRisk,
 			"medium_risk_count": ipqsMedRisk,
 			"high_risk_count":   ipqsHighRisk,
 			"average_score":     ipqsAvgScore,
 			"scored_count":      ipqsScoredCount,
+			"proxy_count":       proxyCount,
+			"vpn_count":         vpnCount,
+			"tor_count":         torCount,
 		},
 		"results": results,
 	})
