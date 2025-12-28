@@ -282,7 +282,13 @@ func launchDevice(device ClientDevice, firefoxPath string) {
 
 	// Create a unique profile directory for this device
 	profileDir := getProfileDir(device.ID)
-	os.MkdirAll(profileDir, 0755)
+
+	// Initialize the Firefox profile properly
+	if err := initializeFirefoxProfile(profileDir); err != nil {
+		fmt.Printf("❌ Error creating profile: %v\n", err)
+		time.Sleep(2 * time.Second)
+		return
+	}
 
 	// Configure Firefox preferences for proxy
 	configureFirefoxPrefs(profileDir, device)
@@ -297,6 +303,7 @@ func launchDevice(device ClientDevice, firefoxPath string) {
 	args := []string{
 		"-profile", profileDir,
 		"-no-remote",
+		"-new-instance",
 	}
 
 	cmd := exec.Command(firefoxPath, args...)
@@ -324,11 +331,58 @@ func launchDevice(device ClientDevice, firefoxPath string) {
 }
 
 func getProfileDir(profileID string) string {
+	// Sanitize profile ID for filesystem
+	safeID := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, profileID)
+
 	if runtime.GOOS == "windows" {
-		return filepath.Join(os.Getenv("APPDATA"), "LumierClient", "profiles", profileID)
+		return filepath.Join(os.Getenv("APPDATA"), "LumierClient", "profiles", safeID)
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".lumier-client", "profiles", profileID)
+	return filepath.Join(home, ".lumier-client", "profiles", safeID)
+}
+
+func cleanupProfileLocks(profileDir string) {
+	// Remove Firefox lock files that may be left over from crashes
+	lockFiles := []string{
+		filepath.Join(profileDir, "parent.lock"),
+		filepath.Join(profileDir, "lock"),
+		filepath.Join(profileDir, ".parentlock"),
+	}
+	for _, f := range lockFiles {
+		os.Remove(f)
+	}
+}
+
+func initializeFirefoxProfile(profileDir string) error {
+	// Ensure directory exists
+	if err := os.MkdirAll(profileDir, 0755); err != nil {
+		return err
+	}
+
+	// Clean up any stale lock files
+	cleanupProfileLocks(profileDir)
+
+	// Create times.json (Firefox uses this to track profile creation)
+	timesPath := filepath.Join(profileDir, "times.json")
+	if _, err := os.Stat(timesPath); os.IsNotExist(err) {
+		now := time.Now().UnixMilli()
+		timesData := fmt.Sprintf(`{"created":%d,"firstUse":null}`, now)
+		os.WriteFile(timesPath, []byte(timesData), 0644)
+	}
+
+	// Create compatibility.ini (helps Firefox recognize the profile)
+	compatPath := filepath.Join(profileDir, "compatibility.ini")
+	if _, err := os.Stat(compatPath); os.IsNotExist(err) {
+		compatData := "[Compatibility]\nLastVersion=999.0_0/0\nLastOSABI=WINNT_x86_64-msvc\nLastPlatformDir=\nLastAppDir=\n"
+		os.WriteFile(compatPath, []byte(compatData), 0644)
+	}
+
+	return nil
 }
 
 func configureFirefoxPrefs(profileDir string, device ClientDevice) {
