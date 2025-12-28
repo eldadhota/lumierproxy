@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // ClientDevice represents a device available for selection
@@ -280,6 +283,17 @@ func launchDevice(device ClientDevice, firefoxPath string) {
 	fmt.Printf("   Proxy: %s\n", device.ProxyName)
 	fmt.Println()
 
+	// Start local HTTP proxy that forwards through SOCKS5 with authentication
+	fmt.Println("Starting local proxy...")
+	localPort, stopProxy, err := startLocalProxy(device.UpstreamProxy)
+	if err != nil {
+		fmt.Printf("❌ Error starting local proxy: %v\n", err)
+		time.Sleep(2 * time.Second)
+		return
+	}
+	defer stopProxy()
+	fmt.Printf("✓ Local proxy started on port %d\n", localPort)
+
 	// Create a unique profile directory for this device
 	profileDir := getProfileDir(device.ID)
 
@@ -290,8 +304,9 @@ func launchDevice(device ClientDevice, firefoxPath string) {
 		return
 	}
 
-	// Configure Firefox preferences for proxy
-	configureFirefoxPrefs(profileDir, device)
+	// Configure Firefox preferences to use local HTTP proxy
+	configureFirefoxPrefsWithLocalProxy(profileDir, device, localPort)
+	fmt.Println("✓ Firefox configured with proxy and leak protection")
 
 	// Start session
 	sessionID := startSession(device)
@@ -304,6 +319,7 @@ func launchDevice(device ClientDevice, firefoxPath string) {
 		"-profile", profileDir,
 		"-no-remote",
 		"-new-instance",
+		"-wait-for-browser",
 	}
 
 	cmd := exec.Command(firefoxPath, args...)
@@ -311,7 +327,7 @@ func launchDevice(device ClientDevice, firefoxPath string) {
 	cmd.Stderr = os.Stderr
 
 	startTime := time.Now()
-	err := cmd.Run()
+	err = cmd.Run()
 	duration := time.Since(startTime)
 
 	if err != nil {
@@ -391,7 +407,7 @@ func configureFirefoxPrefs(profileDir string, device ClientDevice) {
 	}
 	if len(parts) >= 4 {
 		proxyUser = parts[2]
-		proxyPass = parts[3]
+		proxyPass = strings.Join(parts[3:], ":") // Handle passwords containing colons
 	}
 
 	// Create prefs.js for Firefox
@@ -438,6 +454,11 @@ user_pref("browser.aboutConfig.showWarning", false);
 // Homepage
 user_pref("browser.startup.homepage", "about:blank");
 user_pref("browser.newtabpage.enabled", false);
+
+// Allow unsigned extensions (needed for proxy auth extension)
+user_pref("xpinstall.signatures.required", false);
+user_pref("extensions.autoDisableScopes", 0);
+user_pref("extensions.enabledScopes", 15);
 `, device.Name, device.ProxyName, proxyHost, proxyPort)
 
 	// Add proxy authentication if provided
@@ -457,6 +478,232 @@ user_pref("signon.autologin.proxy", true);
 	// Also write user.js (applied on startup, overrides prefs.js)
 	userJsPath := filepath.Join(profileDir, "user.js")
 	os.WriteFile(userJsPath, []byte(prefs), 0644)
+}
+
+// configureFirefoxPrefsWithLocalProxy configures Firefox to use local HTTP proxy
+// with comprehensive DNS and WebRTC leak protection
+func configureFirefoxPrefsWithLocalProxy(profileDir string, device ClientDevice, localPort int) {
+	prefs := fmt.Sprintf(`// Lumier Dynamics Browser Configuration
+// Device: %s
+// Proxy: %s (via local HTTP proxy on port %d)
+
+// ============================================================
+// HTTP PROXY SETTINGS - Connect to local proxy (no auth needed)
+// ============================================================
+user_pref("network.proxy.type", 1);
+user_pref("network.proxy.http", "127.0.0.1");
+user_pref("network.proxy.http_port", %d);
+user_pref("network.proxy.ssl", "127.0.0.1");
+user_pref("network.proxy.ssl_port", %d);
+user_pref("network.proxy.no_proxies_on", "");
+
+// ============================================================
+// DNS LEAK PROTECTION
+// ============================================================
+// Disable DNS-over-HTTPS (would bypass proxy)
+user_pref("network.trr.mode", 0);
+user_pref("network.trr.uri", "");
+// Disable DNS prefetching
+user_pref("network.dns.disablePrefetch", true);
+user_pref("network.dns.disablePrefetchFromHTTPS", true);
+// Disable prefetching
+user_pref("network.prefetch-next", false);
+// Disable speculative connections
+user_pref("network.http.speculative-parallel-limit", 0);
+user_pref("network.predictor.enabled", false);
+user_pref("network.predictor.enable-prefetch", false);
+
+// ============================================================
+// WEBRTC LEAK PROTECTION
+// ============================================================
+// Completely disable WebRTC
+user_pref("media.peerconnection.enabled", false);
+// Backup restrictions
+user_pref("media.peerconnection.ice.default_address_only", true);
+user_pref("media.peerconnection.ice.no_host", true);
+user_pref("media.navigator.enabled", false);
+user_pref("media.peerconnection.turn.disable", true);
+user_pref("media.peerconnection.use_document_iceservers", false);
+user_pref("media.peerconnection.video.enabled", false);
+user_pref("media.peerconnection.identity.timeout", 1);
+
+// ============================================================
+// ADDITIONAL PRIVACY PROTECTIONS
+// ============================================================
+user_pref("privacy.resistFingerprinting", true);
+user_pref("privacy.trackingprotection.enabled", true);
+user_pref("geo.enabled", false);
+user_pref("beacon.enabled", false);
+
+// Disable telemetry
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("toolkit.telemetry.unified", false);
+user_pref("toolkit.telemetry.archive.enabled", false);
+
+// Clear data on shutdown
+user_pref("privacy.sanitize.sanitizeOnShutdown", true);
+user_pref("privacy.clearOnShutdown.cache", true);
+user_pref("privacy.clearOnShutdown.cookies", true);
+user_pref("privacy.clearOnShutdown.history", false);
+
+// Disable safebrowsing (sends URLs to Google)
+user_pref("browser.safebrowsing.malware.enabled", false);
+user_pref("browser.safebrowsing.phishing.enabled", false);
+user_pref("browser.safebrowsing.downloads.enabled", false);
+
+// UI settings
+user_pref("browser.aboutConfig.showWarning", false);
+user_pref("browser.startup.homepage", "about:blank");
+user_pref("browser.newtabpage.enabled", false);
+`, device.Name, device.ProxyName, localPort, localPort, localPort)
+
+	// Write prefs.js
+	prefsPath := filepath.Join(profileDir, "prefs.js")
+	os.WriteFile(prefsPath, []byte(prefs), 0644)
+
+	// Also write user.js (applied on startup, overrides prefs.js)
+	userJsPath := filepath.Join(profileDir, "user.js")
+	os.WriteFile(userJsPath, []byte(prefs), 0644)
+}
+
+// ============================================================================
+// LOCAL HTTP PROXY - Handles SOCKS5 authentication for Firefox
+// ============================================================================
+
+// localProxyHandler handles HTTP proxy requests and forwards through SOCKS5
+type localProxyHandler struct {
+	dialer proxy.Dialer
+}
+
+// startLocalProxy starts a local HTTP proxy that forwards through the upstream SOCKS5 proxy
+func startLocalProxy(upstreamProxy string) (int, func(), error) {
+	// Parse upstream: host:port:user:pass
+	parts := strings.Split(upstreamProxy, ":")
+	if len(parts) < 4 {
+		return 0, nil, fmt.Errorf("invalid proxy format: expected host:port:user:pass")
+	}
+
+	proxyAddr := parts[0] + ":" + parts[1]
+	auth := &proxy.Auth{
+		User:     parts[2],
+		Password: strings.Join(parts[3:], ":"), // Handle passwords with colons
+	}
+
+	// Create SOCKS5 dialer with authentication
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to create SOCKS5 dialer: %v", err)
+	}
+
+	// Start local HTTP proxy server on random available port
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to start listener: %v", err)
+	}
+
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	handler := &localProxyHandler{dialer: dialer}
+	server := &http.Server{Handler: handler}
+
+	go server.Serve(listener)
+
+	stopFunc := func() {
+		server.Close()
+		listener.Close()
+	}
+
+	return port, stopFunc, nil
+}
+
+// ServeHTTP handles incoming proxy requests
+func (h *localProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		h.handleConnect(w, r)
+	} else {
+		h.handleHTTP(w, r)
+	}
+}
+
+// handleConnect handles HTTPS CONNECT tunneling
+func (h *localProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
+	// Connect to target through SOCKS5 proxy
+	targetConn, err := h.dialer.Dial("tcp", r.Host)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to connect: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer targetConn.Close()
+
+	// Hijack the client connection
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer clientConn.Close()
+
+	// Send 200 Connection Established
+	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// Bidirectional copy
+	done := make(chan bool, 2)
+	go func() {
+		io.Copy(targetConn, clientConn)
+		done <- true
+	}()
+	go func() {
+		io.Copy(clientConn, targetConn)
+		done <- true
+	}()
+	<-done
+	<-done
+}
+
+// handleHTTP handles plain HTTP requests
+func (h *localProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	// Build target address
+	target := r.Host
+	if !strings.Contains(target, ":") {
+		target += ":80"
+	}
+
+	// Connect through SOCKS5 proxy
+	targetConn, err := h.dialer.Dial("tcp", target)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to connect: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer targetConn.Close()
+
+	// Forward the request
+	if err := r.Write(targetConn); err != nil {
+		http.Error(w, "Failed to forward request", http.StatusBadGateway)
+		return
+	}
+
+	// Read and forward response
+	resp, err := http.ReadResponse(bufio.NewReader(targetConn), r)
+	if err != nil {
+		http.Error(w, "Failed to read response", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy headers
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func startSession(device ClientDevice) string {
