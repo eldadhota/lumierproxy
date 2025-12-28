@@ -359,28 +359,20 @@ func cleanupProfileLocks(profileDir string) {
 }
 
 func initializeFirefoxProfile(profileDir string) error {
-	// Ensure directory exists
+	// Remove existing profile to ensure clean state
+	// This avoids version mismatch issues and stale data
+	os.RemoveAll(profileDir)
+
+	// Create fresh profile directory
 	if err := os.MkdirAll(profileDir, 0755); err != nil {
 		return err
 	}
 
-	// Clean up any stale lock files
-	cleanupProfileLocks(profileDir)
-
 	// Create times.json (Firefox uses this to track profile creation)
 	timesPath := filepath.Join(profileDir, "times.json")
-	if _, err := os.Stat(timesPath); os.IsNotExist(err) {
-		now := time.Now().UnixMilli()
-		timesData := fmt.Sprintf(`{"created":%d,"firstUse":null}`, now)
-		os.WriteFile(timesPath, []byte(timesData), 0644)
-	}
-
-	// Create compatibility.ini (helps Firefox recognize the profile)
-	compatPath := filepath.Join(profileDir, "compatibility.ini")
-	if _, err := os.Stat(compatPath); os.IsNotExist(err) {
-		compatData := "[Compatibility]\nLastVersion=999.0_0/0\nLastOSABI=WINNT_x86_64-msvc\nLastPlatformDir=\nLastAppDir=\n"
-		os.WriteFile(compatPath, []byte(compatData), 0644)
-	}
+	now := time.Now().UnixMilli()
+	timesData := fmt.Sprintf(`{"created":%d,"firstUse":null}`, now)
+	os.WriteFile(timesPath, []byte(timesData), 0644)
 
 	return nil
 }
