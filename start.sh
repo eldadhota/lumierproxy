@@ -27,7 +27,7 @@ if ! command -v go &> /dev/null; then
 fi
 
 echo -e "${YELLOW}Building the proxy server...${NC}"
-go build -o lumierproxy main.go
+go build -o lumierproxy .
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}Build successful!${NC}"

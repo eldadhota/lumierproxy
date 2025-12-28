@@ -228,7 +228,7 @@ configure_firewall 2>/dev/null || true
 echo ""
 echo -e "${YELLOW}Building Lumier Dynamics...${NC}"
 
-if go build -o lumierproxy main.go; then
+if go build -o lumierproxy .; then
     echo -e "${GREEN}Build successful!${NC}"
 else
     echo -e "${RED}Build failed. Please check for errors above.${NC}"

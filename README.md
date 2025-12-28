@@ -275,14 +275,31 @@ After registering in the app:
 
 ```
 lumierproxy/
-├── main.go              # Server source code
+├── main.go              # Entry point and API handlers
+├── server.go            # Type definitions, ProxyServer struct
+├── auth.go              # Authentication, sessions
+├── persistence.go       # Data save/load, pruning
+├── proxy.go             # Proxy handling, SOCKS5, health monitoring
+├── dhcp.go              # DHCP monitoring, AP traffic handling
+├── logging.go           # Log and activity tracking
+├── routes.go            # Route registration
+├── utils.go             # Helper functions
+├── embed.go             # Dashboard asset embedding
+├── dashboard/           # Embedded dashboard assets
+│   ├── pages/           # HTML pages (10 files)
+│   ├── assets/          # CSS and JS files
+│   └── partials/        # Shared HTML components
 ├── proxies.txt          # Upstream proxy list
 ├── device_data.json     # Persistent device/settings data
 ├── go.mod               # Go module definition
 ├── run_proxy.ps1        # Windows launcher
 ├── run_proxy.sh         # Linux launcher
-├── install.sh           # Linux service installer
-├── start.sh             # Simple Linux launcher
+├── deploy/              # Deployment scripts
+│   ├── install.sh       # Linux service installer
+│   └── quickstart.sh    # Quick setup script
+├── scripts/             # AP setup scripts
+│   ├── ap-setup.sh      # Access Point setup
+│   └── ap-teardown.sh   # AP teardown
 └── android-app/         # Android application source
 ```
 

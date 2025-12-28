@@ -148,7 +148,7 @@ In UniFi Controller:
 
 ```bash
 cd /home/user/lumierproxy
-go run main.go
+go run .
 ```
 
 Or if you have the compiled binary:
