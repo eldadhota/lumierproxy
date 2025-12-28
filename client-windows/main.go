@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -27,7 +29,7 @@ type ClientDevice struct {
 	ProxyName     string `json:"proxy_name"`
 	UpstreamProxy string `json:"upstream_proxy"`
 	Group         string `json:"group"`
-	DeviceType    string `json:"device_type"` // "ap" or "legacy"
+	DeviceType    string `json:"device_type"`
 }
 
 // DevicesResponse is the response from the API
@@ -38,227 +40,295 @@ type DevicesResponse struct {
 // Config holds client configuration
 type Config struct {
 	ServerURL string `json:"server_url"`
-	Username  string `json:"username"`
 }
 
-var config Config
-var configPath string
+// LumierApp is the main application state
+type LumierApp struct {
+	config     Config
+	configPath string
+
+	// Data
+	devices     []ClientDevice
+	firefoxPath string
+
+	// Session state
+	currentUser    string
+	selectedDevice *ClientDevice
+	isRunning      bool
+	sessionStart   time.Time
+	sessionID      string
+	stopProxy      func()
+
+	mu sync.Mutex
+}
+
+var app *LumierApp
 
 func main() {
-	fmt.Println("╔════════════════════════════════════════════════════════════╗")
-	fmt.Println("║           LUMIER DYNAMICS - Device Browser Launcher        ║")
-	fmt.Println("╚════════════════════════════════════════════════════════════╝")
-	fmt.Println()
+	app = &LumierApp{}
+	app.initialize()
 
-	// Load or create config
-	configPath = getConfigPath()
-	loadConfig()
+	// Start local web server
+	http.HandleFunc("/", handleHome)
+	http.HandleFunc("/api/setup", handleSetup)
+	http.HandleFunc("/api/login", handleLogin)
+	http.HandleFunc("/api/logout", handleLogout)
+	http.HandleFunc("/api/devices", handleDevices)
+	http.HandleFunc("/api/launch", handleLaunch)
+	http.HandleFunc("/api/status", handleStatus)
+	http.HandleFunc("/api/change-server", handleChangeServer)
 
-	// Check if Firefox is installed
-	firefoxPath := findFirefox()
-	if firefoxPath == "" {
-		fmt.Println("⚠️  Firefox not found! Please install Firefox first.")
-		fmt.Println("   Download from: https://www.mozilla.org/firefox/")
-		waitForEnter()
+	// Find available port
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Println("Failed to start server:", err)
 		return
 	}
-	fmt.Printf("✓ Firefox found: %s\n\n", firefoxPath)
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
 
-	// Main loop
-	for {
-		if config.ServerURL == "" {
-			configureServer()
-			continue
-		}
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Printf("Lumier Proxy Launcher running at http://%s\n", addr)
+	fmt.Println("Opening browser...")
 
-		if config.Username == "" {
-			configureUsername()
-			continue
-		}
+	// Open browser
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		openBrowser(fmt.Sprintf("http://%s", addr))
+	}()
 
-		// Fetch and display devices
-		devices, err := fetchDevices()
-		if err != nil {
-			fmt.Printf("❌ Error fetching devices: %v\n", err)
-			fmt.Println()
-			fmt.Println("Options:")
-			fmt.Println("  [R] Retry")
-			fmt.Println("  [C] Change server URL")
-			fmt.Println("  [Q] Quit")
-			fmt.Print("Choice: ")
-			choice := readLine()
-			switch strings.ToUpper(choice) {
-			case "R":
-				continue
-			case "C":
-				config.ServerURL = ""
-				saveConfig()
-				continue
-			case "Q":
-				return
-			}
-			continue
-		}
-
-		if len(devices) == 0 {
-			fmt.Println("No approved devices found on the server.")
-			fmt.Println("Please approve devices in the dashboard first.")
-			fmt.Println()
-			fmt.Println("  [R] Retry")
-			fmt.Println("  [Q] Quit")
-			fmt.Print("Choice: ")
-			choice := readLine()
-			if strings.ToUpper(choice) == "Q" {
-				return
-			}
-			continue
-		}
-
-		// Display devices
-		fmt.Println("╔════════════════════════════════════════════════════════════╗")
-		fmt.Println("║                    Available Devices                       ║")
-		fmt.Println("╠════════════════════════════════════════════════════════════╣")
-		for i, d := range devices {
-			proxy := d.ProxyName
-			if proxy == "" {
-				proxy = fmt.Sprintf("Proxy #%d", d.ProxyIndex+1)
-			}
-			group := d.Group
-			if group == "" {
-				group = "Default"
-			}
-			fmt.Printf("║  [%2d] %-22s │ %-12s │ %s\n", i+1, truncate(d.Name, 22), truncate(proxy, 12), truncate(group, 10))
-		}
-		fmt.Println("╠════════════════════════════════════════════════════════════╣")
-		fmt.Printf("║  User: %-50s ║\n", truncate(config.Username, 50))
-		fmt.Println("╠════════════════════════════════════════════════════════════╣")
-		fmt.Println("║  [U] Change user    [C] Change server    [R] Refresh      ║")
-		fmt.Println("║  [Q] Quit                                                  ║")
-		fmt.Println("╚════════════════════════════════════════════════════════════╝")
-		fmt.Print("Select device number: ")
-
-		choice := readLine()
-
-		switch strings.ToUpper(choice) {
-		case "U":
-			configureUsername()
-			continue
-		case "C":
-			config.ServerURL = ""
-			saveConfig()
-			continue
-		case "R":
-			continue
-		case "Q":
-			return
-		}
-
-		// Parse device selection
-		num, err := strconv.Atoi(choice)
-		if err != nil || num < 1 || num > len(devices) {
-			fmt.Println("Invalid selection. Please enter a number from the list.")
-			time.Sleep(time.Second)
-			continue
-		}
-
-		device := devices[num-1]
-		launchDevice(device, firefoxPath)
-	}
+	fmt.Println("\nPress Ctrl+C to exit")
+	http.ListenAndServe(addr, nil)
 }
 
-func findFirefox() string {
-	if runtime.GOOS == "windows" {
-		// Common Firefox locations on Windows
-		paths := []string{
-			filepath.Join(os.Getenv("ProgramFiles"), "Mozilla Firefox", "firefox.exe"),
-			filepath.Join(os.Getenv("ProgramFiles(x86)"), "Mozilla Firefox", "firefox.exe"),
-			filepath.Join(os.Getenv("LOCALAPPDATA"), "Mozilla Firefox", "firefox.exe"),
-		}
-		for _, p := range paths {
-			if _, err := os.Stat(p); err == nil {
-				return p
-			}
-		}
-		// Try PATH
-		if p, err := exec.LookPath("firefox.exe"); err == nil {
-			return p
-		}
-	} else {
-		// Linux/Mac
-		if p, err := exec.LookPath("firefox"); err == nil {
-			return p
-		}
-	}
-	return ""
+func (l *LumierApp) initialize() {
+	l.configPath = getConfigPath()
+	l.loadConfig()
+	l.firefoxPath = findFirefox()
 }
 
-func getConfigPath() string {
-	if runtime.GOOS == "windows" {
-		return filepath.Join(os.Getenv("APPDATA"), "LumierClient", "config.json")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".lumier-client", "config.json")
-}
-
-func loadConfig() {
-	data, err := os.ReadFile(configPath)
+func (l *LumierApp) loadConfig() {
+	data, err := os.ReadFile(l.configPath)
 	if err != nil {
 		return
 	}
-	json.Unmarshal(data, &config)
+	json.Unmarshal(data, &l.config)
 }
 
-func saveConfig() {
-	dir := filepath.Dir(configPath)
+func (l *LumierApp) saveConfig() {
+	dir := filepath.Dir(l.configPath)
 	os.MkdirAll(dir, 0755)
-	data, _ := json.MarshalIndent(config, "", "  ")
-	os.WriteFile(configPath, data, 0644)
+	data, _ := json.MarshalIndent(l.config, "", "  ")
+	os.WriteFile(l.configPath, data, 0644)
 }
 
-func configureServer() {
-	fmt.Println("Enter the Lumier server URL (e.g., http://192.168.1.100:8080):")
-	fmt.Print("> ")
-	serverURL := readLine()
-	serverURL = strings.TrimSpace(serverURL)
+// ============================================================================
+// HTTP HANDLERS
+// ============================================================================
 
-	// Validate URL
+func handleHome(w http.ResponseWriter, r *http.Request) {
+	tmpl := template.Must(template.New("index").Parse(htmlTemplate))
+
+	data := map[string]interface{}{
+		"HasServer":   app.config.ServerURL != "",
+		"HasUser":     app.currentUser != "",
+		"Username":    app.currentUser,
+		"FirefoxOK":   app.firefoxPath != "",
+		"ServerURL":   app.config.ServerURL,
+	}
+
+	tmpl.Execute(w, data)
+}
+
+func handleSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	serverURL := r.FormValue("server_url")
+	if serverURL == "" {
+		json.NewEncoder(w).Encode(map[string]string{"error": "Please enter a server URL"})
+		return
+	}
+
 	if !strings.HasPrefix(serverURL, "http://") && !strings.HasPrefix(serverURL, "https://") {
 		serverURL = "http://" + serverURL
 	}
 
 	// Test connection
-	fmt.Println("Testing connection...")
-	_, err := http.Get(serverURL + "/api/server-ip")
+	client := &http.Client{Timeout: 5 * time.Second}
+	_, err := client.Get(serverURL + "/api/server-ip")
 	if err != nil {
-		fmt.Printf("❌ Cannot connect to server: %v\n", err)
-		fmt.Println("Please check the URL and try again.")
-		time.Sleep(2 * time.Second)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Cannot connect: " + err.Error()})
 		return
 	}
 
-	config.ServerURL = serverURL
-	saveConfig()
-	fmt.Println("✓ Server configured successfully!")
-	fmt.Println()
+	app.config.ServerURL = serverURL
+	app.saveConfig()
+	json.NewEncoder(w).Encode(map[string]string{"success": "true"})
 }
 
-func configureUsername() {
-	fmt.Println("Enter your username (for session logging):")
-	fmt.Print("> ")
-	username := readLine()
-	username = strings.TrimSpace(username)
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	username := strings.TrimSpace(r.FormValue("username"))
 	if username == "" {
-		fmt.Println("Username cannot be empty.")
-		time.Sleep(time.Second)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Please enter your name"})
 		return
 	}
-	config.Username = username
-	saveConfig()
-	fmt.Printf("✓ Username set to: %s\n\n", username)
+
+	if app.firefoxPath == "" {
+		json.NewEncoder(w).Encode(map[string]string{"error": "Firefox not found. Please install Firefox first."})
+		return
+	}
+
+	app.currentUser = username
+	json.NewEncoder(w).Encode(map[string]string{"success": "true"})
 }
 
-func fetchDevices() ([]ClientDevice, error) {
-	resp, err := http.Get(config.ServerURL + "/api/client/profiles")
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	app.currentUser = ""
+	json.NewEncoder(w).Encode(map[string]string{"success": "true"})
+}
+
+func handleChangeServer(w http.ResponseWriter, r *http.Request) {
+	app.config.ServerURL = ""
+	app.saveConfig()
+	app.currentUser = ""
+	json.NewEncoder(w).Encode(map[string]string{"success": "true"})
+}
+
+func handleDevices(w http.ResponseWriter, r *http.Request) {
+	devices, err := fetchDevices(app.config.ServerURL)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{"error": err.Error()})
+		return
+	}
+	app.devices = devices
+	json.NewEncoder(w).Encode(map[string]interface{}{"devices": devices})
+}
+
+func handleLaunch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+
+	app.mu.Lock()
+	if app.isRunning {
+		app.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]string{"error": "Browser is already running"})
+		return
+	}
+	app.mu.Unlock()
+
+	deviceID := r.FormValue("device_id")
+	var device *ClientDevice
+	for i := range app.devices {
+		if app.devices[i].ID == deviceID {
+			device = &app.devices[i]
+			break
+		}
+	}
+
+	if device == nil {
+		json.NewEncoder(w).Encode(map[string]string{"error": "Device not found"})
+		return
+	}
+
+	app.mu.Lock()
+	app.isRunning = true
+	app.selectedDevice = device
+	app.mu.Unlock()
+
+	go launchBrowser(*device)
+
+	json.NewEncoder(w).Encode(map[string]string{"success": "true"})
+}
+
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	app.mu.Lock()
+	defer app.mu.Unlock()
+
+	status := map[string]interface{}{
+		"running":  app.isRunning,
+		"duration": "",
+	}
+
+	if app.isRunning && !app.sessionStart.IsZero() {
+		elapsed := time.Since(app.sessionStart)
+		status["duration"] = formatDuration(int64(elapsed.Seconds()))
+	}
+
+	json.NewEncoder(w).Encode(status)
+}
+
+// ============================================================================
+// BROWSER LAUNCH
+// ============================================================================
+
+func launchBrowser(device ClientDevice) {
+	// Start local proxy
+	localPort, stopProxy, err := startLocalProxy(device.UpstreamProxy)
+	if err != nil {
+		app.mu.Lock()
+		app.isRunning = false
+		app.mu.Unlock()
+		return
+	}
+
+	// Create profile
+	profileDir := getProfileDir(device.ID)
+	if err := initializeFirefoxProfile(profileDir); err != nil {
+		stopProxy()
+		app.mu.Lock()
+		app.isRunning = false
+		app.mu.Unlock()
+		return
+	}
+
+	// Configure Firefox
+	configureFirefoxPrefsWithLocalProxy(profileDir, device, localPort)
+
+	// Start session tracking
+	app.sessionID = startSession(app.config.ServerURL, device, app.currentUser)
+	app.sessionStart = time.Now()
+
+	// Launch Firefox
+	args := []string{
+		"-profile", profileDir,
+		"-no-remote",
+		"-new-instance",
+		"-wait-for-browser",
+	}
+
+	cmd := exec.Command(app.firefoxPath, args...)
+	startTime := time.Now()
+	cmd.Run()
+	duration := time.Since(startTime)
+
+	// Cleanup
+	stopProxy()
+	endSession(app.config.ServerURL, device, app.currentUser, app.sessionID, int64(duration.Seconds()))
+	flushDNS()
+
+	app.mu.Lock()
+	app.isRunning = false
+	app.selectedDevice = nil
+	app.sessionStart = time.Time{}
+	app.mu.Unlock()
+}
+
+// ============================================================================
+// API FUNCTIONS
+// ============================================================================
+
+func fetchDevices(serverURL string) ([]ClientDevice, error) {
+	resp, err := http.Get(serverURL + "/api/client/profiles")
 	if err != nil {
 		return nil, err
 	}
@@ -277,77 +347,79 @@ func fetchDevices() ([]ClientDevice, error) {
 	return result.Devices, nil
 }
 
-func launchDevice(device ClientDevice, firefoxPath string) {
-	fmt.Println()
-	fmt.Printf("🚀 Launching browser for device: %s\n", device.Name)
-	fmt.Printf("   Proxy: %s\n", device.ProxyName)
-	fmt.Println()
+func startSession(serverURL string, device ClientDevice, username string) string {
+	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
 
-	// Start local HTTP proxy that forwards through SOCKS5 with authentication
-	fmt.Println("Starting local proxy...")
-	localPort, stopProxy, err := startLocalProxy(device.UpstreamProxy)
+	data := url.Values{}
+	data.Set("action", "start")
+	data.Set("device_id", device.ID)
+	data.Set("device_name", device.Name)
+	data.Set("proxy_name", device.ProxyName)
+	data.Set("username", username)
+	data.Set("session_id", sessionID)
+
+	resp, err := http.PostForm(serverURL+"/api/client/session", data)
 	if err != nil {
-		fmt.Printf("❌ Error starting local proxy: %v\n", err)
-		time.Sleep(2 * time.Second)
+		return sessionID
+	}
+	defer resp.Body.Close()
+
+	return sessionID
+}
+
+func endSession(serverURL string, device ClientDevice, username, sessionID string, durationSeconds int64) {
+	data := url.Values{}
+	data.Set("action", "stop")
+	data.Set("device_id", device.ID)
+	data.Set("device_name", device.Name)
+	data.Set("proxy_name", device.ProxyName)
+	data.Set("username", username)
+	data.Set("session_id", sessionID)
+	data.Set("duration", strconv.FormatInt(durationSeconds, 10))
+
+	resp, err := http.PostForm(serverURL+"/api/client/session", data)
+	if err != nil {
 		return
 	}
-	defer stopProxy()
-	fmt.Printf("✓ Local proxy started on port %d\n", localPort)
+	defer resp.Body.Close()
+}
 
-	// Create a unique profile directory for this device
-	profileDir := getProfileDir(device.ID)
+// ============================================================================
+// FIREFOX
+// ============================================================================
 
-	// Initialize the Firefox profile properly
-	if err := initializeFirefoxProfile(profileDir); err != nil {
-		fmt.Printf("❌ Error creating profile: %v\n", err)
-		time.Sleep(2 * time.Second)
-		return
+func findFirefox() string {
+	if runtime.GOOS == "windows" {
+		paths := []string{
+			filepath.Join(os.Getenv("ProgramFiles"), "Mozilla Firefox", "firefox.exe"),
+			filepath.Join(os.Getenv("ProgramFiles(x86)"), "Mozilla Firefox", "firefox.exe"),
+			filepath.Join(os.Getenv("LOCALAPPDATA"), "Mozilla Firefox", "firefox.exe"),
+		}
+		for _, p := range paths {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+		if p, err := exec.LookPath("firefox.exe"); err == nil {
+			return p
+		}
+	} else {
+		if p, err := exec.LookPath("firefox"); err == nil {
+			return p
+		}
 	}
+	return ""
+}
 
-	// Configure Firefox preferences to use local HTTP proxy
-	configureFirefoxPrefsWithLocalProxy(profileDir, device, localPort)
-	fmt.Println("✓ Firefox configured with proxy and leak protection")
-
-	// Start session
-	sessionID := startSession(device)
-
-	// Launch Firefox
-	fmt.Println("Starting Firefox... (close the browser to end session)")
-	fmt.Println()
-
-	args := []string{
-		"-profile", profileDir,
-		"-no-remote",
-		"-new-instance",
-		"-wait-for-browser",
+func getConfigPath() string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(os.Getenv("APPDATA"), "LumierClient", "config.json")
 	}
-
-	cmd := exec.Command(firefoxPath, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	startTime := time.Now()
-	err = cmd.Run()
-	duration := time.Since(startTime)
-
-	if err != nil {
-		fmt.Printf("Firefox exited with error: %v\n", err)
-	}
-
-	// End session
-	endSession(device, sessionID, int64(duration.Seconds()))
-
-	fmt.Println()
-	fmt.Printf("✓ Session ended. Duration: %s\n", formatDuration(int64(duration.Seconds())))
-	fmt.Println()
-	time.Sleep(2 * time.Second)
-
-	// Flush DNS cache
-	flushDNS()
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".lumier-client", "config.json")
 }
 
 func getProfileDir(profileID string) string {
-	// Sanitize profile ID for filesystem
 	safeID := strings.Map(func(r rune) rune {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
 			return r
@@ -362,29 +434,13 @@ func getProfileDir(profileID string) string {
 	return filepath.Join(home, ".lumier-client", "profiles", safeID)
 }
 
-func cleanupProfileLocks(profileDir string) {
-	// Remove Firefox lock files that may be left over from crashes
-	lockFiles := []string{
-		filepath.Join(profileDir, "parent.lock"),
-		filepath.Join(profileDir, "lock"),
-		filepath.Join(profileDir, ".parentlock"),
-	}
-	for _, f := range lockFiles {
-		os.Remove(f)
-	}
-}
-
 func initializeFirefoxProfile(profileDir string) error {
-	// Remove existing profile to ensure clean state
-	// This avoids version mismatch issues and stale data
 	os.RemoveAll(profileDir)
 
-	// Create fresh profile directory
 	if err := os.MkdirAll(profileDir, 0755); err != nil {
 		return err
 	}
 
-	// Create times.json (Firefox uses this to track profile creation)
 	timesPath := filepath.Join(profileDir, "times.json")
 	now := time.Now().UnixMilli()
 	timesData := fmt.Sprintf(`{"created":%d,"firstUse":null}`, now)
@@ -393,103 +449,11 @@ func initializeFirefoxProfile(profileDir string) error {
 	return nil
 }
 
-func configureFirefoxPrefs(profileDir string, device ClientDevice) {
-	// Parse the proxy string (format: host:port or host:port:user:pass)
-	proxyHost := ""
-	proxyPort := 0
-	proxyUser := ""
-	proxyPass := ""
-
-	parts := strings.Split(device.UpstreamProxy, ":")
-	if len(parts) >= 2 {
-		proxyHost = parts[0]
-		proxyPort, _ = strconv.Atoi(parts[1])
-	}
-	if len(parts) >= 4 {
-		proxyUser = parts[2]
-		proxyPass = strings.Join(parts[3:], ":") // Handle passwords containing colons
-	}
-
-	// Create prefs.js for Firefox
-	prefs := fmt.Sprintf(`// Lumier Dynamics Browser Configuration
-// Device: %s
-// Proxy: %s
-
-// Use manual proxy configuration
-user_pref("network.proxy.type", 1);
-
-// SOCKS5 proxy settings
-user_pref("network.proxy.socks", "%s");
-user_pref("network.proxy.socks_port", %d);
-user_pref("network.proxy.socks_version", 5);
-user_pref("network.proxy.socks_remote_dns", true);
-
-// Route all DNS through SOCKS proxy
-user_pref("network.proxy.allow_hijacking_localhost", false);
-
-// Disable WebRTC to prevent IP leaks
-user_pref("media.peerconnection.enabled", false);
-user_pref("media.peerconnection.ice.default_address_only", true);
-user_pref("media.peerconnection.ice.no_host", true);
-user_pref("media.navigator.enabled", false);
-
-// Privacy settings
-user_pref("privacy.resistFingerprinting", true);
-user_pref("privacy.trackingprotection.enabled", true);
-user_pref("geo.enabled", false);
-
-// Disable telemetry
-user_pref("toolkit.telemetry.enabled", false);
-user_pref("toolkit.telemetry.unified", false);
-
-// Clear data on shutdown
-user_pref("privacy.sanitize.sanitizeOnShutdown", true);
-user_pref("privacy.clearOnShutdown.cache", true);
-user_pref("privacy.clearOnShutdown.cookies", true);
-user_pref("privacy.clearOnShutdown.history", false);
-
-// Show about:config warning
-user_pref("browser.aboutConfig.showWarning", false);
-
-// Homepage
-user_pref("browser.startup.homepage", "about:blank");
-user_pref("browser.newtabpage.enabled", false);
-
-// Allow unsigned extensions (needed for proxy auth extension)
-user_pref("xpinstall.signatures.required", false);
-user_pref("extensions.autoDisableScopes", 0);
-user_pref("extensions.enabledScopes", 15);
-`, device.Name, device.ProxyName, proxyHost, proxyPort)
-
-	// Add proxy authentication if provided
-	if proxyUser != "" && proxyPass != "" {
-		// Note: Firefox will prompt for SOCKS5 auth if needed
-		// For automatic auth, we'd need an extension
-		prefs += fmt.Sprintf(`
-// Proxy authentication (may still prompt)
-user_pref("signon.autologin.proxy", true);
-`)
-	}
-
-	// Write prefs.js
-	prefsPath := filepath.Join(profileDir, "prefs.js")
-	os.WriteFile(prefsPath, []byte(prefs), 0644)
-
-	// Also write user.js (applied on startup, overrides prefs.js)
-	userJsPath := filepath.Join(profileDir, "user.js")
-	os.WriteFile(userJsPath, []byte(prefs), 0644)
-}
-
-// configureFirefoxPrefsWithLocalProxy configures Firefox to use local HTTP proxy
-// with comprehensive DNS and WebRTC leak protection
 func configureFirefoxPrefsWithLocalProxy(profileDir string, device ClientDevice, localPort int) {
 	prefs := fmt.Sprintf(`// Lumier Dynamics Browser Configuration
 // Device: %s
 // Proxy: %s (via local HTTP proxy on port %d)
 
-// ============================================================
-// HTTP PROXY SETTINGS - Connect to local proxy (no auth needed)
-// ============================================================
 user_pref("network.proxy.type", 1);
 user_pref("network.proxy.http", "127.0.0.1");
 user_pref("network.proxy.http_port", %d);
@@ -497,28 +461,16 @@ user_pref("network.proxy.ssl", "127.0.0.1");
 user_pref("network.proxy.ssl_port", %d);
 user_pref("network.proxy.no_proxies_on", "");
 
-// ============================================================
-// DNS LEAK PROTECTION
-// ============================================================
-// Disable DNS-over-HTTPS (would bypass proxy)
 user_pref("network.trr.mode", 0);
 user_pref("network.trr.uri", "");
-// Disable DNS prefetching
 user_pref("network.dns.disablePrefetch", true);
 user_pref("network.dns.disablePrefetchFromHTTPS", true);
-// Disable prefetching
 user_pref("network.prefetch-next", false);
-// Disable speculative connections
 user_pref("network.http.speculative-parallel-limit", 0);
 user_pref("network.predictor.enabled", false);
 user_pref("network.predictor.enable-prefetch", false);
 
-// ============================================================
-// WEBRTC LEAK PROTECTION
-// ============================================================
-// Completely disable WebRTC
 user_pref("media.peerconnection.enabled", false);
-// Backup restrictions
 user_pref("media.peerconnection.ice.default_address_only", true);
 user_pref("media.peerconnection.ice.no_host", true);
 user_pref("media.navigator.enabled", false);
@@ -527,57 +479,69 @@ user_pref("media.peerconnection.use_document_iceservers", false);
 user_pref("media.peerconnection.video.enabled", false);
 user_pref("media.peerconnection.identity.timeout", 1);
 
-// ============================================================
-// ADDITIONAL PRIVACY PROTECTIONS
-// ============================================================
 user_pref("privacy.resistFingerprinting", true);
 user_pref("privacy.trackingprotection.enabled", true);
 user_pref("geo.enabled", false);
 user_pref("beacon.enabled", false);
 
-// Disable telemetry
 user_pref("toolkit.telemetry.enabled", false);
 user_pref("toolkit.telemetry.unified", false);
 user_pref("toolkit.telemetry.archive.enabled", false);
 
-// Clear data on shutdown
 user_pref("privacy.sanitize.sanitizeOnShutdown", true);
 user_pref("privacy.clearOnShutdown.cache", true);
 user_pref("privacy.clearOnShutdown.cookies", true);
 user_pref("privacy.clearOnShutdown.history", false);
 
-// Disable safebrowsing (sends URLs to Google)
 user_pref("browser.safebrowsing.malware.enabled", false);
 user_pref("browser.safebrowsing.phishing.enabled", false);
 user_pref("browser.safebrowsing.downloads.enabled", false);
 
-// UI settings
 user_pref("browser.aboutConfig.showWarning", false);
 user_pref("browser.startup.homepage", "about:blank");
 user_pref("browser.newtabpage.enabled", false);
 `, device.Name, device.ProxyName, localPort, localPort, localPort)
 
-	// Write prefs.js
 	prefsPath := filepath.Join(profileDir, "prefs.js")
 	os.WriteFile(prefsPath, []byte(prefs), 0644)
 
-	// Also write user.js (applied on startup, overrides prefs.js)
 	userJsPath := filepath.Join(profileDir, "user.js")
 	os.WriteFile(userJsPath, []byte(prefs), 0644)
 }
 
+func flushDNS() {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("ipconfig", "/flushdns")
+	} else if runtime.GOOS == "darwin" {
+		cmd = exec.Command("sudo", "dscacheutil", "-flushcache")
+	} else {
+		cmd = exec.Command("sudo", "systemd-resolve", "--flush-caches")
+	}
+	cmd.Run()
+}
+
+func openBrowser(url string) {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	} else if runtime.GOOS == "darwin" {
+		cmd = exec.Command("open", url)
+	} else {
+		cmd = exec.Command("xdg-open", url)
+	}
+	cmd.Start()
+}
+
 // ============================================================================
-// LOCAL HTTP PROXY - Handles SOCKS5 authentication for Firefox
+// LOCAL HTTP PROXY
 // ============================================================================
 
-// localProxyHandler handles HTTP proxy requests and forwards through SOCKS5
 type localProxyHandler struct {
 	dialer proxy.Dialer
 }
 
-// startLocalProxy starts a local HTTP proxy that forwards through the upstream SOCKS5 proxy
 func startLocalProxy(upstreamProxy string) (int, func(), error) {
-	// Parse upstream: host:port:user:pass
 	parts := strings.Split(upstreamProxy, ":")
 	if len(parts) < 4 {
 		return 0, nil, fmt.Errorf("invalid proxy format: expected host:port:user:pass")
@@ -586,16 +550,14 @@ func startLocalProxy(upstreamProxy string) (int, func(), error) {
 	proxyAddr := parts[0] + ":" + parts[1]
 	auth := &proxy.Auth{
 		User:     parts[2],
-		Password: strings.Join(parts[3:], ":"), // Handle passwords with colons
+		Password: strings.Join(parts[3:], ":"),
 	}
 
-	// Create SOCKS5 dialer with authentication
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to create SOCKS5 dialer: %v", err)
 	}
 
-	// Start local HTTP proxy server on random available port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to start listener: %v", err)
@@ -616,7 +578,6 @@ func startLocalProxy(upstreamProxy string) (int, func(), error) {
 	return port, stopFunc, nil
 }
 
-// ServeHTTP handles incoming proxy requests
 func (h *localProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
 		h.handleConnect(w, r)
@@ -625,9 +586,7 @@ func (h *localProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleConnect handles HTTPS CONNECT tunneling
 func (h *localProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
-	// Connect to target through SOCKS5 proxy
 	targetConn, err := h.dialer.Dial("tcp", r.Host)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to connect: %v", err), http.StatusBadGateway)
@@ -635,7 +594,6 @@ func (h *localProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request
 	}
 	defer targetConn.Close()
 
-	// Hijack the client connection
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
@@ -649,10 +607,8 @@ func (h *localProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request
 	}
 	defer clientConn.Close()
 
-	// Send 200 Connection Established
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	// Bidirectional copy
 	done := make(chan bool, 2)
 	go func() {
 		io.Copy(targetConn, clientConn)
@@ -666,15 +622,12 @@ func (h *localProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request
 	<-done
 }
 
-// handleHTTP handles plain HTTP requests
 func (h *localProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	// Build target address
 	target := r.Host
 	if !strings.Contains(target, ":") {
 		target += ":80"
 	}
 
-	// Connect through SOCKS5 proxy
 	targetConn, err := h.dialer.Dial("tcp", target)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to connect: %v", err), http.StatusBadGateway)
@@ -682,13 +635,11 @@ func (h *localProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer targetConn.Close()
 
-	// Forward the request
 	if err := r.Write(targetConn); err != nil {
 		http.Error(w, "Failed to forward request", http.StatusBadGateway)
 		return
 	}
 
-	// Read and forward response
 	resp, err := http.ReadResponse(bufio.NewReader(targetConn), r)
 	if err != nil {
 		http.Error(w, "Failed to read response", http.StatusBadGateway)
@@ -696,7 +647,6 @@ func (h *localProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Copy headers
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
@@ -706,58 +656,9 @@ func (h *localProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
-func startSession(device ClientDevice) string {
-	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
-
-	data := url.Values{}
-	data.Set("action", "start")
-	data.Set("device_id", device.ID)
-	data.Set("device_name", device.Name)
-	data.Set("proxy_name", device.ProxyName)
-	data.Set("username", config.Username)
-	data.Set("session_id", sessionID)
-
-	resp, err := http.PostForm(config.ServerURL+"/api/client/session", data)
-	if err != nil {
-		fmt.Printf("Warning: Could not log session start: %v\n", err)
-		return sessionID
-	}
-	defer resp.Body.Close()
-
-	return sessionID
-}
-
-func endSession(device ClientDevice, sessionID string, durationSeconds int64) {
-	data := url.Values{}
-	data.Set("action", "stop")
-	data.Set("device_id", device.ID)
-	data.Set("device_name", device.Name)
-	data.Set("proxy_name", device.ProxyName)
-	data.Set("username", config.Username)
-	data.Set("session_id", sessionID)
-	data.Set("duration", strconv.FormatInt(durationSeconds, 10))
-
-	resp, err := http.PostForm(config.ServerURL+"/api/client/session", data)
-	if err != nil {
-		fmt.Printf("Warning: Could not log session end: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
-}
-
-func flushDNS() {
-	fmt.Println("Flushing DNS cache...")
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("ipconfig", "/flushdns")
-	} else if runtime.GOOS == "darwin" {
-		cmd = exec.Command("sudo", "dscacheutil", "-flushcache")
-	} else {
-		// Linux
-		cmd = exec.Command("sudo", "systemd-resolve", "--flush-caches")
-	}
-	cmd.Run()
-}
+// ============================================================================
+// UTILITIES
+// ============================================================================
 
 func formatDuration(seconds int64) string {
 	if seconds < 60 {
@@ -771,45 +672,523 @@ func formatDuration(seconds int64) string {
 	return fmt.Sprintf("%dh %dm", hours, mins)
 }
 
-func getColorName(hex string) string {
-	colors := map[string]string{
-		"#f44336": "🔴 Red",
-		"#e91e63": "🩷 Pink",
-		"#9c27b0": "🟣 Purple",
-		"#673ab7": "🔮 Deep Purple",
-		"#3f51b5": "🔵 Indigo",
-		"#2196f3": "💙 Blue",
-		"#03a9f4": "🩵 Light Blue",
-		"#00bcd4": "🩵 Cyan",
-		"#009688": "🩵 Teal",
-		"#4caf50": "🟢 Green",
-		"#8bc34a": "💚 Light Green",
-		"#cddc39": "💛 Lime",
-		"#ffeb3b": "💛 Yellow",
-		"#ffc107": "🟡 Amber",
-		"#ff9800": "🟠 Orange",
-		"#ff5722": "🧡 Deep Orange",
-	}
-	if name, ok := colors[hex]; ok {
-		return name
-	}
-	return "⚪"
-}
+// ============================================================================
+// HTML TEMPLATE
+// ============================================================================
 
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max-3] + "..."
-}
+const htmlTemplate = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lumier Proxy Launcher</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: #fff;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 450px;
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 24px;
+            text-align: center;
+        }
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+        }
+        .header p {
+            opacity: 0.9;
+            margin-top: 4px;
+            font-size: 14px;
+        }
+        .content {
+            padding: 24px;
+        }
+        .screen {
+            display: none;
+        }
+        .screen.active {
+            display: block;
+        }
+        label {
+            display: block;
+            font-weight: 500;
+            margin-bottom: 8px;
+            color: #333;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.2s;
+        }
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .btn {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.1s, box-shadow 0.2s;
+            margin-top: 16px;
+        }
+        .btn:hover {
+            transform: translateY(-1px);
+        }
+        .btn:active {
+            transform: translateY(0);
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .btn-secondary {
+            background: #f0f0f0;
+            color: #333;
+        }
+        .btn-success {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+            color: white;
+        }
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .error {
+            background: #fee;
+            color: #c00;
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 16px;
+            font-size: 14px;
+            display: none;
+        }
+        .error.show {
+            display: block;
+        }
+        .user-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #eee;
+        }
+        .user-header span {
+            font-weight: 500;
+            color: #333;
+        }
+        .btn-link {
+            background: none;
+            border: none;
+            color: #667eea;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 0;
+        }
+        .btn-link:hover {
+            text-decoration: underline;
+        }
+        .device-list {
+            max-height: 250px;
+            overflow-y: auto;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            margin: 16px 0;
+        }
+        .device-item {
+            padding: 14px 16px;
+            border-bottom: 1px solid #eee;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            transition: background 0.15s;
+        }
+        .device-item:last-child {
+            border-bottom: none;
+        }
+        .device-item:hover {
+            background: #f8f8ff;
+        }
+        .device-item.selected {
+            background: #f0f0ff;
+        }
+        .device-item input {
+            margin-right: 12px;
+        }
+        .device-name {
+            font-weight: 500;
+            color: #333;
+        }
+        .device-proxy {
+            font-size: 13px;
+            color: #666;
+            margin-left: auto;
+        }
+        .status-bar {
+            background: #f8f8f8;
+            padding: 16px;
+            border-radius: 8px;
+            margin-top: 16px;
+        }
+        .status-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        .status-row:last-child {
+            margin-bottom: 0;
+        }
+        .status-label {
+            color: #666;
+            font-size: 14px;
+        }
+        .status-value {
+            font-weight: 500;
+            color: #333;
+        }
+        .status-value.running {
+            color: #11998e;
+        }
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .refresh-btn {
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 18px;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+        .refresh-btn:hover {
+            background: #f0f0f0;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        .change-server {
+            text-align: center;
+            margin-top: 24px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Lumier Proxy Launcher</h1>
+            <p id="subtitle">Initial Setup</p>
+        </div>
+        <div class="content">
+            <!-- Setup Screen -->
+            <div id="setup-screen" class="screen {{if not .HasServer}}active{{end}}">
+                <label for="server-url">Server URL</label>
+                <input type="text" id="server-url" placeholder="http://192.168.1.100:8080">
+                <button class="btn btn-primary" onclick="connectServer()">Connect</button>
+                <div id="setup-error" class="error"></div>
+            </div>
 
-func readLine() string {
-	reader := bufio.NewReader(os.Stdin)
-	line, _ := reader.ReadString('\n')
-	return strings.TrimSpace(line)
-}
+            <!-- Login Screen -->
+            <div id="login-screen" class="screen {{if and .HasServer (not .HasUser)}}active{{end}}">
+                <label for="username">Enter your name</label>
+                <input type="text" id="username" placeholder="Your name">
+                <button class="btn btn-primary" onclick="login()">Login</button>
+                <div id="login-error" class="error"></div>
+                {{if not .FirefoxOK}}
+                <div class="error show">Firefox not found. Please install Firefox first.</div>
+                {{end}}
+                <div class="change-server">
+                    <button class="btn-link" onclick="changeServer()">Change Server</button>
+                </div>
+            </div>
 
-func waitForEnter() {
-	fmt.Println("\nPress Enter to exit...")
-	readLine()
-}
+            <!-- Devices Screen -->
+            <div id="devices-screen" class="screen {{if and .HasServer .HasUser}}active{{end}}">
+                <div class="user-header">
+                    <span>Operator: <strong id="current-user">{{.Username}}</strong></span>
+                    <button class="btn-link" onclick="logout()">Log Out</button>
+                </div>
+
+                <div class="section-header">
+                    <label>Select Account</label>
+                    <button class="refresh-btn" onclick="loadDevices()" title="Refresh">&#x21bb;</button>
+                </div>
+
+                <div id="device-list" class="device-list">
+                    <div class="loading">Loading devices...</div>
+                </div>
+
+                <button id="launch-btn" class="btn btn-success" onclick="launchBrowser()" disabled>
+                    Launch Browser
+                </button>
+
+                <div class="status-bar">
+                    <div class="status-row">
+                        <span class="status-label">Status:</span>
+                        <span id="status-value" class="status-value">Ready</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">Session:</span>
+                        <span id="session-value" class="status-value">--</span>
+                    </div>
+                </div>
+
+                <div id="devices-error" class="error"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let selectedDeviceId = null;
+        let devices = [];
+        let statusInterval = null;
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            updateSubtitle();
+            if (document.getElementById('devices-screen').classList.contains('active')) {
+                loadDevices();
+                startStatusPolling();
+            }
+        });
+
+        function updateSubtitle() {
+            const subtitle = document.getElementById('subtitle');
+            if (document.getElementById('setup-screen').classList.contains('active')) {
+                subtitle.textContent = 'Initial Setup';
+            } else if (document.getElementById('login-screen').classList.contains('active')) {
+                subtitle.textContent = 'Operator Login';
+            } else {
+                subtitle.textContent = 'Select Account';
+            }
+        }
+
+        function showScreen(screenId) {
+            document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+            document.getElementById(screenId).classList.add('active');
+            updateSubtitle();
+        }
+
+        function showError(elementId, message) {
+            const el = document.getElementById(elementId);
+            el.textContent = message;
+            el.classList.add('show');
+        }
+
+        function hideError(elementId) {
+            document.getElementById(elementId).classList.remove('show');
+        }
+
+        async function connectServer() {
+            hideError('setup-error');
+            const serverUrl = document.getElementById('server-url').value.trim();
+
+            const formData = new FormData();
+            formData.append('server_url', serverUrl);
+
+            const resp = await fetch('/api/setup', { method: 'POST', body: formData });
+            const data = await resp.json();
+
+            if (data.error) {
+                showError('setup-error', data.error);
+            } else {
+                showScreen('login-screen');
+            }
+        }
+
+        async function login() {
+            hideError('login-error');
+            const username = document.getElementById('username').value.trim();
+
+            const formData = new FormData();
+            formData.append('username', username);
+
+            const resp = await fetch('/api/login', { method: 'POST', body: formData });
+            const data = await resp.json();
+
+            if (data.error) {
+                showError('login-error', data.error);
+            } else {
+                document.getElementById('current-user').textContent = username;
+                showScreen('devices-screen');
+                loadDevices();
+                startStatusPolling();
+            }
+        }
+
+        async function logout() {
+            await fetch('/api/logout', { method: 'POST' });
+            stopStatusPolling();
+            selectedDeviceId = null;
+            document.getElementById('username').value = '';
+            showScreen('login-screen');
+        }
+
+        async function changeServer() {
+            await fetch('/api/change-server', { method: 'POST' });
+            stopStatusPolling();
+            selectedDeviceId = null;
+            document.getElementById('server-url').value = '';
+            showScreen('setup-screen');
+        }
+
+        async function loadDevices() {
+            const list = document.getElementById('device-list');
+            list.innerHTML = '<div class="loading">Loading devices...</div>';
+
+            const resp = await fetch('/api/devices');
+            const data = await resp.json();
+
+            if (data.error) {
+                list.innerHTML = '<div class="loading" style="color:#c00;">' + data.error + '</div>';
+                return;
+            }
+
+            devices = data.devices || [];
+
+            if (devices.length === 0) {
+                list.innerHTML = '<div class="loading">No approved devices found.</div>';
+                return;
+            }
+
+            list.innerHTML = devices.map(d => {
+                const proxyName = d.proxy_name || ('Proxy #' + (d.proxy_index + 1));
+                return '<div class="device-item" onclick="selectDevice(\'' + d.id + '\')">' +
+                    '<input type="radio" name="device" ' + (selectedDeviceId === d.id ? 'checked' : '') + '>' +
+                    '<span class="device-name">' + escapeHtml(d.name) + '</span>' +
+                    '<span class="device-proxy">' + escapeHtml(proxyName) + '</span>' +
+                '</div>';
+            }).join('');
+
+            updateLaunchButton();
+        }
+
+        function selectDevice(deviceId) {
+            selectedDeviceId = deviceId;
+            document.querySelectorAll('.device-item').forEach(el => el.classList.remove('selected'));
+            document.querySelectorAll('.device-item input').forEach(el => el.checked = false);
+
+            const items = document.querySelectorAll('.device-item');
+            devices.forEach((d, i) => {
+                if (d.id === deviceId) {
+                    items[i].classList.add('selected');
+                    items[i].querySelector('input').checked = true;
+                }
+            });
+
+            updateLaunchButton();
+        }
+
+        function updateLaunchButton() {
+            const btn = document.getElementById('launch-btn');
+            const statusValue = document.getElementById('status-value');
+
+            if (statusValue.classList.contains('running')) {
+                btn.disabled = true;
+                btn.textContent = 'Browser Running...';
+            } else if (selectedDeviceId) {
+                btn.disabled = false;
+                btn.textContent = 'Launch Browser';
+            } else {
+                btn.disabled = true;
+                btn.textContent = 'Launch Browser';
+            }
+        }
+
+        async function launchBrowser() {
+            if (!selectedDeviceId) return;
+
+            hideError('devices-error');
+
+            const formData = new FormData();
+            formData.append('device_id', selectedDeviceId);
+
+            const resp = await fetch('/api/launch', { method: 'POST', body: formData });
+            const data = await resp.json();
+
+            if (data.error) {
+                showError('devices-error', data.error);
+            }
+        }
+
+        function startStatusPolling() {
+            stopStatusPolling();
+            checkStatus();
+            statusInterval = setInterval(checkStatus, 1000);
+        }
+
+        function stopStatusPolling() {
+            if (statusInterval) {
+                clearInterval(statusInterval);
+                statusInterval = null;
+            }
+        }
+
+        async function checkStatus() {
+            const resp = await fetch('/api/status');
+            const data = await resp.json();
+
+            const statusEl = document.getElementById('status-value');
+            const sessionEl = document.getElementById('session-value');
+
+            if (data.running) {
+                statusEl.textContent = 'Browser Running';
+                statusEl.classList.add('running');
+                sessionEl.textContent = data.duration || '0s';
+            } else {
+                statusEl.textContent = 'Ready';
+                statusEl.classList.remove('running');
+                sessionEl.textContent = '--';
+            }
+
+            updateLaunchButton();
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Handle Enter key
+        document.getElementById('server-url').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') connectServer();
+        });
+        document.getElementById('username').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') login();
+        });
+    </script>
+</body>
+</html>
+`

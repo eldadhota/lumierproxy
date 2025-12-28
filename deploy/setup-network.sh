@@ -3,6 +3,18 @@
 # Lumier Dynamics - Network Setup Script
 # This script configures the USB ethernet adapter and DHCP for the Access Point network
 #
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ ⚠️  SECURITY WARNING - DEPRECATED SCRIPT                                    │
+# │                                                                             │
+# │ This script enables NAT and IP forwarding, which allows devices to bypass  │
+# │ the proxy and access the internet directly. For a secure setup that        │
+# │ FORCES all traffic through the proxy, use:                                 │
+# │                                                                             │
+# │   sudo ./scripts/ap-setup.sh                                               │
+# │                                                                             │
+# │ Only use this script if you specifically need NAT/direct internet access.  │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
 
 set -e
 
@@ -45,6 +57,27 @@ print_banner() {
     echo "║                                                               ║"
     echo "╚═══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
+}
+
+# Print security warning
+print_security_warning() {
+    echo -e "${YELLOW}"
+    echo "┌───────────────────────────────────────────────────────────────┐"
+    echo "│ ⚠️  WARNING: This script enables NAT/IP forwarding            │"
+    echo "│                                                               │"
+    echo "│ Devices can BYPASS the proxy and access internet directly.   │"
+    echo "│ For a secure setup that forces proxy usage, use instead:     │"
+    echo "│                                                               │"
+    echo "│   sudo ./scripts/ap-setup.sh                                 │"
+    echo "│                                                               │"
+    echo "└───────────────────────────────────────────────────────────────┘"
+    echo -e "${NC}"
+    echo ""
+    read -p "Continue anyway? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Aborted. Use ./scripts/ap-setup.sh for secure setup."
+        exit 0
+    fi
 }
 
 # Detect USB ethernet adapter
@@ -329,7 +362,7 @@ test_connectivity() {
     echo ""
 
     # Check for connected devices
-    LEASES=$(cat /var/lib/misc/dnsmasq.leases 2>/dev/null | wc -l)
+    LEASES=$(cat /var/lib/lumier/dnsmasq.leases 2>/dev/null | wc -l)
     echo "DHCP Leases: $LEASES active"
     echo ""
 
@@ -383,6 +416,7 @@ fix_rules() {
 main() {
     print_banner
     check_root
+    print_security_warning
 
     # Check for --fix-rules mode
     if [ "$1" == "--fix-rules" ]; then

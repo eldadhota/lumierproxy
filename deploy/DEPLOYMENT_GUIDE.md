@@ -414,7 +414,7 @@ curl -I http://localhost:8080
 
 2. **Check DHCP leases:**
    ```bash
-   cat /var/lib/misc/dnsmasq.leases
+   cat /var/lib/lumier/dnsmasq.leases
    ```
 
 3. **Check proxy logs:**
@@ -489,7 +489,7 @@ Print this and keep it handy:
 ║  TROUBLESHOOTING                                              ║
 ║  ─────────────                                                ║
 ║  Restart DHCP:  sudo systemctl restart dnsmasq                ║
-║  Check leases:  cat /var/lib/misc/dnsmasq.leases              ║
+║  Check leases:  cat /var/lib/lumier/dnsmasq.leases              ║
 ║  Fix network:   sudo ./deploy/setup-network.sh --fix-rules    ║
 ║  View AP logs:  ssh ubnt@10.10.10.2                           ║
 ║                                                               ║

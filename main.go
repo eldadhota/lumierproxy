@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"runtime"
@@ -94,6 +95,13 @@ type Session struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+// loginAttemptInfo tracks failed login attempts for rate limiting
+type loginAttemptInfo struct {
+	Count      int
+	LastAttempt time.Time
+	LockedUntil time.Time
+}
+
 type PersistentData struct {
 	DeviceConfigs   map[string]DeviceConfig `json:"device_configs"`
 	Groups          []string                `json:"groups"`
@@ -118,9 +126,12 @@ type Supervisor struct {
 }
 
 type SystemSettings struct {
-	SessionTimeout       int `json:"session_timeout_hours"`
-	TrafficRetentionDays int `json:"traffic_retention_days"`
-	DeviceTimeoutMinutes int `json:"device_timeout_minutes"`
+	SessionTimeout          int  `json:"session_timeout_hours"`
+	TrafficRetentionDays    int  `json:"traffic_retention_days"`
+	DeviceTimeoutMinutes    int  `json:"device_timeout_minutes"`
+	SecureCookies           bool `json:"secure_cookies"`             // Set true when behind HTTPS reverse proxy
+	PrunePendingAfterHours  int  `json:"prune_pending_after_hours"`  // Auto-prune unapproved devices (0 = disabled)
+	PruneOfflineAfterDays   int  `json:"prune_offline_after_days"`   // Auto-prune offline devices (0 = disabled)
 }
 
 // ============================================================================
@@ -272,9 +283,13 @@ type ProxyServer struct {
 	deviceConnectionMu sync.RWMutex
 	// Access Point fields
 	apDevices      map[string]*APDevice // keyed by MAC address (runtime copy)
+	apIPToMAC      map[string]string    // IP -> MAC index for O(1) lookups
 	apMu           sync.RWMutex
 	apConfig       APConfig
 	apPoolIndex    int // For round-robin proxy assignment to new AP devices
+	// Rate limiting for login
+	loginAttempts  map[string]*loginAttemptInfo // IP -> attempt info
+	loginMu        sync.RWMutex
 	// Browser Profile fields
 	browserProfiles map[string]*BrowserProfile // keyed by ID (runtime copy)
 	browserMu       sync.RWMutex
@@ -462,6 +477,9 @@ func main() {
 		deviceConnections: make(map[string][]DeviceConnection),
 		// Access Point initialization
 		apDevices: make(map[string]*APDevice),
+		apIPToMAC: make(map[string]string),
+		// Rate limiting
+		loginAttempts: make(map[string]*loginAttemptInfo),
 		apConfig: APConfig{
 			Enabled:      true,
 			Interface:    "eth0",
@@ -507,6 +525,7 @@ func main() {
 	go cleanupExpiredSessions()
 	go proxyHealthChecker()
 	go cpuMonitor()
+	go pruneStaleDevices()
 	go server.monitorDHCPLeases() // Monitor for AP device connections
 	go startDashboard()
 
@@ -516,7 +535,15 @@ func main() {
 	log.Println("Default login: admin / admin123")
 	log.Printf("Access Point: Devices on 10.10.10.x network will be proxied\n")
 
-	if err := http.ListenAndServe(fmt.Sprintf("%s:%d", server.bindAddr, server.proxyPort), http.HandlerFunc(handleProxy)); err != nil {
+	// Use http.Server with timeouts for security (prevents slow loris attacks)
+	proxyServer := &http.Server{
+		Addr:              fmt.Sprintf("%s:%d", server.bindAddr, server.proxyPort),
+		Handler:           http.HandlerFunc(handleProxy),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		// Note: WriteTimeout not set for proxy to allow long downloads
+	}
+	if err := proxyServer.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -787,31 +814,91 @@ func (s *ProxyServer) restoreAPDevices() {
 }
 
 func (s *ProxyServer) savePersistentData() {
-	s.persistMu.Lock() // Use write lock since we modify ProxyHealthData
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
+	// Deep copy proxy health data to avoid race during marshal
 	s.healthMu.RLock()
-	s.persistentData.ProxyHealthData = make(map[int]*ProxyHealth)
+	healthSnapshot := make(map[int]*ProxyHealth)
 	for k, v := range s.proxyHealth {
-		s.persistentData.ProxyHealthData[k] = v
+		// Deep copy the struct to avoid pointer mutation during marshal
+		healthCopy := *v
+		healthSnapshot[k] = &healthCopy
 	}
 	s.healthMu.RUnlock()
 
-	// Save AP devices and config
+	// Deep copy AP devices to avoid race during marshal
 	s.apMu.RLock()
-	s.persistentData.APDevices = make(map[string]*APDevice)
+	deviceSnapshot := make(map[string]*APDevice)
 	for mac, device := range s.apDevices {
-		s.persistentData.APDevices[mac] = device
+		// Deep copy the struct (APDevice has no slice fields, so shallow copy is safe)
+		deviceCopy := *device
+		deviceSnapshot[mac] = &deviceCopy
 	}
-	s.persistentData.APConfig = s.apConfig
+	configSnapshot := s.apConfig // Struct copy
 	s.apMu.RUnlock()
 
+	// Now we can safely update persistentData and marshal
+	s.persistentData.ProxyHealthData = healthSnapshot
+	s.persistentData.APDevices = deviceSnapshot
+	s.persistentData.APConfig = configSnapshot
+
 	data, _ := json.MarshalIndent(s.persistentData, "", "  ")
-	s.persistMu.Unlock()
 	os.WriteFile(s.dataFile, data, 0644)
 }
 
 func autoSaveData() {
 	for range time.NewTicker(5 * time.Minute).C {
 		server.savePersistentData()
+	}
+}
+
+// pruneStaleDevices removes old pending and long-offline devices
+func pruneStaleDevices() {
+	for range time.NewTicker(1 * time.Hour).C {
+		server.pruneDevices()
+	}
+}
+
+func (s *ProxyServer) pruneDevices() {
+	pendingHours := s.persistentData.SystemSettings.PrunePendingAfterHours
+	offlineDays := s.persistentData.SystemSettings.PruneOfflineAfterDays
+
+	// Skip if both pruning options are disabled
+	if pendingHours <= 0 && offlineDays <= 0 {
+		return
+	}
+
+	now := time.Now()
+	var pruned []string
+
+	s.apMu.Lock()
+	for mac, device := range s.apDevices {
+		// Prune pending (unapproved) devices after configured hours
+		if pendingHours > 0 && !device.Confirmed {
+			if now.Sub(device.FirstSeen) > time.Duration(pendingHours)*time.Hour {
+				pruned = append(pruned, fmt.Sprintf("%s (pending, first seen %s ago)", mac, now.Sub(device.FirstSeen).Round(time.Hour)))
+				delete(s.apDevices, mac)
+				delete(s.apIPToMAC, device.IP)
+				continue
+			}
+		}
+
+		// Prune long-offline confirmed devices after configured days
+		if offlineDays > 0 && device.Confirmed {
+			if now.Sub(device.LastSeen) > time.Duration(offlineDays)*24*time.Hour {
+				pruned = append(pruned, fmt.Sprintf("%s (offline, last seen %s ago)", mac, now.Sub(device.LastSeen).Round(time.Hour)))
+				delete(s.apDevices, mac)
+				delete(s.apIPToMAC, device.IP)
+				continue
+			}
+		}
+	}
+	s.apMu.Unlock()
+
+	if len(pruned) > 0 {
+		s.addLog("info", fmt.Sprintf("Pruned %d stale devices: %v", len(pruned), pruned))
+		s.savePersistentData()
 	}
 }
 
@@ -1312,7 +1399,14 @@ func startDashboard() {
 
 	log.Printf("📊 Dashboard on port %d\n", server.dashPort)
 	addr := fmt.Sprintf("%s:%d", server.bindAddr, server.dashPort)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	// Use http.Server with timeouts for security
+	dashServer := &http.Server{
+		Addr:              addr,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := dashServer.ListenAndServe(); err != nil {
 		log.Fatalf("failed to start dashboard on %s: %v", addr, err)
 	}
 }
@@ -1354,21 +1448,58 @@ func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Rate limiting: check for lockout
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+	server.loginMu.Lock()
+	attempt, exists := server.loginAttempts[clientIP]
+	if exists && time.Now().Before(attempt.LockedUntil) {
+		server.loginMu.Unlock()
+		remaining := time.Until(attempt.LockedUntil).Round(time.Second)
+		http.Error(w, fmt.Sprintf("Too many failed attempts. Try again in %s", remaining), http.StatusTooManyRequests)
+		return
+	}
+	server.loginMu.Unlock()
+
 	var req loginRequest
 	if json.NewDecoder(r.Body).Decode(&req) != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
 	if !server.validateCredentials(req.Username, req.Password) {
+		// Record failed attempt
+		server.loginMu.Lock()
+		if server.loginAttempts[clientIP] == nil {
+			server.loginAttempts[clientIP] = &loginAttemptInfo{}
+		}
+		attempt := server.loginAttempts[clientIP]
+		attempt.Count++
+		attempt.LastAttempt = time.Now()
+
+		// Lock out after 5 failed attempts for 5 minutes
+		if attempt.Count >= 5 {
+			attempt.LockedUntil = time.Now().Add(5 * time.Minute)
+			server.addLog("warning", fmt.Sprintf("IP %s locked out due to %d failed login attempts", clientIP, attempt.Count))
+		}
+		server.loginMu.Unlock()
+
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
+
+	// Clear failed attempts on successful login
+	server.loginMu.Lock()
+	delete(server.loginAttempts, clientIP)
+	server.loginMu.Unlock()
+
 	token := server.createSession(req.Username)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_token",
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   server.persistentData.SystemSettings.SecureCookies,
 		MaxAge:   server.persistentData.SystemSettings.SessionTimeout * 3600,
 	})
 	w.Header().Set("Content-Type", "application/json")
@@ -1381,7 +1512,14 @@ func handleLogoutAPI(w http.ResponseWriter, r *http.Request) {
 		delete(server.sessions, cookie.Value)
 		server.sessionMu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "session_token", Value: "", Path: "/", MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_token",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   server.persistentData.SystemSettings.SecureCookies,
+	})
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
@@ -1502,14 +1640,12 @@ func (s *ProxyServer) isAPClient(ip string) bool {
 	return strings.HasPrefix(ip, "10.10.10.")
 }
 
-// getAPDeviceByIP finds an AP device by its current IP address
+// getAPDeviceByIP finds an AP device by its current IP address (O(1) lookup via index)
 func (s *ProxyServer) getAPDeviceByIP(ip string) *APDevice {
 	s.apMu.RLock()
 	defer s.apMu.RUnlock()
-	for _, device := range s.apDevices {
-		if device.IP == ip {
-			return device
-		}
+	if mac, exists := s.apIPToMAC[ip]; exists {
+		return s.apDevices[mac]
 	}
 	return nil
 }
@@ -1582,6 +1718,11 @@ func (s *ProxyServer) parseDHCPLeases(leaseFile string) {
 
 		s.apMu.Lock()
 		if device, exists := s.apDevices[mac]; exists {
+			// Update IP-to-MAC index if IP changed
+			if device.IP != ip {
+				delete(s.apIPToMAC, device.IP) // Remove old IP mapping
+			}
+			s.apIPToMAC[ip] = mac // Add/update new IP mapping
 			// Update existing device
 			device.IP = ip
 			device.Hostname = hostname
@@ -1601,6 +1742,7 @@ func (s *ProxyServer) parseDHCPLeases(leaseFile string) {
 			}
 			s.assignProxyToAPDevice(newDevice)
 			s.apDevices[mac] = newDevice
+			s.apIPToMAC[ip] = mac // Add IP-to-MAC mapping
 
 			// Also save to persistent data
 			s.persistMu.Lock()
@@ -1615,13 +1757,14 @@ func (s *ProxyServer) parseDHCPLeases(leaseFile string) {
 		s.apMu.Unlock()
 	}
 
-	// Mark devices not in current leases as offline
+	// Mark devices not in current leases as offline and clean up IP index
 	s.apMu.Lock()
 	for mac, device := range s.apDevices {
 		if !currentLeases[mac] && device.Status == "online" {
 			// Check if device was seen recently (within 2 minutes)
 			if time.Since(device.LastSeen) > 2*time.Minute {
 				device.Status = "offline"
+				delete(s.apIPToMAC, device.IP) // Remove from IP index when offline
 			}
 		}
 	}
@@ -1662,6 +1805,7 @@ func handleAPHTTPS(w http.ResponseWriter, r *http.Request, device *APDevice, pro
 		device.LastError = err.Error()
 		device.LastErrorTime = time.Now()
 		server.apMu.Unlock()
+		server.recordProxyFailure(device.ProxyIndex, err.Error())
 		http.Error(w, "Failed to connect to upstream proxy", http.StatusBadGateway)
 		return
 	}
@@ -1740,13 +1884,51 @@ func handleAPHTTP(w http.ResponseWriter, r *http.Request, device *APDevice, prox
 		device.LastError = err.Error()
 		device.LastErrorTime = time.Now()
 		server.apMu.Unlock()
+		server.recordProxyFailure(device.ProxyIndex, err.Error())
 		http.Error(w, "Failed to connect to upstream proxy", http.StatusBadGateway)
 		return
 	}
 	defer upstream.Close()
 
-	// Forward the request
-	if err := r.Write(upstream); err != nil {
+	// Normalize request to origin-form for upstream server
+	// Clients send absolute-form (GET http://example.com/path HTTP/1.1)
+	// but origin servers expect origin-form (GET /path HTTP/1.1)
+	outReq := new(http.Request)
+	*outReq = *r // Shallow copy
+
+	// Build origin-form URL (just path + query)
+	outReq.URL = &url.URL{
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
+	}
+	if outReq.URL.Path == "" {
+		outReq.URL.Path = "/"
+	}
+
+	// Clear RequestURI (Go requires this to be empty for client requests)
+	outReq.RequestURI = ""
+
+	// Copy headers and remove proxy-specific ones
+	outReq.Header = make(http.Header)
+	for key, values := range r.Header {
+		// Skip proxy-specific headers
+		if strings.EqualFold(key, "Proxy-Connection") ||
+			strings.EqualFold(key, "Proxy-Authenticate") ||
+			strings.EqualFold(key, "Proxy-Authorization") {
+			continue
+		}
+		for _, v := range values {
+			outReq.Header.Add(key, v)
+		}
+	}
+
+	// Ensure Host header is set
+	if outReq.Header.Get("Host") == "" {
+		outReq.Header.Set("Host", r.Host)
+	}
+
+	// Forward the normalized request
+	if err := outReq.Write(upstream); err != nil {
 		http.Error(w, "Failed to forward request", http.StatusBadGateway)
 		return
 	}

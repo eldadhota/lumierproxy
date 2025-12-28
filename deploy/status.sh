@@ -53,13 +53,13 @@ echo ""
 
 # DHCP Leases
 echo -e "${BLUE}DHCP Leases:${NC}"
-if [ -f /var/lib/misc/dnsmasq.leases ]; then
-    LEASE_COUNT=$(wc -l < /var/lib/misc/dnsmasq.leases)
+if [ -f /var/lib/lumier/dnsmasq.leases ]; then
+    LEASE_COUNT=$(wc -l < /var/lib/lumier/dnsmasq.leases)
     echo "  Active leases: $LEASE_COUNT"
     if [ "$LEASE_COUNT" -gt 0 ]; then
         echo ""
         echo "  Recent devices:"
-        tail -5 /var/lib/misc/dnsmasq.leases | while read line; do
+        tail -5 /var/lib/lumier/dnsmasq.leases | while read line; do
             IP=$(echo "$line" | awk '{print $3}')
             MAC=$(echo "$line" | awk '{print $2}')
             NAME=$(echo "$line" | awk '{print $4}')
