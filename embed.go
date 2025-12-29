@@ -27,6 +27,7 @@ var (
 	monitoringPageHTML     []byte
 	accessPointPageHTML    []byte
 	deviceMonitorPageHTML  []byte
+	screenshotsPageHTML    []byte
 	navHTML                []byte
 	baseStyles             []byte
 	baseJS                 []byte
@@ -91,6 +92,11 @@ func initEmbeddedContent() {
 		log.Fatal("Failed to load device-monitor.html:", err)
 	}
 
+	screenshotsPageHTML, err = dashboardFS.ReadFile("dashboard/pages/screenshots.html")
+	if err != nil {
+		log.Fatal("Failed to load screenshots.html:", err)
+	}
+
 	navHTML, err = dashboardFS.ReadFile("dashboard/partials/nav.html")
 	if err != nil {
 		log.Fatal("Failed to load nav.html:", err)
@@ -117,6 +123,7 @@ func initEmbeddedContent() {
 	monitoringPageHTML = assembleHTML(monitoringPageHTML)
 	accessPointPageHTML = assembleHTML(accessPointPageHTML)
 	deviceMonitorPageHTML = assembleHTML(deviceMonitorPageHTML)
+	screenshotsPageHTML = assembleHTML(screenshotsPageHTML)
 
 	log.Println("Loaded embedded dashboard content")
 }

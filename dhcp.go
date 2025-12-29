@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -11,6 +12,31 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// Google domains that can be bypassed during device setup
+var googleDomains = []string{
+	"google.com", "google.co", "googleapis.com", "gstatic.com",
+	"googleusercontent.com", "googledrive.com", "gmail.com",
+	"android.com", "gvt1.com", "gvt2.com", "gvt3.com",
+	"ggpht.com", "googleadservices.com", "doubleclick.net",
+	"google-analytics.com", "googlesyndication.com",
+}
+
+// isGoogleService checks if a host is a Google service that can be bypassed
+func isGoogleService(hostPort string) bool {
+	host := strings.ToLower(hostPort)
+	// Remove port if present
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+
+	for _, domain := range googleDomains {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
 
 // ============================================================================
 // ACCESS POINT CLIENT MANAGEMENT
@@ -187,7 +213,18 @@ func handleAPHTTPS(w http.ResponseWriter, r *http.Request, device *APDevice, pro
 
 	startTime := time.Now()
 
-	upstream, err := dialThroughSOCKS5(target, device.UpstreamProxy)
+	var upstream net.Conn
+	var err error
+
+	// Google bypass: connect directly if enabled for this device
+	if device.GoogleBypass && isGoogleService(target) {
+		upstream, err = net.DialTimeout("tcp", target, 30*time.Second)
+		if err == nil {
+			server.addLog("info", fmt.Sprintf("[AP] Google bypass HTTPS: %s -> %s (direct)", device.CustomName, target))
+		}
+	} else {
+		upstream, err = dialThroughSOCKS5(target, device.UpstreamProxy)
+	}
 	if err != nil {
 		server.apMu.Lock()
 		atomic.AddInt64(&device.ErrorCount, 1)
@@ -266,7 +303,18 @@ func handleAPHTTP(w http.ResponseWriter, r *http.Request, device *APDevice, prox
 		target += ":80"
 	}
 
-	upstream, err := dialThroughSOCKS5(target, device.UpstreamProxy)
+	var upstream net.Conn
+	var err error
+
+	// Google bypass: connect directly if enabled for this device
+	if device.GoogleBypass && isGoogleService(target) {
+		upstream, err = net.DialTimeout("tcp", target, 30*time.Second)
+		if err == nil {
+			server.addLog("info", fmt.Sprintf("[AP] Google bypass HTTP: %s -> %s (direct)", device.CustomName, target))
+		}
+	} else {
+		upstream, err = dialThroughSOCKS5(target, device.UpstreamProxy)
+	}
 	if err != nil {
 		server.apMu.Lock()
 		atomic.AddInt64(&device.ErrorCount, 1)

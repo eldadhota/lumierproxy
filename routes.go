@@ -29,6 +29,7 @@ func startDashboard() {
 	http.HandleFunc("/api/ap/device/proxy", server.requireAuth(handleAPDeviceProxyAPI))
 	http.HandleFunc("/api/ap/device/update", server.requireAuth(handleAPDeviceUpdateAPI))
 	http.HandleFunc("/api/ap/device/delete", server.requireAuth(handleAPDeviceDeleteAPI))
+	http.HandleFunc("/api/ap/device/bypass", server.requireAuth(handleAPDeviceBypassAPI))
 
 	// Browser Profiles API
 	http.HandleFunc("/browsers", server.requireAuth(handleBrowserProfilesPage))
@@ -49,6 +50,7 @@ func startDashboard() {
 	http.HandleFunc("/analytics", server.requireAuth(handleAnalyticsPage))
 	http.HandleFunc("/activity", server.requireAuth(handleActivityPage))
 	http.HandleFunc("/device-monitor", server.requireAuth(handleDeviceMonitorPage))
+	http.HandleFunc("/screenshots", server.requireAuth(handleScreenshotsPage))
 	http.HandleFunc("/settings", server.requireAuth(handleSettingsPage))
 	http.HandleFunc("/monitoring", server.requireAuth(handleMonitoringPage))
 
@@ -82,6 +84,17 @@ func startDashboard() {
 	http.HandleFunc("/api/check-blacklist", server.requireAuth(handleCheckBlacklistAPI))
 	http.HandleFunc("/api/device-connections", server.requireAuth(handleDeviceConnectionsAPI))
 	http.HandleFunc("/api/network-overview", server.requireAuth(handleNetworkOverviewAPI))
+
+	// Screenshot API (Dashboard)
+	http.HandleFunc("/api/screenshot/request", server.requireAuth(handleScreenshotRequest))
+	http.HandleFunc("/api/screenshot/list", server.requireAuth(handleScreenshotList))
+	http.HandleFunc("/api/screenshot/image", server.requireAuth(handleScreenshotImage))
+	http.HandleFunc("/api/screenshot/delete", server.requireAuth(handleScreenshotDelete))
+	http.HandleFunc("/api/screenshot/active-devices", server.requireAuth(handleActiveDevicesAPI))
+
+	// Client Screenshot API (no auth - used by Windows client)
+	http.HandleFunc("/api/client/screenshot/pending", handleClientScreenshotPending)
+	http.HandleFunc("/api/client/screenshot/upload", handleClientScreenshotUpload)
 
 	log.Printf("📊 Dashboard on port %d\n", server.dashPort)
 	addr := fmt.Sprintf("%s:%d", server.bindAddr, server.dashPort)

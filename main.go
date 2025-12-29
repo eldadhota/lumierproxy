@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -63,7 +64,10 @@ func main() {
 			DHCPEnd:      "10.10.10.200",
 			LeaseFile:    "/var/lib/lumier/dnsmasq.leases",
 		},
-		browserProfiles: make(map[string]*BrowserProfile),
+		browserProfiles:    make(map[string]*BrowserProfile),
+		screenshots:        []Screenshot{},
+		screenshotRequests: make(map[string]*ScreenshotRequest),
+		screenshotDir:      "./screenshots",
 		persistentData: PersistentData{
 			DeviceConfigs:   make(map[string]DeviceConfig),
 			Groups:          []string{"Default", "Floor 1", "Floor 2", "Team A", "Team B"},
@@ -95,6 +99,13 @@ func main() {
 
 	// Load embedded dashboard content
 	initEmbeddedContent()
+
+	// Create screenshots directory if it doesn't exist
+	if err := os.MkdirAll(server.screenshotDir, 0755); err != nil {
+		log.Printf("Warning: Could not create screenshots directory: %v", err)
+	} else {
+		server.loadExistingScreenshots()
+	}
 
 	go autoSaveData()
 	go collectTrafficSnapshots()
@@ -532,6 +543,56 @@ func handleAPDeviceProxyAPI(w http.ResponseWriter, r *http.Request) {
 		"success":     true,
 		"proxy_index": req.ProxyIndex,
 		"proxy_name":  server.getProxyName(req.ProxyIndex),
+	})
+}
+
+// handleAPDeviceBypassAPI toggles Google bypass for an AP device
+func handleAPDeviceBypassAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		MAC          string `json:"mac"`
+		GoogleBypass bool   `json:"google_bypass"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	mac := strings.ToLower(req.MAC)
+
+	server.apMu.Lock()
+	device, exists := server.apDevices[mac]
+	if !exists {
+		server.apMu.Unlock()
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	device.GoogleBypass = req.GoogleBypass
+	server.apMu.Unlock()
+
+	// Save to persistent data
+	server.persistMu.Lock()
+	server.persistentData.APDevices[mac] = device
+	server.persistMu.Unlock()
+
+	status := "disabled"
+	if req.GoogleBypass {
+		status = "enabled"
+	}
+	server.addLog("info", fmt.Sprintf("[AP] Google bypass %s for %s (%s)",
+		status, device.CustomName, device.MAC))
+
+	server.savePersistentData()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":       true,
+		"google_bypass": req.GoogleBypass,
 	})
 }
 
@@ -1080,7 +1141,23 @@ func handleBrowserProfilesPage(w http.ResponseWriter, r *http.Request) {
 func handleClientProfilesAPI(w http.ResponseWriter, r *http.Request) {
 	devices := make([]ClientDevice, 0)
 
-	// Get AP devices (confirmed only)
+	// Get browser profiles (primary method for Windows client)
+	server.browserMu.RLock()
+	for _, p := range server.browserProfiles {
+		if p.UpstreamProxy != "" {
+			devices = append(devices, ClientDevice{
+				ID:            p.ID, // bp-xxx format
+				Name:          p.Name,
+				ProxyIndex:    p.ProxyIndex,
+				ProxyName:     p.ProxyName,
+				UpstreamProxy: p.UpstreamProxy,
+				DeviceType:    "browser",
+			})
+		}
+	}
+	server.browserMu.RUnlock()
+
+	// Get AP devices (confirmed only) - for backward compatibility
 	server.apMu.RLock()
 	for _, d := range server.apDevices {
 		if d.Confirmed && d.UpstreamProxy != "" {
@@ -2606,6 +2683,377 @@ func handleNetworkOverviewAPI(w http.ResponseWriter, r *http.Request) {
 		"active_count":   activeCount,
 		"total_bytes_in": totalBytesIn,
 		"total_bytes_out": totalBytesOut,
+	})
+}
+
+// ============================================================================
+// SCREENSHOT HANDLERS (Client Remote Screenshots)
+// ============================================================================
+
+const maxScreenshotsPerDevice = 10
+const maxTotalScreenshots = 50
+
+// loadExistingScreenshots loads any existing screenshots from disk on startup
+func (s *ProxyServer) loadExistingScreenshots() {
+	files, err := os.ReadDir(s.screenshotDir)
+	if err != nil {
+		return
+	}
+
+	s.screenshotMu.Lock()
+	defer s.screenshotMu.Unlock()
+
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(strings.ToLower(file.Name()), ".jpg") {
+			continue
+		}
+
+		info, err := file.Info()
+		if err != nil {
+			continue
+		}
+
+		// Parse device ID from filename (format: deviceID_timestamp.jpg)
+		parts := strings.SplitN(strings.TrimSuffix(file.Name(), ".jpg"), "_", 2)
+		deviceID := ""
+		if len(parts) > 0 {
+			deviceID = parts[0]
+		}
+
+		s.screenshots = append(s.screenshots, Screenshot{
+			ID:          strings.TrimSuffix(file.Name(), ".jpg"),
+			DeviceID:    deviceID,
+			Filename:    file.Name(),
+			CaptureTime: info.ModTime(),
+			SizeBytes:   info.Size(),
+		})
+	}
+
+	// Sort by capture time (newest first)
+	sort.Slice(s.screenshots, func(i, j int) bool {
+		return s.screenshots[i].CaptureTime.After(s.screenshots[j].CaptureTime)
+	})
+
+	log.Printf("Loaded %d existing screenshots", len(s.screenshots))
+}
+
+func handleScreenshotsPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write(screenshotsPageHTML)
+}
+
+// handleActiveDevicesAPI returns only devices with active browser sessions (Duration == 0)
+func handleActiveDevicesAPI(w http.ResponseWriter, r *http.Request) {
+	type ActiveDevice struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		ProxyName string `json:"proxy_name"`
+		Username  string `json:"username"`
+	}
+
+	var activeDevices []ActiveDevice
+	seen := make(map[string]bool)
+
+	server.persistMu.RLock()
+	for _, s := range server.persistentData.BrowserSessions {
+		// Duration == 0 means session is still active
+		if s.Duration == 0 && !seen[s.ProfileID] {
+			seen[s.ProfileID] = true
+			activeDevices = append(activeDevices, ActiveDevice{
+				ID:        s.ProfileID,
+				Name:      s.DeviceName,
+				ProxyName: s.ProxyName,
+				Username:  s.Username,
+			})
+		}
+	}
+	server.persistMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"devices": activeDevices,
+	})
+}
+
+// handleScreenshotRequest - Dashboard requests a screenshot from a specific device
+func handleScreenshotRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	deviceID := r.URL.Query().Get("device_id")
+	if deviceID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Missing device_id parameter",
+		})
+		return
+	}
+
+	server.screenshotMu.Lock()
+	server.screenshotRequests[deviceID] = &ScreenshotRequest{
+		DeviceID:    deviceID,
+		RequestedAt: time.Now(),
+		RequestedBy: "dashboard",
+	}
+	server.screenshotMu.Unlock()
+
+	server.addLog("info", fmt.Sprintf("Screenshot requested for device: %s", deviceID))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"device_id": deviceID,
+	})
+}
+
+// handleClientScreenshotPending - Client checks if there's a pending screenshot request
+func handleClientScreenshotPending(w http.ResponseWriter, r *http.Request) {
+	deviceID := r.URL.Query().Get("device_id")
+	if deviceID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"pending": false})
+		return
+	}
+
+	server.screenshotMu.Lock()
+	req, exists := server.screenshotRequests[deviceID]
+	if exists {
+		// Check if request is still valid (within 60 seconds)
+		if time.Since(req.RequestedAt) > 60*time.Second {
+			delete(server.screenshotRequests, deviceID)
+			exists = false
+		} else {
+			// Found a pending request - remove it so client only captures once
+			delete(server.screenshotRequests, deviceID)
+			server.addLog("info", fmt.Sprintf("Screenshot pending found for device: %s", deviceID))
+		}
+	}
+	server.screenshotMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"pending": exists,
+	})
+}
+
+// handleClientScreenshotUpload - Client uploads a screenshot
+func handleClientScreenshotUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse multipart form (max 10MB)
+	err := r.ParseMultipartForm(10 << 20)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to parse form: " + err.Error(),
+		})
+		return
+	}
+
+	deviceID := r.FormValue("device_id")
+	deviceName := r.FormValue("device_name")
+	username := r.FormValue("username")
+	widthStr := r.FormValue("width")
+	heightStr := r.FormValue("height")
+
+	if deviceID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Missing device_id",
+		})
+		return
+	}
+
+	file, _, err := r.FormFile("screenshot")
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Missing screenshot file: " + err.Error(),
+		})
+		return
+	}
+	defer file.Close()
+
+	// Generate filename
+	now := time.Now()
+	id := fmt.Sprintf("%s_%s", deviceID, now.Format("20060102_150405"))
+	filename := id + ".jpg"
+	filePath := filepath.Join(server.screenshotDir, filename)
+
+	// Save file
+	outFile, err := os.Create(filePath)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to create file: " + err.Error(),
+		})
+		return
+	}
+	defer outFile.Close()
+
+	written, err := io.Copy(outFile, file)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to save file: " + err.Error(),
+		})
+		return
+	}
+
+	width, _ := strconv.Atoi(widthStr)
+	height, _ := strconv.Atoi(heightStr)
+
+	// Create screenshot record
+	ss := Screenshot{
+		ID:          id,
+		DeviceID:    deviceID,
+		DeviceName:  deviceName,
+		Username:    username,
+		Filename:    filename,
+		CaptureTime: now,
+		Width:       width,
+		Height:      height,
+		SizeBytes:   written,
+	}
+
+	// Add to list and remove pending request
+	server.screenshotMu.Lock()
+	delete(server.screenshotRequests, deviceID)
+	server.screenshots = append([]Screenshot{ss}, server.screenshots...)
+
+	// Prune old screenshots for this device
+	deviceCount := 0
+	filtered := []Screenshot{}
+	for _, s := range server.screenshots {
+		if s.DeviceID == deviceID {
+			deviceCount++
+			if deviceCount > maxScreenshotsPerDevice {
+				os.Remove(filepath.Join(server.screenshotDir, s.Filename))
+				continue
+			}
+		}
+		filtered = append(filtered, s)
+	}
+	server.screenshots = filtered
+
+	// Prune if total exceeds limit
+	for len(server.screenshots) > maxTotalScreenshots {
+		oldest := server.screenshots[len(server.screenshots)-1]
+		os.Remove(filepath.Join(server.screenshotDir, oldest.Filename))
+		server.screenshots = server.screenshots[:len(server.screenshots)-1]
+	}
+	server.screenshotMu.Unlock()
+
+	server.addLog("info", fmt.Sprintf("Screenshot uploaded from %s (%s): %dx%d", deviceName, deviceID, width, height))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+func handleScreenshotList(w http.ResponseWriter, r *http.Request) {
+	deviceID := r.URL.Query().Get("device_id")
+
+	server.screenshotMu.RLock()
+	var filtered []Screenshot
+	for _, s := range server.screenshots {
+		if deviceID == "" || s.DeviceID == deviceID {
+			filtered = append(filtered, s)
+		}
+	}
+	server.screenshotMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"screenshots": filtered,
+		"count":       len(filtered),
+	})
+}
+
+func handleScreenshotImage(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "Missing id parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Find the screenshot
+	server.screenshotMu.RLock()
+	var found *Screenshot
+	for i := range server.screenshots {
+		if server.screenshots[i].ID == id {
+			found = &server.screenshots[i]
+			break
+		}
+	}
+	server.screenshotMu.RUnlock()
+
+	if found == nil {
+		http.Error(w, "Screenshot not found", http.StatusNotFound)
+		return
+	}
+
+	filePath := filepath.Join(server.screenshotDir, found.Filename)
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "max-age=3600")
+	http.ServeFile(w, r, filePath)
+}
+
+func handleScreenshotDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "Missing id parameter", http.StatusBadRequest)
+		return
+	}
+
+	server.screenshotMu.Lock()
+	var found bool
+	var filename string
+	for i := range server.screenshots {
+		if server.screenshots[i].ID == id {
+			filename = server.screenshots[i].Filename
+			server.screenshots = append(server.screenshots[:i], server.screenshots[i+1:]...)
+			found = true
+			break
+		}
+	}
+	server.screenshotMu.Unlock()
+
+	if !found {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Screenshot not found",
+		})
+		return
+	}
+
+	// Delete file
+	os.Remove(filepath.Join(server.screenshotDir, filename))
+
+	server.addLog("info", fmt.Sprintf("Screenshot deleted: %s", filename))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
 	})
 }
 

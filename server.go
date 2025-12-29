@@ -136,6 +136,7 @@ type APDevice struct {
 	ErrorCount    int64     `json:"error_count"`
 	LastError     string    `json:"last_error"`
 	LastErrorTime time.Time `json:"last_error_time"`
+	GoogleBypass  bool      `json:"google_bypass"` // Allow direct access to Google services
 }
 
 // APConfig stores access point network configuration
@@ -221,6 +222,11 @@ type ProxyServer struct {
 	// Browser Profile fields
 	browserProfiles map[string]*BrowserProfile
 	browserMu       sync.RWMutex
+	// Screenshot fields
+	screenshots          []Screenshot
+	screenshotRequests   map[string]*ScreenshotRequest // device_id -> request
+	screenshotDir        string
+	screenshotMu         sync.RWMutex
 }
 
 type LogEntry struct {
@@ -331,6 +337,26 @@ type IPQSResult struct {
 type CombinedTrustScore struct {
 	IPQS           IPQSResult       `json:"ipqs"`
 	IPQualityScore TrustScoreResult `json:"ipqualityscore"` // Legacy field for IP-API fallback
+}
+
+// Screenshot represents a captured screenshot from a client device
+type Screenshot struct {
+	ID          string    `json:"id"`
+	DeviceID    string    `json:"device_id"`
+	DeviceName  string    `json:"device_name"`
+	Username    string    `json:"username"`
+	Filename    string    `json:"filename"`
+	CaptureTime time.Time `json:"capture_time"`
+	Width       int       `json:"width"`
+	Height      int       `json:"height"`
+	SizeBytes   int64     `json:"size_bytes"`
+}
+
+// ScreenshotRequest represents a pending screenshot request for a device
+type ScreenshotRequest struct {
+	DeviceID    string    `json:"device_id"`
+	RequestedAt time.Time `json:"requested_at"`
+	RequestedBy string    `json:"requested_by"`
 }
 
 // ============================================================================
