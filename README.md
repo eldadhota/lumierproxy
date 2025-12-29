@@ -34,6 +34,47 @@ chmod +x run_proxy.sh
 
 ---
 
+## Access Point (AP) Mode - Recommended Setup
+
+The recommended deployment method uses a WiFi Access Point for automatic device management:
+
+### Setup Steps
+
+1. **Run the AP setup script** (Linux):
+   ```bash
+   sudo ./scripts/ap-setup.sh
+   ```
+
+2. **Start the LumierProxy service**:
+   ```bash
+   ./lumierproxy
+   # Or as a service:
+   sudo systemctl start lumierproxy
+   ```
+
+3. **Connect devices to the WiFi network** (SSID: `LumierProxy`)
+
+4. **Approve devices in the dashboard**:
+   - Open http://YOUR_SERVER_IP:8080
+   - Go to Devices tab
+   - Click "Approve" on pending devices
+   - Assign proxies to approved devices
+
+5. **Verify traffic routing**:
+   - Approved devices get internet only through assigned proxy
+   - Unapproved devices are blocked
+
+### Why AP Mode?
+
+- **No per-device configuration** - Devices auto-configure via WPAD/PAC
+- **Prevent bypass** - Devices cannot access internet directly
+- **Easy management** - Approve/assign proxies from dashboard
+- **MAC-based tracking** - Even with IP changes, devices are tracked
+
+For detailed AP deployment, see `SETUP_GUIDE.md`.
+
+---
+
 ## Server Setup
 
 ### Prerequisites
@@ -234,14 +275,31 @@ After registering in the app:
 
 ```
 lumierproxy/
-├── main.go              # Server source code
+├── main.go              # Entry point and API handlers
+├── server.go            # Type definitions, ProxyServer struct
+├── auth.go              # Authentication, sessions
+├── persistence.go       # Data save/load, pruning
+├── proxy.go             # Proxy handling, SOCKS5, health monitoring
+├── dhcp.go              # DHCP monitoring, AP traffic handling
+├── logging.go           # Log and activity tracking
+├── routes.go            # Route registration
+├── utils.go             # Helper functions
+├── embed.go             # Dashboard asset embedding
+├── dashboard/           # Embedded dashboard assets
+│   ├── pages/           # HTML pages (10 files)
+│   ├── assets/          # CSS and JS files
+│   └── partials/        # Shared HTML components
 ├── proxies.txt          # Upstream proxy list
 ├── device_data.json     # Persistent device/settings data
 ├── go.mod               # Go module definition
 ├── run_proxy.ps1        # Windows launcher
 ├── run_proxy.sh         # Linux launcher
-├── install.sh           # Linux service installer
-├── start.sh             # Simple Linux launcher
+├── deploy/              # Deployment scripts
+│   ├── install.sh       # Linux service installer
+│   └── quickstart.sh    # Quick setup script
+├── scripts/             # AP setup scripts
+│   ├── ap-setup.sh      # Access Point setup
+│   └── ap-teardown.sh   # AP teardown
 └── android-app/         # Android application source
 ```
 

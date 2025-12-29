@@ -94,12 +94,11 @@ Ensure-GoModule
 Ensure-ProxiesFile
 
 Write-Host ""
-Write-Host "Starting Lumier Dynamics proxy (go run main.go)..." -ForegroundColor Cyan
+Write-Host "Starting Lumier Dynamics proxy (go run .)..." -ForegroundColor Cyan
 Write-Host ""
 
-# Run the Go program using only the main entrypoint (avoids pulling in stray
-# backup .go files that could cause duplicate-definition errors)
-go run main.go
+# Run the Go program (all .go files in the package)
+go run .
 
 Write-Host ""
 Write-Host "Proxy exited. You can close this window." -ForegroundColor Yellow

@@ -16,12 +16,36 @@
   ],
   "traffic_history": [
     {
-      "timestamp": "2025-12-09T15:45:15.4513465+01:00",
-      "total_bytes_in": 636928,
-      "total_bytes_out": 142748,
-      "total_requests": 49,
-      "active_devices": 1,
-      "error_count": 12
+      "timestamp": "2025-12-28T06:56:07.5834737+01:00",
+      "total_bytes_in": 0,
+      "total_bytes_out": 0,
+      "total_requests": 0,
+      "active_devices": 0,
+      "error_count": 0
+    },
+    {
+      "timestamp": "2025-12-28T07:01:07.5835544+01:00",
+      "total_bytes_in": 0,
+      "total_bytes_out": 0,
+      "total_requests": 0,
+      "active_devices": 0,
+      "error_count": 0
+    },
+    {
+      "timestamp": "2025-12-28T07:06:07.5833461+01:00",
+      "total_bytes_in": 0,
+      "total_bytes_out": 0,
+      "total_requests": 0,
+      "active_devices": 0,
+      "error_count": 0
+    },
+    {
+      "timestamp": "2025-12-28T07:11:07.5835551+01:00",
+      "total_bytes_in": 0,
+      "total_bytes_out": 0,
+      "total_requests": 0,
+      "active_devices": 0,
+      "error_count": 0
     }
   ],
   "proxy_health_data": {
@@ -40,7 +64,8 @@
       "status": "unhealthy",
       "bytes_in": 552364,
       "bytes_out": 61203,
-      "active_devices": 1
+      "active_devices": 0,
+      "device_count": 0
     },
     "1": {
       "index": 1,
@@ -57,7 +82,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "10": {
       "index": 10,
@@ -74,7 +100,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "11": {
       "index": 11,
@@ -91,7 +118,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "12": {
       "index": 12,
@@ -108,7 +136,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "13": {
       "index": 13,
@@ -125,7 +154,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "14": {
       "index": 14,
@@ -142,7 +172,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "15": {
       "index": 15,
@@ -159,7 +190,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "16": {
       "index": 16,
@@ -176,7 +208,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "17": {
       "index": 17,
@@ -193,7 +226,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "18": {
       "index": 18,
@@ -210,7 +244,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "19": {
       "index": 19,
@@ -227,7 +262,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "2": {
       "index": 2,
@@ -244,7 +280,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "20": {
       "index": 20,
@@ -261,7 +298,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "21": {
       "index": 21,
@@ -278,7 +316,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "22": {
       "index": 22,
@@ -295,7 +334,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "23": {
       "index": 23,
@@ -312,7 +352,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "24": {
       "index": 24,
@@ -329,7 +370,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "25": {
       "index": 25,
@@ -346,7 +388,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "26": {
       "index": 26,
@@ -363,7 +406,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "27": {
       "index": 27,
@@ -380,7 +424,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "28": {
       "index": 28,
@@ -397,7 +442,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "29": {
       "index": 29,
@@ -414,7 +460,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "3": {
       "index": 3,
@@ -431,7 +478,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "4": {
       "index": 4,
@@ -448,7 +496,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "5": {
       "index": 5,
@@ -465,7 +514,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "6": {
       "index": 6,
@@ -482,7 +532,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "7": {
       "index": 7,
@@ -499,7 +550,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "8": {
       "index": 8,
@@ -516,7 +568,8 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     },
     "9": {
       "index": 9,
@@ -533,12 +586,140 @@
       "status": "unknown",
       "bytes_in": 0,
       "bytes_out": 0,
-      "active_devices": 0
+      "active_devices": 0,
+      "device_count": 0
     }
   },
   "system_settings": {
     "session_timeout_hours": 24,
     "traffic_retention_days": 7,
     "device_timeout_minutes": 30
-  }
+  },
+  "supervisors": [
+    {
+      "name": "Mirko",
+      "password": "DobroJeMirko321a"
+    },
+    {
+      "name": "Ana",
+      "password": "SupervisorAna123"
+    },
+    {
+      "name": "Marko",
+      "password": "SupervisorMarko456"
+    },
+    {
+      "name": "Ivan",
+      "password": "SupervisorIvan789"
+    }
+  ],
+  "admin_password": "Drnda123",
+  "proxy_names": {},
+  "ap_config": {
+    "enabled": true,
+    "interface": "eth0",
+    "wan_interface": "wlan0",
+    "ip_address": "10.10.10.1",
+    "netmask": "255.255.255.0",
+    "dhcp_start": "10.10.10.100",
+    "dhcp_end": "10.10.10.200",
+    "lease_file": "/var/lib/lumier/dnsmasq.leases"
+  },
+  "ap_devices": {
+    "00:11:22:33:44:55": {
+      "mac": "00:11:22:33:44:55",
+      "ip": "10.10.10.99",
+      "hostname": "test-device",
+      "upstream_proxy": "brd.superproxy.io:22228:brd-customer-hl_5c7ff83f-zone-isp_thirty_sg-ip-31.204.27.212:bap9iupp91kd",
+      "proxy_index": 0,
+      "first_seen": "2025-12-28T00:00:00Z",
+      "last_seen": "2025-12-28T00:00:00Z",
+      "status": "offline",
+      "confirmed": true,
+      "confirmed_at": "2025-12-28T00:00:00Z",
+      "confirmed_by": "system",
+      "bytes_in": 0,
+      "bytes_out": 0,
+      "request_count": 0,
+      "group": "Test",
+      "custom_name": "Test Device (Firefox Testing)",
+      "notes": "Fake device for testing Firefox proxy functionality",
+      "error_count": 0,
+      "last_error": "",
+      "last_error_time": "0001-01-01T00:00:00Z"
+    }
+  },
+  "browser_profiles": null,
+  "browser_sessions": [
+    {
+      "id": "bs-1766901181591903900",
+      "profile_id": "00:11:22:33:44:55",
+      "device_name": "Test Device (Firefox Testing)",
+      "proxy_name": "SG1",
+      "username": "Eldad",
+      "started_at": "2025-12-28T06:53:01.5919039+01:00",
+      "ended_at": "0001-01-01T00:00:00Z",
+      "duration_seconds": 0
+    },
+    {
+      "id": "bs-1766901315864778400",
+      "profile_id": "00:11:22:33:44:55",
+      "device_name": "Test Device (Firefox Testing)",
+      "proxy_name": "SG1",
+      "username": "Eldad",
+      "started_at": "2025-12-28T06:55:15.8647784+01:00",
+      "ended_at": "0001-01-01T00:00:00Z",
+      "duration_seconds": 0
+    },
+    {
+      "id": "bs-1766901622801495800",
+      "profile_id": "00:11:22:33:44:55",
+      "device_name": "Test Device (Firefox Testing)",
+      "proxy_name": "SG1",
+      "username": "Eldad",
+      "started_at": "2025-12-28T07:00:22.8014958+01:00",
+      "ended_at": "2025-12-28T07:01:13.9229844+01:00",
+      "duration_seconds": 51
+    },
+    {
+      "id": "bs-1766901826516280600",
+      "profile_id": "00:11:22:33:44:55",
+      "device_name": "Test Device (Firefox Testing)",
+      "proxy_name": "SG1",
+      "username": "Eldad",
+      "started_at": "2025-12-28T07:03:46.5162806+01:00",
+      "ended_at": "2025-12-28T07:04:44.1620649+01:00",
+      "duration_seconds": 57
+    },
+    {
+      "id": "bs-1766902285758111000",
+      "profile_id": "00:11:22:33:44:55",
+      "device_name": "Test Device (Firefox Testing)",
+      "proxy_name": "SG1",
+      "username": "Eldad",
+      "started_at": "2025-12-28T07:11:25.758111+01:00",
+      "ended_at": "2025-12-28T07:12:24.357911+01:00",
+      "duration_seconds": 58
+    },
+    {
+      "id": "bs-1766902362320648800",
+      "profile_id": "00:11:22:33:44:55",
+      "device_name": "Test Device (Firefox Testing)",
+      "proxy_name": "SG1",
+      "username": "Eldad",
+      "started_at": "2025-12-28T07:12:42.3206488+01:00",
+      "ended_at": "2025-12-28T07:13:07.9733281+01:00",
+      "duration_seconds": 25
+    },
+    {
+      "id": "bs-1766903289084301200",
+      "profile_id": "00:11:22:33:44:55",
+      "device_name": "Test Device (Firefox Testing)",
+      "proxy_name": "SG1",
+      "username": "Eldad",
+      "started_at": "2025-12-28T07:28:09.0843012+01:00",
+      "ended_at": "2025-12-28T07:29:18.7238245+01:00",
+      "duration_seconds": 69
+    }
+  ]
 }

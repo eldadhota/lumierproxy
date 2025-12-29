@@ -1,13 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"compress/gzip"
-	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,416 +8,14 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"regexp"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"golang.org/x/net/proxy"
 )
-
-// ============================================================================
-// DATA STRUCTURES
-// ============================================================================
-
-type Device struct {
-	ID            string    `json:"id"`
-	IP            string    `json:"ip"`
-	Username      string    `json:"username"`
-	Name          string    `json:"name"`
-	CustomName    string    `json:"custom_name"`
-	Group         string    `json:"group"`
-	UpstreamProxy string    `json:"upstream_proxy"`
-	Status        string    `json:"status"`
-	FirstSeen     time.Time `json:"first_seen"`
-	LastSeen      time.Time `json:"last_seen"`
-	LastActive    time.Time `json:"last_active"`
-	RequestCount  int64     `json:"request_count"`
-	BytesIn       int64     `json:"bytes_in"`
-	BytesOut      int64     `json:"bytes_out"`
-	Notes         string    `json:"notes"`
-	ErrorCount    int64     `json:"error_count"`
-	LastError     string    `json:"last_error"`
-	LastErrorTime time.Time `json:"last_error_time"`
-	// Session confirmation fields
-	Confirmed     bool      `json:"confirmed"`
-	ConfirmedAt   time.Time `json:"confirmed_at"`
-	SessionStart  time.Time `json:"session_start"`
-}
-
-// DeviceConnection tracks a recent connection made by a device
-type DeviceConnection struct {
-	Timestamp time.Time `json:"timestamp"`
-	Host      string    `json:"host"`
-	Protocol  string    `json:"protocol"`
-	BytesIn   int64     `json:"bytes_in"`
-	BytesOut  int64     `json:"bytes_out"`
-	Success   bool      `json:"success"`
-}
-
-type ProxyHealth struct {
-	Index           int               `json:"index"`
-	ProxyString     string            `json:"proxy_string"`
-	IPAddress       string            `json:"ip_address"`
-	TotalRequests   int64             `json:"total_requests"`
-	SuccessCount    int64             `json:"success_count"`
-	FailureCount    int64             `json:"failure_count"`
-	SuccessRate     float64           `json:"success_rate"`
-	LastSuccess     time.Time         `json:"last_success"`
-	LastFailure     time.Time         `json:"last_failure"`
-	LastError       string            `json:"last_error"`
-	AvgResponseTime int64             `json:"avg_response_time_ms"`
-	Status          string            `json:"status"`
-	BytesIn         int64             `json:"bytes_in"`
-	BytesOut        int64             `json:"bytes_out"`
-	ActiveDevices   int               `json:"active_devices"`
-	UniqueDevices   map[string]bool   `json:"-"`
-	DeviceCount     int               `json:"device_count"`
-}
-
-type TrafficSnapshot struct {
-	Timestamp     time.Time `json:"timestamp"`
-	TotalBytesIn  int64     `json:"total_bytes_in"`
-	TotalBytesOut int64     `json:"total_bytes_out"`
-	TotalRequests int64     `json:"total_requests"`
-	ActiveDevices int       `json:"active_devices"`
-	ErrorCount    int64     `json:"error_count"`
-}
-
-type DeviceConfig struct {
-	Username         string    `json:"username"`
-	CustomName       string    `json:"custom_name"`
-	Group            string    `json:"group"`
-	Notes            string    `json:"notes"`
-	ProxyIndex       int       `json:"proxy_index"`
-	LastIP           string    `json:"last_ip,omitempty"`            // Last known IP for IP-based device lookup
-	LastConfirmed    time.Time `json:"last_confirmed,omitempty"`     // When device last confirmed correct proxy
-	LastSessionStart time.Time `json:"last_session_start,omitempty"` // When current session started
-}
-
-type UserCredentials struct {
-	Username     string `json:"username"`
-	PasswordHash string `json:"password_hash"`
-	Salt         string `json:"salt"`
-}
-
-type Session struct {
-	Token     string    `json:"token"`
-	Username  string    `json:"username"`
-	CreatedAt time.Time `json:"created_at"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
-
-type PersistentData struct {
-	DeviceConfigs   map[string]DeviceConfig `json:"device_configs"`
-	Groups          []string                `json:"groups"`
-	Users           []UserCredentials       `json:"users"`
-	TrafficHistory  []TrafficSnapshot       `json:"traffic_history"`
-	ProxyHealthData map[int]*ProxyHealth    `json:"proxy_health_data"`
-	SystemSettings  SystemSettings          `json:"system_settings"`
-	Supervisors     []Supervisor            `json:"supervisors"`
-	AdminPassword   string                  `json:"admin_password"`
-	ProxyNames      map[int]string          `json:"proxy_names"` // Custom names for proxies (index -> name)
-}
-
-type Supervisor struct {
-	Name     string `json:"name"`
-	Password string `json:"password"`
-}
-
-type SystemSettings struct {
-	SessionTimeout       int `json:"session_timeout_hours"`
-	TrafficRetentionDays int `json:"traffic_retention_days"`
-	DeviceTimeoutMinutes int `json:"device_timeout_minutes"`
-}
-
-// ============================================================================
-// USERNAME PARSING FROM PROXY AUTH
-// ============================================================================
-
-// parseProxyUsername extracts the username from Proxy-Authorization header
-// The header format is: Basic base64(username:password)
-func parseProxyUsername(r *http.Request) string {
-	auth := r.Header.Get("Proxy-Authorization")
-	if auth == "" {
-		return ""
-	}
-
-	// Remove "Basic " prefix
-	if !strings.HasPrefix(auth, "Basic ") {
-		return ""
-	}
-	encoded := strings.TrimPrefix(auth, "Basic ")
-
-	// Decode base64
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return ""
-	}
-
-	// Split username:password and return username
-	parts := strings.SplitN(string(decoded), ":", 2)
-	if len(parts) >= 1 && parts[0] != "" {
-		return parts[0]
-	}
-	return ""
-}
-
-// isValidUsername checks if a username contains only valid characters
-// This prevents corrupted/garbled usernames from being registered
-func isValidUsername(username string) bool {
-	if len(username) == 0 || len(username) > 100 {
-		return false
-	}
-
-	// Check each character is printable ASCII or common unicode letters/numbers
-	for _, r := range username {
-		// Allow: a-z, A-Z, 0-9, underscore, hyphen, dot, space
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
-			r == '_' || r == '-' || r == '.' || r == ' ' {
-			continue
-		}
-		// Reject any other characters (including non-ASCII, control chars, etc.)
-		return false
-	}
-	return true
-}
-
-// findDeviceByUsername looks up a device by its username (primary identifier)
-func (s *ProxyServer) findDeviceByUsername(username string) *Device {
-	for _, device := range s.devices {
-		if device.Username == username {
-			return device
-		}
-	}
-	return nil
-}
-
-// findDeviceByIP looks up a device by its current IP address
-func (s *ProxyServer) findDeviceByIP(ip string) *Device {
-	for _, device := range s.devices {
-		if device.IP == ip {
-			return device
-		}
-	}
-	return nil
-}
-
-// findAnonymousDeviceByIP looks up an anonymous device (no username) by IP
-func (s *ProxyServer) findAnonymousDeviceByIP(ip string) *Device {
-	for _, device := range s.devices {
-		if device.IP == ip && device.Username == "" {
-			return device
-		}
-	}
-	return nil
-}
-
-type ProxyServer struct {
-	devices         map[string]*Device
-	mu              sync.RWMutex
-	proxyPool       []string
-	proxyHealth     map[int]*ProxyHealth
-	healthMu        sync.RWMutex
-	poolIndex       int
-	poolMu          sync.Mutex
-	proxyPort       int
-	dashPort        int
-	bindAddr        string
-	allowIPFallback bool
-	authRequired    bool
-	requireRegister bool
-	persistentData  PersistentData
-	persistMu       sync.RWMutex
-	dataFile        string
-	sessions        map[string]*Session
-	appSessions     map[string]*Session
-	sessionMu       sync.RWMutex
-	startTime        time.Time
-	logBuffer        []LogEntry
-	logMu            sync.RWMutex
-	cpuUsage         float64
-	cpuMu              sync.RWMutex
-	deviceActivity     map[string][]DeviceActivity // keyed by device IP
-	deviceActivityMu   sync.RWMutex
-	deviceConnections  map[string][]DeviceConnection // keyed by device IP - recent connections
-	deviceConnectionMu sync.RWMutex
-}
-
-type LogEntry struct {
-	Timestamp  time.Time `json:"timestamp"`
-	Level      string    `json:"level"`
-	Message    string    `json:"message"`
-	DeviceIP   string    `json:"device_ip,omitempty"`
-	DeviceName string    `json:"device_name,omitempty"`
-	Username   string    `json:"username,omitempty"`
-	Category   string    `json:"category,omitempty"` // connection, auth, proxy, error, session, config
-}
-
-// DeviceActivity stores detailed activity for a specific device
-type DeviceActivity struct {
-	Timestamp  time.Time `json:"timestamp"`
-	Action     string    `json:"action"`
-	Details    string    `json:"details"`
-	Success    bool      `json:"success"`
-	ProxyName  string    `json:"proxy_name,omitempty"`
-	TargetHost string    `json:"target_host,omitempty"`
-}
-
-type ProxyInfo struct {
-	Index      int    `json:"index"`
-	Host       string `json:"host"`
-	Port       string `json:"port"`
-	User       string `json:"user"`
-	Pass       string `json:"pass"`
-	Full       string `json:"full"`
-	CustomName string `json:"custom_name"`
-}
-
-type changeProxyRequest struct {
-	DeviceIP   string `json:"device_ip"`
-	ProxyIndex int    `json:"proxy_index"`
-}
-
-// ============================================================================
-// WEBRTC LEAK PREVENTION
-// ============================================================================
-
-// Known STUN/TURN server patterns that can cause WebRTC IP leaks
-var webrtcBlockedPatterns = []string{
-	"stun.l.google.com",
-	"stun1.l.google.com",
-	"stun2.l.google.com",
-	"stun3.l.google.com",
-	"stun4.l.google.com",
-	"stun.services.mozilla.com",
-	"turn.l.google.com",
-	"turn.twilio.com",
-	"global.stun.twilio.com",
-	"stun.stunprotocol.org",
-	"stun.voip.eutelia.it",
-	"stun.sipgate.net",
-	"stun.ekiga.net",
-	"stun.ideasip.com",
-	"stun.schlund.de",
-	"stun.voipbuster.com",
-	"stun.voipstunt.com",
-	"stun.counterpath.com",
-	"stun.1und1.de",
-	"stun.gmx.net",
-	"stun.callwithus.com",
-	"stun.counterpath.net",
-	"stun.internetcalls.com",
-}
-
-// STUN/TURN ports to block
-var webrtcBlockedPorts = []string{"3478", "5349", "19302", "19305"}
-
-// isWebRTCLeakHost checks if a host:port is a STUN/TURN server that could cause WebRTC leaks
-func isWebRTCLeakHost(hostPort string) bool {
-	host := hostPort
-	port := ""
-
-	// Extract host and port
-	if idx := strings.LastIndex(hostPort, ":"); idx != -1 {
-		host = hostPort[:idx]
-		port = hostPort[idx+1:]
-	}
-
-	hostLower := strings.ToLower(host)
-
-	// Check against known STUN/TURN server patterns
-	for _, pattern := range webrtcBlockedPatterns {
-		if strings.Contains(hostLower, pattern) || hostLower == pattern {
-			return true
-		}
-	}
-
-	// Check for generic STUN/TURN patterns in hostname
-	if strings.Contains(hostLower, "stun.") || strings.Contains(hostLower, ".stun.") ||
-		strings.HasPrefix(hostLower, "stun") ||
-		strings.Contains(hostLower, "turn.") || strings.Contains(hostLower, ".turn.") ||
-		strings.HasPrefix(hostLower, "turn") ||
-		strings.Contains(hostLower, "webrtc") {
-		return true
-	}
-
-	// Check for STUN/TURN ports
-	for _, blockedPort := range webrtcBlockedPorts {
-		if port == blockedPort {
-			return true
-		}
-	}
-
-	return false
-}
-
-type updateDeviceRequest struct {
-	DeviceIP   string `json:"device_ip"`
-	CustomName string `json:"custom_name"`
-	Group      string `json:"group"`
-	Notes      string `json:"notes"`
-	Username   string `json:"username"`
-}
-
-type bulkChangeProxyRequest struct {
-	DeviceIPs  []string `json:"device_ips"`
-	ProxyIndex int      `json:"proxy_index"`
-}
-
-type addGroupRequest struct {
-	GroupName string `json:"group_name"`
-}
-
-type deleteGroupRequest struct {
-	GroupName string `json:"group_name"`
-}
-
-type addProxyRequest struct {
-	ProxyString string `json:"proxy_string"`
-}
-
-type deleteProxyRequest struct {
-	ProxyIndex int `json:"proxy_index"`
-}
-
-type deleteDeviceRequest struct {
-	DeviceIP string `json:"device_ip"`
-	Username string `json:"username"` // Preferred - delete by username for accuracy
-}
-
-type loginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-type changePasswordRequest struct {
-	OldPassword string `json:"old_password"`
-	NewPassword string `json:"new_password"`
-}
-
-var server *ProxyServer
-
-func getServerIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		addrs, _ := net.InterfaceAddrs()
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-				if ipnet.IP.To4() != nil {
-					return ipnet.IP.String()
-				}
-			}
-		}
-		return "localhost"
-	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
-}
 
 func main() {
 	log.Println("===========================================")
@@ -444,7 +35,6 @@ func main() {
 	requireRegister := parseEnvBool("REQUIRE_REGISTER", true) // Default: require app registration
 
 	server = &ProxyServer{
-		devices:         make(map[string]*Device),
 		proxyPool:       loadProxyPool(),
 		proxyHealth:     make(map[int]*ProxyHealth),
 		proxyPort:       proxyPort,
@@ -455,17 +45,36 @@ func main() {
 		requireRegister: requireRegister,
 		dataFile:        "device_data.json",
 		sessions:        make(map[string]*Session),
-		appSessions:     make(map[string]*Session),
 		startTime:         time.Now(),
 		logBuffer:         make([]LogEntry, 0, 1000),
 		deviceActivity:    make(map[string][]DeviceActivity),
 		deviceConnections: make(map[string][]DeviceConnection),
+		// Access Point initialization
+		apDevices: make(map[string]*APDevice),
+		apIPToMAC: make(map[string]string),
+		// Rate limiting
+		loginAttempts: make(map[string]*loginAttemptInfo),
+		apConfig: APConfig{
+			Enabled:      true,
+			Interface:    "eth0",
+			WANInterface: "wlan0",
+			IPAddress:    "10.10.10.1",
+			Netmask:      "255.255.255.0",
+			DHCPStart:    "10.10.10.100",
+			DHCPEnd:      "10.10.10.200",
+			LeaseFile:    "/var/lib/lumier/dnsmasq.leases",
+		},
+		browserProfiles:    make(map[string]*BrowserProfile),
+		screenshots:        []Screenshot{},
+		screenshotRequests: make(map[string]*ScreenshotRequest),
+		screenshotDir:      "./screenshots",
 		persistentData: PersistentData{
 			DeviceConfigs:   make(map[string]DeviceConfig),
 			Groups:          []string{"Default", "Floor 1", "Floor 2", "Team A", "Team B"},
 			Users:           []UserCredentials{},
 			TrafficHistory:  []TrafficSnapshot{},
 			ProxyHealthData: make(map[int]*ProxyHealth),
+			APDevices:       make(map[string]*APDevice),
 			SystemSettings: SystemSettings{
 				SessionTimeout:       2, // 2 hours default WiFi session timeout
 				TrafficRetentionDays: 7,
@@ -475,1381 +84,118 @@ func main() {
 	}
 
 	server.loadPersistentData()
-	server.restoreDevicesFromConfig() // Restore devices so IP-based lookup works after restart
 	server.initializeProxyHealth()
+	server.restoreAPDevices() // Restore AP devices from persistent data
 
 	if len(server.persistentData.Users) == 0 {
 		server.createDefaultAdmin()
 	}
 
 	if len(server.proxyPool) == 0 {
-		log.Println("⚠️  WARNING: No upstream proxies loaded!")
+		log.Println("WARNING: No upstream proxies loaded!")
 	} else {
-		log.Printf("✅ Loaded %d upstream proxies\n", len(server.proxyPool))
+		log.Printf("Loaded %d upstream proxies\n", len(server.proxyPool))
 	}
 
-	go cleanupInactiveDevices()
+	// Load embedded dashboard content
+	initEmbeddedContent()
+
+	// Create screenshots directory if it doesn't exist
+	if err := os.MkdirAll(server.screenshotDir, 0755); err != nil {
+		log.Printf("Warning: Could not create screenshots directory: %v", err)
+	} else {
+		server.loadExistingScreenshots()
+	}
+
 	go autoSaveData()
 	go collectTrafficSnapshots()
 	go cleanupExpiredSessions()
 	go proxyHealthChecker()
 	go cpuMonitor()
+	go pruneStaleDevices()
+	go server.monitorDHCPLeases() // Monitor for AP device connections
 	go startDashboard()
 
 	serverIP := getServerIP()
-	log.Printf("🚀 Proxy server starting on port %d\n", server.proxyPort)
-	log.Printf("📊 Dashboard: http://%s:%d\n", serverIP, server.dashPort)
-	log.Println("🔐 Default login: admin / admin123")
-	log.Printf("📱 Phone setup: Proxy %s:%d\n", serverIP, server.proxyPort)
+	log.Printf("Proxy server starting on port %d\n", server.proxyPort)
+	log.Printf("Dashboard: http://%s:%d\n", serverIP, server.dashPort)
+	log.Println("Default login: admin / admin123")
+	log.Printf("Access Point: Devices on 10.10.10.x network will be proxied\n")
 
-	if err := http.ListenAndServe(fmt.Sprintf("%s:%d", server.bindAddr, server.proxyPort), http.HandlerFunc(handleProxy)); err != nil {
+	// Use http.Server with timeouts for security (prevents slow loris attacks)
+	proxyServer := &http.Server{
+		Addr:              fmt.Sprintf("%s:%d", server.bindAddr, server.proxyPort),
+		Handler:           http.HandlerFunc(handleProxy),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		// Note: WriteTimeout not set for proxy to allow long downloads
+	}
+	if err := proxyServer.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func loadProxyPool() []string {
-	data, err := os.ReadFile("proxies.txt")
-	if err != nil {
-		return []string{}
-	}
-	var proxies []string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" && !strings.HasPrefix(line, "#") {
-			proxies = append(proxies, line)
-		}
-	}
-	return proxies
-}
-
-func (s *ProxyServer) initializeProxyHealth() {
-	s.healthMu.Lock()
-	defer s.healthMu.Unlock()
-	for i, proxyStr := range s.proxyPool {
-		if existing, ok := s.persistentData.ProxyHealthData[i]; ok {
-			s.proxyHealth[i] = existing
-			// Always refresh ProxyString and IPAddress from current proxy pool
-			s.proxyHealth[i].ProxyString = proxyStr
-			s.proxyHealth[i].IPAddress = extractProxyIP(proxyStr)
-			// Ensure UniqueDevices map is initialized
-			if s.proxyHealth[i].UniqueDevices == nil {
-				s.proxyHealth[i].UniqueDevices = make(map[string]bool)
-			}
-		} else {
-			s.proxyHealth[i] = &ProxyHealth{
-				Index:         i,
-				ProxyString:   proxyStr,
-				IPAddress:     extractProxyIP(proxyStr),
-				Status:        "unknown",
-				UniqueDevices: make(map[string]bool),
-			}
-		}
-	}
-}
-
-func extractProxyIP(proxyStr string) string {
-	if idx := strings.Index(proxyStr, "-ip-"); idx != -1 {
-		rest := proxyStr[idx+4:]
-		if colonIdx := strings.Index(rest, ":"); colonIdx != -1 {
-			return rest[:colonIdx]
-		}
-		return rest
-	}
-	parts := strings.Split(proxyStr, ":")
-	if len(parts) > 0 {
-		return parts[0]
-	}
-	return "unknown"
-}
-
-// trackDeviceRegistration tracks a device being assigned to a proxy
-func (s *ProxyServer) trackDeviceRegistration(proxyIndex int, deviceUsername string) {
-	s.healthMu.Lock()
-	defer s.healthMu.Unlock()
-
-	if health, ok := s.proxyHealth[proxyIndex]; ok {
-		if health.UniqueDevices == nil {
-			health.UniqueDevices = make(map[string]bool)
-		}
-		if !health.UniqueDevices[deviceUsername] {
-			health.UniqueDevices[deviceUsername] = true
-			health.DeviceCount = len(health.UniqueDevices)
-		}
-	}
-}
-
 // ============================================================================
-// AUTHENTICATION
+// API HANDLERS
 // ============================================================================
-
-func generateSalt() string {
-	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
-}
-
-func hashPassword(password, salt string) string {
-	hash := sha256.Sum256([]byte(password + salt))
-	return hex.EncodeToString(hash[:])
-}
-
-func (s *ProxyServer) createDefaultAdmin() {
-	salt := generateSalt()
-	s.persistMu.Lock()
-	s.persistentData.Users = append(s.persistentData.Users, UserCredentials{
-		Username:     "admin",
-		PasswordHash: hashPassword("admin123", salt),
-		Salt:         salt,
-	})
-	s.persistMu.Unlock()
-	go s.savePersistentData()
-}
-
-func (s *ProxyServer) validateCredentials(username, password string) bool {
-	s.persistMu.RLock()
-	defer s.persistMu.RUnlock()
-	for _, user := range s.persistentData.Users {
-		if user.Username == username {
-			hash := hashPassword(password, user.Salt)
-			return subtle.ConstantTimeCompare([]byte(hash), []byte(user.PasswordHash)) == 1
-		}
-	}
-	return false
-}
-
-func (s *ProxyServer) createSession(username string) string {
-	bytes := make([]byte, 32)
-	rand.Read(bytes)
-	token := base64.URLEncoding.EncodeToString(bytes)
-	s.sessionMu.Lock()
-	s.sessions[token] = &Session{
-		Token:     token,
-		Username:  username,
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(time.Duration(s.persistentData.SystemSettings.SessionTimeout) * time.Hour),
-	}
-	s.sessionMu.Unlock()
-	return token
-}
-
-func (s *ProxyServer) validateSession(token string) (*Session, bool) {
-	s.sessionMu.RLock()
-	session, exists := s.sessions[token]
-	s.sessionMu.RUnlock()
-	if !exists || time.Now().After(session.ExpiresAt) {
-		if exists {
-			s.sessionMu.Lock()
-			delete(s.sessions, token)
-			s.sessionMu.Unlock()
-		}
-		return nil, false
-	}
-	return session, true
-}
-
-func (s *ProxyServer) createAppSession(username string) *Session {
-	bytes := make([]byte, 32)
-	rand.Read(bytes)
-	token := base64.URLEncoding.EncodeToString(bytes)
-	s.sessionMu.Lock()
-	s.appSessions[token] = &Session{
-		Token:     token,
-		Username:  username,
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(time.Duration(s.persistentData.SystemSettings.SessionTimeout) * time.Hour),
-	}
-	s.sessionMu.Unlock()
-	return s.appSessions[token]
-}
-
-func (s *ProxyServer) validateAppSession(token, username string) (*Session, bool) {
-	s.sessionMu.RLock()
-	session, ok := s.appSessions[token]
-	s.sessionMu.RUnlock()
-	if !ok || time.Now().After(session.ExpiresAt) || session.Username != username {
-		if ok {
-			s.sessionMu.Lock()
-			delete(s.appSessions, token)
-			s.sessionMu.Unlock()
-		}
-		return nil, false
-	}
-	return session, true
-}
-
-func (s *ProxyServer) requireAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("session_token")
-		if err != nil {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-		if _, valid := s.validateSession(cookie.Value); !valid {
-			http.Error(w, "Session expired", http.StatusUnauthorized)
-			return
-		}
-		next(w, r)
-	}
-}
-
-func cleanupExpiredSessions() {
-	for range time.NewTicker(1 * time.Hour).C {
-		server.sessionMu.Lock()
-		now := time.Now()
-		for token, session := range server.sessions {
-			if now.After(session.ExpiresAt) {
-				delete(server.sessions, token)
-			}
-		}
-		for token, session := range server.appSessions {
-			if now.After(session.ExpiresAt) {
-				delete(server.appSessions, token)
-			}
-		}
-		server.sessionMu.Unlock()
-	}
-}
-
-// ============================================================================
-// PERSISTENCE
-// ============================================================================
-
-func (s *ProxyServer) loadPersistentData() {
-	data, err := os.ReadFile(s.dataFile)
-	if err != nil {
-		return
-	}
-	json.Unmarshal(data, &s.persistentData)
-	if s.persistentData.DeviceConfigs == nil {
-		s.persistentData.DeviceConfigs = make(map[string]DeviceConfig)
-	}
-	if s.persistentData.Groups == nil {
-		s.persistentData.Groups = []string{"Default"}
-	}
-	if s.persistentData.ProxyHealthData == nil {
-		s.persistentData.ProxyHealthData = make(map[int]*ProxyHealth)
-	}
-	// Initialize default supervisors if empty
-	if len(s.persistentData.Supervisors) == 0 {
-		s.persistentData.Supervisors = []Supervisor{
-			{Name: "Mirko", Password: "DobroJeMirko321a"},
-			{Name: "Ana", Password: "SupervisorAna123"},
-			{Name: "Marko", Password: "SupervisorMarko456"},
-			{Name: "Ivan", Password: "SupervisorIvan789"},
-		}
-	}
-	// Initialize default admin password if empty
-	if s.persistentData.AdminPassword == "" {
-		s.persistentData.AdminPassword = "Drnda123"
-	}
-	// Initialize proxy names map if empty
-	if s.persistentData.ProxyNames == nil {
-		s.persistentData.ProxyNames = make(map[int]string)
-	}
-}
-
-// getProxyName returns the custom name for a proxy or the default "SG{n}" format
-func (s *ProxyServer) getProxyName(index int) string {
-	s.persistMu.RLock()
-	defer s.persistMu.RUnlock()
-	if name, ok := s.persistentData.ProxyNames[index]; ok && name != "" {
-		return name
-	}
-	return fmt.Sprintf("SG%d", index+1)
-}
-
-// restoreDevicesFromConfig recreates device objects from saved configs so that
-// IP-based lookup works immediately after a server restart. Without this,
-// registered devices would be blocked until they re-register because the
-// in-memory devices map would be empty.
-func (s *ProxyServer) restoreDevicesFromConfig() {
-	s.persistMu.RLock()
-	defer s.persistMu.RUnlock()
-
-	count := 0
-	for username, cfg := range s.persistentData.DeviceConfigs {
-		// Skip IP-keyed entries (used for allowIPFallback mode)
-		if cfg.Username == "" || cfg.Username != username {
-			continue
-		}
-
-		// Determine upstream proxy
-		var upstreamProxy string
-		s.poolMu.Lock()
-		if cfg.ProxyIndex >= 0 && cfg.ProxyIndex < len(s.proxyPool) {
-			upstreamProxy = s.proxyPool[cfg.ProxyIndex]
-		} else if len(s.proxyPool) > 0 {
-			upstreamProxy = s.proxyPool[0]
-		}
-		s.poolMu.Unlock()
-
-		device := &Device{
-			ID:            fmt.Sprintf("device-%s", username),
-			IP:            cfg.LastIP, // Restore last known IP
-			Username:      username,
-			Name:          username,
-			CustomName:    cfg.CustomName,
-			Group:         cfg.Group,
-			Notes:         cfg.Notes,
-			UpstreamProxy: upstreamProxy,
-			Status:        "active",
-			FirstSeen:     time.Now(),
-			LastSeen:      time.Now(),
-		}
-
-		s.mu.Lock()
-		s.devices[username] = device
-		s.mu.Unlock()
-		count++
-	}
-
-	if count > 0 {
-		log.Printf("📱 Restored %d registered devices from config\n", count)
-	}
-}
-
-func (s *ProxyServer) savePersistentData() {
-	s.persistMu.Lock() // Use write lock since we modify ProxyHealthData
-	s.healthMu.RLock()
-	s.persistentData.ProxyHealthData = make(map[int]*ProxyHealth)
-	for k, v := range s.proxyHealth {
-		s.persistentData.ProxyHealthData[k] = v
-	}
-	s.healthMu.RUnlock()
-	data, _ := json.MarshalIndent(s.persistentData, "", "  ")
-	s.persistMu.Unlock()
-	os.WriteFile(s.dataFile, data, 0644)
-}
-
-func autoSaveData() {
-	for range time.NewTicker(5 * time.Minute).C {
-		server.savePersistentData()
-	}
-}
-
-// ============================================================================
-// TRAFFIC ANALYTICS
-// ============================================================================
-
-func collectTrafficSnapshots() {
-	for range time.NewTicker(5 * time.Minute).C {
-		server.mu.RLock()
-		var totalBytesIn, totalBytesOut, totalRequests, totalErrors int64
-		activeDevices := 0
-		for _, device := range server.devices {
-			totalBytesIn += device.BytesIn
-			totalBytesOut += device.BytesOut
-			totalRequests += device.RequestCount
-			totalErrors += device.ErrorCount
-			if time.Since(device.LastSeen) < 5*time.Minute {
-				activeDevices++
-			}
-		}
-		server.mu.RUnlock()
-
-		snapshot := TrafficSnapshot{
-			Timestamp:     time.Now(),
-			TotalBytesIn:  totalBytesIn,
-			TotalBytesOut: totalBytesOut,
-			TotalRequests: totalRequests,
-			ActiveDevices: activeDevices,
-			ErrorCount:    totalErrors,
-		}
-
-		server.persistMu.Lock()
-		server.persistentData.TrafficHistory = append(server.persistentData.TrafficHistory, snapshot)
-		cutoff := time.Now().AddDate(0, 0, -server.persistentData.SystemSettings.TrafficRetentionDays)
-		var filtered []TrafficSnapshot
-		for _, s := range server.persistentData.TrafficHistory {
-			if s.Timestamp.After(cutoff) {
-				filtered = append(filtered, s)
-			}
-		}
-		server.persistentData.TrafficHistory = filtered
-		server.persistMu.Unlock()
-	}
-}
-
-// ============================================================================
-// PROXY HEALTH MONITORING
-// ============================================================================
-
-func (s *ProxyServer) recordProxySuccess(proxyIndex int, responseTime time.Duration, bytesIn, bytesOut int64) {
-	s.healthMu.Lock()
-	defer s.healthMu.Unlock()
-	health, exists := s.proxyHealth[proxyIndex]
-	if !exists {
-		return
-	}
-	health.TotalRequests++
-	health.SuccessCount++
-	health.LastSuccess = time.Now()
-	health.BytesIn += bytesIn
-	health.BytesOut += bytesOut
-	if health.AvgResponseTime == 0 {
-		health.AvgResponseTime = responseTime.Milliseconds()
-	} else {
-		health.AvgResponseTime = (health.AvgResponseTime + responseTime.Milliseconds()) / 2
-	}
-	if health.TotalRequests > 0 {
-		health.SuccessRate = float64(health.SuccessCount) / float64(health.TotalRequests) * 100
-	}
-	health.Status = s.calculateProxyStatus(health)
-}
-
-func (s *ProxyServer) recordProxyFailure(proxyIndex int, errorMsg string) {
-	// Check if this is a proxy-side/destination error (not our proxy's fault)
-	if isProxySideError(errorMsg) {
-		// Still count the request but don't penalize the proxy health
-		s.healthMu.Lock()
-		defer s.healthMu.Unlock()
-		health, exists := s.proxyHealth[proxyIndex]
-		if !exists {
-			return
-		}
-		health.TotalRequests++
-		health.SuccessCount++ // Count as success since proxy worked fine
-		if health.TotalRequests > 0 {
-			health.SuccessRate = float64(health.SuccessCount) / float64(health.TotalRequests) * 100
-		}
-		health.Status = s.calculateProxyStatus(health)
-		return
-	}
-
-	s.healthMu.Lock()
-	defer s.healthMu.Unlock()
-	health, exists := s.proxyHealth[proxyIndex]
-	if !exists {
-		return
-	}
-	health.TotalRequests++
-	health.FailureCount++
-	health.LastFailure = time.Now()
-	health.LastError = errorMsg
-	if health.TotalRequests > 0 {
-		health.SuccessRate = float64(health.SuccessCount) / float64(health.TotalRequests) * 100
-	}
-	health.Status = s.calculateProxyStatus(health)
-}
-
-// isProxySideError checks if an error is caused by the destination/ruleset
-// rather than the proxy itself being unhealthy
-func isProxySideError(errMsg string) bool {
-	proxySideErrors := []string{
-		"connection not allowed by ruleset",
-		"not allowed by ruleset",
-		"host unreachable",
-		"network unreachable",
-		"connection refused",
-		"ttl expired",
-		"no route to host",
-		"address not supported",
-		"connection reset by peer",
-		"broken pipe",
-	}
-	errLower := strings.ToLower(errMsg)
-	for _, e := range proxySideErrors {
-		if strings.Contains(errLower, e) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *ProxyServer) calculateProxyStatus(health *ProxyHealth) string {
-	if health.TotalRequests < 10 {
-		return "unknown"
-	}
-	if health.SuccessRate >= 95 {
-		return "healthy"
-	}
-	if health.SuccessRate >= 80 {
-		return "degraded"
-	}
-	return "unhealthy"
-}
-
-func (s *ProxyServer) getProxyIndexByString(proxyStr string) int {
-	s.poolMu.Lock()
-	defer s.poolMu.Unlock()
-	for i, p := range s.proxyPool {
-		if p == proxyStr {
-			return i
-		}
-	}
-	return -1
-}
-
-func proxyHealthChecker() {
-	for range time.NewTicker(1 * time.Minute).C {
-		server.mu.RLock()
-		proxyCounts := make(map[int]int)
-		for _, device := range server.devices {
-			if time.Since(device.LastSeen) < 5*time.Minute {
-				idx := server.getProxyIndexByString(device.UpstreamProxy)
-				if idx >= 0 {
-					proxyCounts[idx]++
-				}
-			}
-		}
-		server.mu.RUnlock()
-
-		server.healthMu.Lock()
-		for idx, health := range server.proxyHealth {
-			health.ActiveDevices = proxyCounts[idx]
-		}
-		server.healthMu.Unlock()
-	}
-}
-
-// ============================================================================
-// SYSTEM MONITORING
-// ============================================================================
-
-func cpuMonitor() {
-	var lastTotal, lastIdle uint64
-	for range time.NewTicker(2 * time.Second).C {
-		total, idle := getCPUTimes()
-		if lastTotal > 0 {
-			totalDelta := total - lastTotal
-			idleDelta := idle - lastIdle
-			if totalDelta > 0 {
-				usage := 100.0 * (1.0 - float64(idleDelta)/float64(totalDelta))
-				server.cpuMu.Lock()
-				server.cpuUsage = usage
-				server.cpuMu.Unlock()
-			}
-		}
-		lastTotal, lastIdle = total, idle
-	}
-}
-
-func getCPUTimes() (total, idle uint64) {
-	data, err := os.ReadFile("/proc/stat")
-	if err != nil {
-		return 0, 0
-	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) < 1 {
-		return 0, 0
-	}
-	fields := strings.Fields(lines[0])
-	if len(fields) < 5 || fields[0] != "cpu" {
-		return 0, 0
-	}
-	for i := 1; i < len(fields); i++ {
-		var val uint64
-		fmt.Sscanf(fields[i], "%d", &val)
-		total += val
-		if i == 4 {
-			idle = val
-		}
-	}
-	return total, idle
-}
-
-func (s *ProxyServer) addLog(level, message string) {
-	entry := LogEntry{
-		Timestamp: time.Now(),
-		Level:     level,
-		Message:   message,
-	}
-	s.logMu.Lock()
-	s.logBuffer = append(s.logBuffer, entry)
-	// Keep only last 1000 entries
-	if len(s.logBuffer) > 1000 {
-		s.logBuffer = s.logBuffer[len(s.logBuffer)-1000:]
-	}
-	s.logMu.Unlock()
-}
-
-// addDeviceLog adds a detailed log entry with device information
-func (s *ProxyServer) addDeviceLog(level, category, message string, device *Device) {
-	deviceIP := ""
-	deviceName := ""
-	username := ""
-	if device != nil {
-		deviceIP = device.IP
-		deviceName = device.CustomName
-		if deviceName == "" {
-			deviceName = device.Name
-		}
-		username = device.Username
-	}
-
-	entry := LogEntry{
-		Timestamp:  time.Now(),
-		Level:      level,
-		Message:    message,
-		DeviceIP:   deviceIP,
-		DeviceName: deviceName,
-		Username:   username,
-		Category:   category,
-	}
-	s.logMu.Lock()
-	s.logBuffer = append(s.logBuffer, entry)
-	if len(s.logBuffer) > 1000 {
-		s.logBuffer = s.logBuffer[len(s.logBuffer)-1000:]
-	}
-	s.logMu.Unlock()
-}
-
-// addDeviceActivity adds an activity entry for a specific device
-func (s *ProxyServer) addDeviceActivity(deviceIP string, action, details string, success bool, proxyName, targetHost string) {
-	activity := DeviceActivity{
-		Timestamp:  time.Now(),
-		Action:     action,
-		Details:    details,
-		Success:    success,
-		ProxyName:  proxyName,
-		TargetHost: targetHost,
-	}
-
-	s.deviceActivityMu.Lock()
-	if s.deviceActivity[deviceIP] == nil {
-		s.deviceActivity[deviceIP] = make([]DeviceActivity, 0, 100)
-	}
-	s.deviceActivity[deviceIP] = append(s.deviceActivity[deviceIP], activity)
-	// Keep only last 100 activities per device
-	if len(s.deviceActivity[deviceIP]) > 100 {
-		s.deviceActivity[deviceIP] = s.deviceActivity[deviceIP][len(s.deviceActivity[deviceIP])-100:]
-	}
-	s.deviceActivityMu.Unlock()
-}
-
-// getDeviceActivity returns activity log for a specific device
-func (s *ProxyServer) getDeviceActivity(deviceIP string, limit int) []DeviceActivity {
-	s.deviceActivityMu.RLock()
-	defer s.deviceActivityMu.RUnlock()
-
-	activities := s.deviceActivity[deviceIP]
-	if activities == nil {
-		return []DeviceActivity{}
-	}
-
-	if limit <= 0 || limit > len(activities) {
-		limit = len(activities)
-	}
-	start := len(activities) - limit
-	if start < 0 {
-		start = 0
-	}
-	result := make([]DeviceActivity, limit)
-	copy(result, activities[start:])
-	return result
-}
-
-// trackDeviceConnection records a connection for real-time monitoring
-func (s *ProxyServer) trackDeviceConnection(deviceIP string, host string, protocol string, bytesIn, bytesOut int64, success bool) {
-	conn := DeviceConnection{
-		Timestamp: time.Now(),
-		Host:      host,
-		Protocol:  protocol,
-		BytesIn:   bytesIn,
-		BytesOut:  bytesOut,
-		Success:   success,
-	}
-
-	s.deviceConnectionMu.Lock()
-	if s.deviceConnections[deviceIP] == nil {
-		s.deviceConnections[deviceIP] = make([]DeviceConnection, 0, 50)
-	}
-	s.deviceConnections[deviceIP] = append(s.deviceConnections[deviceIP], conn)
-	// Keep only last 50 connections per device for real-time view
-	if len(s.deviceConnections[deviceIP]) > 50 {
-		s.deviceConnections[deviceIP] = s.deviceConnections[deviceIP][len(s.deviceConnections[deviceIP])-50:]
-	}
-	s.deviceConnectionMu.Unlock()
-
-	// Update device's LastActive on successful connections
-	if success {
-		s.mu.Lock()
-		if device, ok := s.devices[deviceIP]; ok {
-			device.LastActive = time.Now()
-		}
-		// Also try by username
-		for _, device := range s.devices {
-			if device.IP == deviceIP {
-				device.LastActive = time.Now()
-				break
-			}
-		}
-		s.mu.Unlock()
-	}
-}
-
-// getDeviceConnections returns recent connections for a device
-func (s *ProxyServer) getDeviceConnections(deviceIP string) []DeviceConnection {
-	s.deviceConnectionMu.RLock()
-	defer s.deviceConnectionMu.RUnlock()
-
-	conns := s.deviceConnections[deviceIP]
-	if conns == nil {
-		return []DeviceConnection{}
-	}
-	// Return in reverse order (most recent first)
-	result := make([]DeviceConnection, len(conns))
-	for i, c := range conns {
-		result[len(conns)-1-i] = c
-	}
-	return result
-}
-
-func (s *ProxyServer) getLogs(limit int) []LogEntry {
-	s.logMu.RLock()
-	defer s.logMu.RUnlock()
-	if limit <= 0 || limit > len(s.logBuffer) {
-		limit = len(s.logBuffer)
-	}
-	start := len(s.logBuffer) - limit
-	if start < 0 {
-		start = 0
-	}
-	result := make([]LogEntry, limit)
-	copy(result, s.logBuffer[start:])
-	return result
-}
-
-// ============================================================================
-// PROXY HANDLING
-// ============================================================================
-
-func (s *ProxyServer) getNextProxy() string {
-	s.poolMu.Lock()
-	defer s.poolMu.Unlock()
-	if len(s.proxyPool) == 0 {
-		return ""
-	}
-	proxy := s.proxyPool[s.poolIndex]
-	s.poolIndex = (s.poolIndex + 1) % len(s.proxyPool)
-	return proxy
-}
-
-func (s *ProxyServer) getOrCreateDevice(clientIP string, username string) (*Device, error) {
-	// Optionally recover the username from the last saved config for this IP if
-	// IP-based fallback is explicitly allowed.
-	if username == "" && s.allowIPFallback {
-		s.persistMu.RLock()
-		if cfg, ok := s.persistentData.DeviceConfigs[clientIP]; ok && cfg.Username != "" {
-			username = cfg.Username
-		}
-		s.persistMu.RUnlock()
-	}
-
-	// When no username is provided (e.g., Android WiFi proxy which can't send
-	// Proxy-Authorization headers), look up if there's a registered device with
-	// this IP. This allows registered devices to use the proxy without needing
-	// to send credentials with every request.
-	if username == "" && s.requireRegister {
-		s.mu.RLock()
-		existingDevice := s.findDeviceByIP(clientIP)
-		if existingDevice != nil && existingDevice.Username != "" {
-			// Found a registered device with this IP - use it directly
-			// Note: LastSeen is updated AFTER session validation in handleProxy()
-			s.mu.RUnlock()
-			return existingDevice, nil
-		}
-		s.mu.RUnlock()
-		// No registered device found for this IP
-		return nil, fmt.Errorf("registration required: no username presented")
-	}
-
-	// Check persistence for a registered profile when required.
-	s.persistMu.RLock()
-	var savedConfig DeviceConfig
-	var hasSavedConfig bool
-	if username != "" {
-		savedConfig, hasSavedConfig = s.persistentData.DeviceConfigs[username]
-	}
-	s.persistMu.RUnlock()
-
-	if username != "" && s.requireRegister && !hasSavedConfig {
-		return nil, fmt.Errorf("registration required: unknown username '%s'", username)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// First, try to find device by username (primary identifier)
-	if username != "" {
-		if device := s.findDeviceByUsername(username); device != nil {
-			// Update IP if it changed (device got new IP from DHCP)
-			if device.IP != clientIP {
-				oldIP := device.IP
-				device.IP = clientIP
-				log.Printf("📱 Device '%s' IP changed: %s -> %s\n", username, oldIP, clientIP)
-				s.addLog("info", fmt.Sprintf("Device '%s' IP changed: %s -> %s", username, oldIP, clientIP))
-			}
-			// Note: LastSeen is updated AFTER session validation in handleProxy()
-			return device, nil
-		}
-	}
-
-	// For requests without username, optionally allow IP-based reuse for
-	// backwards compatibility when explicitly enabled.
-	if username == "" && s.allowIPFallback {
-		if device := s.findDeviceByIP(clientIP); device != nil {
-			// Note: LastSeen is updated AFTER session validation in handleProxy()
-			return device, nil
-		}
-	}
-
-	var upstreamProxy, customName, group, notes string = s.getNextProxy(), "", "Default", ""
-	if hasSavedConfig {
-		if savedConfig.ProxyIndex >= 0 && savedConfig.ProxyIndex < len(s.proxyPool) {
-			upstreamProxy = s.proxyPool[savedConfig.ProxyIndex]
-		}
-		customName, group, notes = savedConfig.CustomName, savedConfig.Group, savedConfig.Notes
-	}
-
-	// If registration is required and there is still no username, deny the
-	// request instead of creating an anonymous device.
-	if username == "" && s.requireRegister {
-		return nil, fmt.Errorf("registration required: no username mapping found")
-	}
-
-	// Generate device ID based on username if available
-	var deviceID, deviceName string
-	if username != "" {
-		deviceID = fmt.Sprintf("device-%s", username)
-		deviceName = username
-	} else {
-		deviceID = fmt.Sprintf("device-%d", len(s.devices)+1)
-		deviceName = fmt.Sprintf("Anonymous-%s", clientIP)
-	}
-
-	device := &Device{
-		ID:            deviceID,
-		IP:            clientIP,
-		Username:      username,
-		Name:          deviceName,
-		CustomName:    customName,
-		Group:         group,
-		Notes:         notes,
-		UpstreamProxy: upstreamProxy,
-		Status:        "active",
-		FirstSeen:     time.Now(),
-		LastSeen:      time.Now(),
-	}
-
-	// Store by username if available, otherwise by IP
-	if username != "" {
-		s.devices[username] = device
-		log.Printf("📱 New device: '%s' (%s) -> %s\n", username, clientIP, extractProxyIP(upstreamProxy))
-		s.addLog("info", fmt.Sprintf("New device connected: '%s' (%s) -> Proxy %s", username, clientIP, extractProxyIP(upstreamProxy)))
-	} else {
-		s.devices[clientIP] = device
-		log.Printf("📱 New anonymous device: %s -> %s\n", clientIP, extractProxyIP(upstreamProxy))
-		s.addLog("info", fmt.Sprintf("New anonymous device: %s -> Proxy %s", clientIP, extractProxyIP(upstreamProxy)))
-	}
-
-	// Save new device config for persistence
-	go s.saveDeviceConfig(device)
-
-	return device, nil
-}
-
-// isDeviceSessionValid checks if a device has a valid confirmed session
-func (s *ProxyServer) isDeviceSessionValid(device *Device) bool {
-	// Get session timeout in hours
-	s.persistMu.RLock()
-	sessionTimeoutHours := s.persistentData.SystemSettings.SessionTimeout
-	s.persistMu.RUnlock()
-
-	if sessionTimeoutHours <= 0 {
-		sessionTimeoutHours = 2 // Default to 2 hours if not set
-	}
-
-	// Device must be confirmed
-	if !device.Confirmed {
-		return false
-	}
-
-	// Check if session has expired
-	sessionDuration := time.Duration(sessionTimeoutHours) * time.Hour
-	if time.Since(device.SessionStart) > sessionDuration {
-		// Session expired - require re-confirmation
-		device.Confirmed = false
-		return false
-	}
-
-	return true
-}
-
-// confirmDeviceSession marks a device as confirmed and starts a new session
-func (s *ProxyServer) confirmDeviceSession(device *Device) {
-	now := time.Now()
-	device.Confirmed = true
-	device.ConfirmedAt = now
-	device.SessionStart = now
-
-	// Save to persistent config
-	s.persistMu.Lock()
-	if cfg, ok := s.persistentData.DeviceConfigs[device.Username]; ok {
-		cfg.LastConfirmed = now
-		cfg.LastSessionStart = now
-		s.persistentData.DeviceConfigs[device.Username] = cfg
-	} else if cfg, ok := s.persistentData.DeviceConfigs[device.IP]; ok {
-		cfg.LastConfirmed = now
-		cfg.LastSessionStart = now
-		s.persistentData.DeviceConfigs[device.IP] = cfg
-	}
-	s.persistMu.Unlock()
-
-	go s.savePersistentData()
-}
-
-// saveDeviceConfig saves a device's config to persistent storage
-func (s *ProxyServer) saveDeviceConfig(device *Device) {
-	// Read device fields under lock to avoid race conditions
-	s.mu.RLock()
-	upstreamProxy := device.UpstreamProxy
-	username := device.Username
-	customName := device.CustomName
-	group := device.Group
-	notes := device.Notes
-	deviceIP := device.IP
-	s.mu.RUnlock()
-
-	// Find proxy index under pool lock
-	s.poolMu.Lock()
-	proxyIndex := 0
-	for i, p := range s.proxyPool {
-		if p == upstreamProxy {
-			proxyIndex = i
-			break
-		}
-	}
-	s.poolMu.Unlock()
-
-	cfg := DeviceConfig{
-		Username:   username,
-		CustomName: customName,
-		Group:      group,
-		Notes:      notes,
-		ProxyIndex: proxyIndex,
-		LastIP:     deviceIP,
-	}
-
-	s.persistMu.Lock()
-	// Persist profiles by username as the primary key. When IP-based
-	// fallback is enabled, also store the latest IP as an alias so that
-	// proxy requests that arrive without auth headers can still be bound
-	// to the correct username/profile instead of creating anonymous
-	// devices for the same phone.
-	if username != "" {
-		s.persistentData.DeviceConfigs[username] = cfg
-		if s.allowIPFallback && deviceIP != "" {
-			s.persistentData.DeviceConfigs[deviceIP] = cfg
-		}
-	}
-	s.persistMu.Unlock()
-
-	go s.savePersistentData()
-}
-
-func handleProxy(w http.ResponseWriter, r *http.Request) {
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-
-	// Allow the mobile app to hit its API on the proxy port (e.g., if the user
-	// enters 8888 instead of the dashboard port). This avoids forwarding the
-	// app's own control calls through an upstream proxy, which would hang or
-	// fail.
-	switch r.URL.Path {
-	case "/api/app/proxies":
-		handleAppProxiesAPI(w, r)
-		return
-	case "/api/app/register":
-		handleAppRegisterAPI(w, r)
-		return
-	case "/api/app/change-proxy":
-		handleAppChangeProxyAPI(w, r)
-		return
-	case "/api/app/authenticate":
-		handleAppAuthenticateAPI(w, r)
-		return
-	case "/api/app/whoami":
-		handleAppWhoAmI(w, r)
-		return
-	case "/api/app/check-ip":
-		handleAppCheckIP(w, r)
-		return
-	case "/api/app/validate-password":
-		handleAppValidatePassword(w, r)
-		return
-	case "/api/app/confirm-connection":
-		handleAppConfirmConnection(w, r)
-		return
-	case "/api/app/device-settings":
-		handleAppDeviceSettings(w, r)
-		return
-	}
-
-	username := parseProxyUsername(r)
-	device, err := server.getOrCreateDevice(clientIP, username)
-	if err != nil {
-		// Log unregistered connection attempt
-		server.addLog("warn", fmt.Sprintf("[BLOCKED] Unregistered device %s (user: %s) tried to connect to %s", clientIP, username, r.Host))
-		server.addDeviceActivity(clientIP, "connection_blocked", "Device not registered", false, "", r.Host)
-		http.Error(w, "Registration required: please authenticate in the app", http.StatusProxyAuthRequired)
-		return
-	}
-
-	// Check if device session is confirmed and valid
-	if !server.isDeviceSessionValid(device) {
-		// Log session invalid attempt
-		server.addDeviceLog("warn", "session", fmt.Sprintf("[BLOCKED] Session expired/unconfirmed for %s trying to access %s", device.Username, r.Host), device)
-		server.addDeviceActivity(clientIP, "session_blocked", "Session expired or not confirmed", false, "", r.Host)
-		http.Error(w, "Session expired or not confirmed. Please open the app and confirm your connection.", http.StatusProxyAuthRequired)
-		return
-	}
-
-	// Update LastSeen only AFTER session validation passes
-	// This prevents blocked/expired devices from appearing "active" in the dashboard
-	server.mu.Lock()
-	device.LastSeen = time.Now()
-	server.mu.Unlock()
-
-	atomic.AddInt64(&device.RequestCount, 1)
-
-	// Get proxy name for logging
-	proxyName := ""
-	proxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
-	if proxyIndex >= 0 {
-		server.persistMu.RLock()
-		if name, ok := server.persistentData.ProxyNames[proxyIndex]; ok {
-			proxyName = name
-		} else {
-			proxyName = fmt.Sprintf("Proxy #%d", proxyIndex+1)
-		}
-		server.persistMu.RUnlock()
-	}
-
-	if r.Method == http.MethodConnect {
-		handleHTTPS(w, r, device, proxyName)
-	} else {
-		handleHTTP(w, r, device, proxyName)
-	}
-}
-
-func handleHTTPS(w http.ResponseWriter, r *http.Request, device *Device, proxyName string) {
-	target := r.Host
-	if !strings.Contains(target, ":") {
-		target += ":443"
-	}
-
-	// Block WebRTC leak sources (STUN/TURN servers)
-	if isWebRTCLeakHost(target) {
-		// Silently block to prevent WebRTC IP leaks - return connection refused
-		http.Error(w, "Connection refused", http.StatusForbidden)
-		return
-	}
-
-	startTime := time.Now()
-	proxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
-
-	targetConn, err := dialThroughSOCKS5(target, device.UpstreamProxy)
-	if err != nil {
-		errMsg := err.Error()
-		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, errMsg)
-		}
-		// Only count as device error if it's not a proxy-side issue
-		if !isProxySideError(errMsg) {
-			atomic.AddInt64(&device.ErrorCount, 1)
-			server.mu.Lock()
-			device.LastError = errMsg
-			device.LastErrorTime = time.Now()
-			server.mu.Unlock()
-			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] HTTPS connection failed to %s via %s: %s", target, proxyName, errMsg), device)
-			server.addDeviceActivity(device.IP, "connection_error", fmt.Sprintf("HTTPS to %s failed: %s", target, errMsg), false, proxyName, target)
-		}
-		// Skip logging proxy-side errors (ruleset blocks, etc) - they're normal behavior
-		http.Error(w, "Failed to connect", http.StatusBadGateway)
-		return
-	}
-	defer targetConn.Close()
-
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	defer clientConn.Close()
-
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	// Log successful connection (only for first few requests to avoid spam)
-	reqCount := atomic.LoadInt64(&device.RequestCount)
-	if reqCount <= 5 || reqCount%100 == 0 {
-		server.addDeviceActivity(device.IP, "https_connect", fmt.Sprintf("Connected to %s", target), true, proxyName, target)
-	}
-
-	done := make(chan bool, 2)
-	var bytesOut, bytesIn int64
-
-	go func() {
-		n, _ := io.Copy(targetConn, clientConn)
-		bytesOut = n
-		atomic.AddInt64(&device.BytesOut, n)
-		done <- true
-	}()
-
-	go func() {
-		n, _ := io.Copy(clientConn, targetConn)
-		bytesIn = n
-		atomic.AddInt64(&device.BytesIn, n)
-		done <- true
-	}()
-
-	<-done
-	if proxyIndex >= 0 {
-		server.recordProxySuccess(proxyIndex, time.Since(startTime), bytesIn, bytesOut)
-	}
-	// Track connection for real-time monitoring
-	server.trackDeviceConnection(device.IP, target, "HTTPS", bytesIn, bytesOut, true)
-}
-
-func handleHTTP(w http.ResponseWriter, r *http.Request, device *Device, proxyName string) {
-	host := r.Host
-	if !strings.Contains(host, ":") {
-		host += ":80"
-	}
-
-	// Block WebRTC leak sources (STUN/TURN servers)
-	if isWebRTCLeakHost(host) {
-		// Silently block to prevent WebRTC IP leaks
-		http.Error(w, "Connection refused", http.StatusForbidden)
-		return
-	}
-
-	startTime := time.Now()
-	proxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
-
-	targetConn, err := dialThroughSOCKS5(host, device.UpstreamProxy)
-	if err != nil {
-		errMsg := err.Error()
-		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, errMsg)
-		}
-		if !isProxySideError(errMsg) {
-			atomic.AddInt64(&device.ErrorCount, 1)
-			server.mu.Lock()
-			device.LastError = errMsg
-			server.mu.Unlock()
-			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] HTTP connection failed to %s via %s: %s", host, proxyName, errMsg), device)
-			server.addDeviceActivity(device.IP, "connection_error", fmt.Sprintf("HTTP to %s failed: %s", host, errMsg), false, proxyName, host)
-		}
-		// Skip logging proxy-side errors (ruleset blocks, etc) - they're normal behavior
-		http.Error(w, "Failed to connect", http.StatusBadGateway)
-		return
-	}
-	defer targetConn.Close()
-
-	r.RequestURI = ""
-	if err := r.Write(targetConn); err != nil {
-		errMsg := err.Error()
-		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, errMsg)
-		}
-		if !isProxySideError(errMsg) {
-			atomic.AddInt64(&device.ErrorCount, 1)
-			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] Failed to send HTTP request to %s: %s", host, errMsg), device)
-		}
-		http.Error(w, "Failed to send request", http.StatusBadGateway)
-		return
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(targetConn), r)
-	if err != nil {
-		errMsg := err.Error()
-		if proxyIndex >= 0 {
-			server.recordProxyFailure(proxyIndex, errMsg)
-		}
-		if !isProxySideError(errMsg) {
-			atomic.AddInt64(&device.ErrorCount, 1)
-			server.addDeviceLog("error", "proxy", fmt.Sprintf("[ERROR] Failed to read HTTP response from %s: %s", host, errMsg), device)
-		}
-		http.Error(w, "Failed to read response", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	n, _ := io.Copy(w, resp.Body)
-	atomic.AddInt64(&device.BytesIn, n)
-
-	if proxyIndex >= 0 {
-		server.recordProxySuccess(proxyIndex, time.Since(startTime), n, 0)
-	}
-	// Track connection for real-time monitoring
-	server.trackDeviceConnection(device.IP, host, "HTTP", n, 0, true)
-}
-
-func dialThroughSOCKS5(target, proxyStr string) (net.Conn, error) {
-	if proxyStr == "" {
-		return net.DialTimeout("tcp", target, 30*time.Second)
-	}
-
-	parts := strings.Split(proxyStr, ":")
-	if len(parts) < 4 {
-		return nil, fmt.Errorf("invalid proxy format")
-	}
-
-	auth := &proxy.Auth{User: parts[2], Password: strings.Join(parts[3:], ":")}
-	dialer, err := proxy.SOCKS5("tcp", parts[0]+":"+parts[1], auth, &net.Dialer{Timeout: 30 * time.Second})
-	if err != nil {
-		return nil, err
-	}
-	return dialer.Dial("tcp", target)
-}
-
-func cleanupInactiveDevices() {
-	for range time.NewTicker(10 * time.Minute).C {
-		timeout := time.Duration(server.persistentData.SystemSettings.DeviceTimeoutMinutes) * time.Minute
-		server.mu.Lock()
-		for ip, device := range server.devices {
-			if time.Since(device.LastSeen) > timeout {
-				delete(server.devices, ip)
-			}
-		}
-		server.mu.Unlock()
-	}
-}
-
-// ============================================================================
-// DASHBOARD SERVER
-// ============================================================================
-
-func startDashboard() {
-	http.HandleFunc("/", handleLoginPage)
-	http.HandleFunc("/api/login", handleLoginAPI)
-	http.HandleFunc("/api/logout", handleLogoutAPI)
-	http.HandleFunc("/api/session-check", handleSessionCheckAPI)
-
-	// Public app API (no auth required)
-	http.HandleFunc("/api/app/proxies", handleAppProxiesAPI)
-	http.HandleFunc("/api/app/register", handleAppRegisterAPI)
-	http.HandleFunc("/api/app/change-proxy", handleAppChangeProxyAPI)
-	http.HandleFunc("/api/app/authenticate", handleAppAuthenticateAPI)
-	http.HandleFunc("/api/app/whoami", handleAppWhoAmI)
-	http.HandleFunc("/api/app/check-ip", handleAppCheckIP)
-	http.HandleFunc("/api/app/validate-password", handleAppValidatePassword)
-	http.HandleFunc("/api/app/device-settings", handleAppDeviceSettings)
-
-	http.HandleFunc("/dashboard", server.requireAuth(handleDashboard))
-	http.HandleFunc("/health", server.requireAuth(handleHealthPage))
-	http.HandleFunc("/diagnostics", server.requireAuth(handleDiagnosticsPage))
-	http.HandleFunc("/analytics", server.requireAuth(handleAnalyticsPage))
-	http.HandleFunc("/activity", server.requireAuth(handleActivityPage))
-	http.HandleFunc("/settings", server.requireAuth(handleSettingsPage))
-	http.HandleFunc("/monitoring", server.requireAuth(handleMonitoringPage))
-
-	http.HandleFunc("/api/devices", server.requireAuth(handleDevicesAPI))
-	http.HandleFunc("/api/stats", server.requireAuth(handleStatsAPI))
-	http.HandleFunc("/api/server-ip", server.requireAuth(handleServerIPAPI))
-	http.HandleFunc("/api/proxies", server.requireAuth(handleProxiesAPI))
-	http.HandleFunc("/api/change-proxy", server.requireAuth(handleChangeProxyAPI))
-	http.HandleFunc("/api/update-device", server.requireAuth(handleUpdateDeviceAPI))
-	http.HandleFunc("/api/bulk-change-proxy", server.requireAuth(handleBulkChangeProxyAPI))
-	http.HandleFunc("/api/groups", server.requireAuth(handleGroupsAPI))
-	http.HandleFunc("/api/add-group", server.requireAuth(handleAddGroupAPI))
-	http.HandleFunc("/api/delete-group", server.requireAuth(handleDeleteGroupAPI))
-	http.HandleFunc("/api/add-proxy", server.requireAuth(handleAddProxyAPI))
-	http.HandleFunc("/api/delete-proxy", server.requireAuth(handleDeleteProxyAPI))
-	http.HandleFunc("/api/delete-device", server.requireAuth(handleDeleteDeviceAPI))
-	http.HandleFunc("/api/export", server.requireAuth(handleExportAPI))
-	http.HandleFunc("/api/bulk-import-proxies", server.requireAuth(handleBulkImportProxiesAPI))
-	http.HandleFunc("/api/proxy-health", server.requireAuth(handleProxyHealthAPI))
-	http.HandleFunc("/api/diagnostics", server.requireAuth(handleDiagnosticsAPI))
-	http.HandleFunc("/api/traffic-history", server.requireAuth(handleTrafficHistoryAPI))
-	http.HandleFunc("/api/change-password", server.requireAuth(handleChangePasswordAPI))
-	http.HandleFunc("/api/system-stats", server.requireAuth(handleSystemStatsAPI))
-	http.HandleFunc("/api/logs", server.requireAuth(handleLogsAPI))
-	http.HandleFunc("/api/device-activity", server.requireAuth(handleDeviceActivityAPI))
-	http.HandleFunc("/api/activity-log", server.requireAuth(handleActivityLogAPI))
-	http.HandleFunc("/api/supervisors", server.requireAuth(handleSupervisorsAPI))
-	http.HandleFunc("/api/add-supervisor", server.requireAuth(handleAddSupervisorAPI))
-	http.HandleFunc("/api/update-supervisor", server.requireAuth(handleUpdateSupervisorAPI))
-	http.HandleFunc("/api/delete-supervisor", server.requireAuth(handleDeleteSupervisorAPI))
-	http.HandleFunc("/api/admin-password", server.requireAuth(handleAdminPasswordAPI))
-	http.HandleFunc("/api/update-proxy-name", server.requireAuth(handleUpdateProxyNameAPI))
-	http.HandleFunc("/api/reorder-proxies", server.requireAuth(handleReorderProxiesAPI))
-	http.HandleFunc("/api/session-settings", server.requireAuth(handleSessionSettingsAPI))
-	http.HandleFunc("/api/check-blacklist", server.requireAuth(handleCheckBlacklistAPI))
-	http.HandleFunc("/api/device-connections", server.requireAuth(handleDeviceConnectionsAPI))
-	http.HandleFunc("/api/network-overview", server.requireAuth(handleNetworkOverviewAPI))
-
-	log.Printf("📊 Dashboard on port %d\n", server.dashPort)
-	addr := fmt.Sprintf("%s:%d", server.bindAddr, server.dashPort)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		log.Fatalf("failed to start dashboard on %s: %v", addr, err)
-	}
-}
-
-func parseEnvInt(key string, fallback int) int {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed <= 0 {
-		log.Printf("⚠️  Invalid %s value '%s', using default %d\n", key, value, fallback)
-		return fallback
-	}
-
-	return parsed
-}
-
-func parseEnvBool(key string, fallback bool) bool {
-	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
-	if value == "" {
-		return fallback
-	}
-
-	switch value {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		log.Printf("⚠️  Invalid %s value '%s', using default %t\n", key, value, fallback)
-		return fallback
-	}
-}
 
 func handleLoginAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Rate limiting: check for lockout
+	clientIP := strings.Split(r.RemoteAddr, ":")[0]
+	server.loginMu.Lock()
+	attempt, exists := server.loginAttempts[clientIP]
+	if exists && time.Now().Before(attempt.LockedUntil) {
+		server.loginMu.Unlock()
+		remaining := time.Until(attempt.LockedUntil).Round(time.Second)
+		http.Error(w, fmt.Sprintf("Too many failed attempts. Try again in %s", remaining), http.StatusTooManyRequests)
+		return
+	}
+	server.loginMu.Unlock()
+
 	var req loginRequest
 	if json.NewDecoder(r.Body).Decode(&req) != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
 	if !server.validateCredentials(req.Username, req.Password) {
+		// Record failed attempt
+		server.loginMu.Lock()
+		if server.loginAttempts[clientIP] == nil {
+			server.loginAttempts[clientIP] = &loginAttemptInfo{}
+		}
+		attempt := server.loginAttempts[clientIP]
+		attempt.Count++
+		attempt.LastAttempt = time.Now()
+
+		// Lock out after 5 failed attempts for 5 minutes
+		if attempt.Count >= 5 {
+			attempt.LockedUntil = time.Now().Add(5 * time.Minute)
+			server.addLog("warning", fmt.Sprintf("IP %s locked out due to %d failed login attempts", clientIP, attempt.Count))
+		}
+		server.loginMu.Unlock()
+
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
+
+	// Clear failed attempts on successful login
+	server.loginMu.Lock()
+	delete(server.loginAttempts, clientIP)
+	server.loginMu.Unlock()
+
 	token := server.createSession(req.Username)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_token",
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   server.persistentData.SystemSettings.SecureCookies,
 		MaxAge:   server.persistentData.SystemSettings.SessionTimeout * 3600,
 	})
 	w.Header().Set("Content-Type", "application/json")
@@ -1862,7 +208,14 @@ func handleLogoutAPI(w http.ResponseWriter, r *http.Request) {
 		delete(server.sessions, cookie.Value)
 		server.sessionMu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "session_token", Value: "", Path: "/", MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_token",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   server.persistentData.SystemSettings.SecureCookies,
+	})
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
@@ -1910,82 +263,12 @@ func handleChangePasswordAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
-// DeviceWithStatus extends Device with online status for API response
-type DeviceWithStatus struct {
-	*Device
-	Online bool `json:"online"`
-}
-
-func handleDevicesAPI(w http.ResponseWriter, r *http.Request) {
-	// Check if we want to include offline devices
-	includeOffline := r.URL.Query().Get("include_offline") == "true"
-
-	server.mu.RLock()
-	activeUsernames := make(map[string]bool)
-	devices := make([]DeviceWithStatus, 0)
-
-	// Add all active devices
-	for _, d := range server.devices {
-		isOnline := time.Since(d.LastSeen) < 5*time.Minute
-		devices = append(devices, DeviceWithStatus{Device: d, Online: isOnline})
-		if d.Username != "" {
-			activeUsernames[d.Username] = true
-		}
-	}
-	server.mu.RUnlock()
-
-	// Add offline registered devices from persistent config
-	if includeOffline {
-		server.persistMu.RLock()
-		for username, cfg := range server.persistentData.DeviceConfigs {
-			// Skip if already in active devices or if it's an IP-keyed entry
-			if activeUsernames[username] || cfg.Username == "" || cfg.Username != username {
-				continue
-			}
-
-			// Get proxy string
-			var upstreamProxy string
-			server.poolMu.Lock()
-			if cfg.ProxyIndex >= 0 && cfg.ProxyIndex < len(server.proxyPool) {
-				upstreamProxy = server.proxyPool[cfg.ProxyIndex]
-			}
-			server.poolMu.Unlock()
-
-			offlineDevice := &Device{
-				ID:            fmt.Sprintf("device-%s", username),
-				IP:            cfg.LastIP,
-				Username:      username,
-				Name:          username,
-				CustomName:    cfg.CustomName,
-				Group:         cfg.Group,
-				Notes:         cfg.Notes,
-				UpstreamProxy: upstreamProxy,
-				Status:        "offline",
-			}
-			devices = append(devices, DeviceWithStatus{Device: offlineDevice, Online: false})
-		}
-		server.persistMu.RUnlock()
-	}
-
-	sort.Slice(devices, func(i, j int) bool {
-		ni, nj := devices[i].CustomName, devices[j].CustomName
-		if ni == "" {
-			ni = devices[i].Name
-		}
-		if nj == "" {
-			nj = devices[j].Name
-		}
-		return ni < nj
-	})
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(devices)
-}
-
 func handleStatsAPI(w http.ResponseWriter, r *http.Request) {
-	server.mu.RLock()
+	// Stats from AP devices only
+	server.apMu.RLock()
 	activeCount, totalRequests, totalErrors, totalBytesIn, totalBytesOut := 0, int64(0), int64(0), int64(0), int64(0)
-	for _, d := range server.devices {
-		if time.Since(d.LastSeen) < 5*time.Minute {
+	for _, d := range server.apDevices {
+		if d.Confirmed && time.Since(d.LastSeen) < 5*time.Minute {
 			activeCount++
 		}
 		totalRequests += d.RequestCount
@@ -1993,8 +276,8 @@ func handleStatsAPI(w http.ResponseWriter, r *http.Request) {
 		totalBytesIn += d.BytesIn
 		totalBytesOut += d.BytesOut
 	}
-	totalDevices := len(server.devices)
-	server.mu.RUnlock()
+	totalDevices := len(server.apDevices)
+	server.apMu.RUnlock()
 
 	server.healthMu.RLock()
 	healthyProxies := 0
@@ -2044,944 +327,929 @@ func handleProxiesAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(proxies)
 }
 
-// ============================================================================
-// APP API (public endpoints for mobile app)
-// ============================================================================
 
-type AppProxyInfo struct {
-	Index int    `json:"index"`
-	Name  string `json:"name"`
+// handleAccessPointPage serves the Access Point management page
+func handleAccessPointPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write(accessPointPageHTML)
 }
 
-// handleAppProxiesAPI returns list of proxy names for the mobile app (no auth required)
-func handleAppProxiesAPI(w http.ResponseWriter, r *http.Request) {
+// handleAPStatusAPI returns the current AP network status
+func handleAPStatusAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	username := strings.TrimSpace(r.Header.Get("X-App-Username"))
-	if username == "" {
-		username = strings.TrimSpace(r.URL.Query().Get("username"))
-	}
-
-	if !ensureAppAuth(w, r, username) {
-		return
-	}
-
-	server.poolMu.Lock()
-	defer server.poolMu.Unlock()
-
-	proxies := make([]AppProxyInfo, 0)
-	for i := range server.proxyPool {
-		proxies = append(proxies, AppProxyInfo{
-			Index: i,
-			Name:  server.getProxyName(i),
-		})
-	}
-	json.NewEncoder(w).Encode(proxies)
-}
-
-type AppRegisterRequest struct {
-	Username   string `json:"username"`
-	ProxyIndex int    `json:"proxy_index"`
-	Password   string `json:"password,omitempty"`   // Required for registration
-	Supervisor string `json:"supervisor,omitempty"` // Supervisor name for change-proxy logging
-}
-
-// Registration password - devices must provide this to register
-const registrationPassword = "Drnda123"
-
-type AppAuthRequest struct {
-	Username string `json:"username"`
-}
-
-type AppAuthResponse struct {
-	Success    bool   `json:"success"`
-	Message    string `json:"message"`
-	Token      string `json:"token,omitempty"`
-	Username   string `json:"username,omitempty"`
-	ProxyIndex int    `json:"proxy_index,omitempty"`
-	ProxyName  string `json:"proxy_name,omitempty"`
-}
-
-type AppRegisterResponse struct {
-	Success    bool   `json:"success"`
-	Message    string `json:"message"`
-	Username   string `json:"username"`
-	ProxyName  string `json:"proxy_name"`
-	ProxyIndex int    `json:"proxy_index,omitempty"`
-	Token      string `json:"token,omitempty"`
-}
-
-// ensureAppAuth enforces the optional pre-authentication gate for app calls
-func ensureAppAuth(w http.ResponseWriter, r *http.Request, username string) bool {
-	if !server.authRequired {
-		return true
-	}
-
-	if r.Method == http.MethodOptions {
-		return true
-	}
-
-	if strings.TrimSpace(username) == "" {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Authentication required: send username"})
-		return false
-	}
-
-	token := strings.TrimSpace(r.Header.Get("X-App-Token"))
-	if token == "" {
-		token = strings.TrimSpace(r.URL.Query().Get("token"))
-	}
-	if token == "" {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Authentication required"})
-		return false
-	}
-
-	if _, ok := server.validateAppSession(token, username); !ok {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Session expired, please authenticate"})
-		return false
-	}
-
-	return true
-}
-
-// handleAppRegisterAPI registers a device with username and proxy selection (password protected)
-func handleAppRegisterAPI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Method not allowed"})
-		return
-	}
-
-	var req AppRegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid request"})
-		return
-	}
-
-	username := strings.TrimSpace(req.Username)
-	if username == "" {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
-		return
-	}
-
-	// Validate username contains only safe characters (prevent corrupted registrations)
-	if !isValidUsername(username) {
-		clientIP := strings.Split(r.RemoteAddr, ":")[0]
-		log.Printf("⚠️ App: Registration denied - invalid username characters '%s' (IP: %s)\n", username, clientIP)
-		server.addLog("warning", fmt.Sprintf("App: Registration denied - invalid username '%s' (IP: %s)", username, clientIP))
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid username - use only letters, numbers, underscore, hyphen, dot, space"})
-		return
-	}
-
-	// Validate registration password
-	if req.Password != registrationPassword {
-		clientIP := strings.Split(r.RemoteAddr, ":")[0]
-		log.Printf("⚠️ App: Registration denied - invalid password for username '%s' (IP: %s)\n", username, clientIP)
-		server.addLog("warning", fmt.Sprintf("App: Registration denied - invalid password for '%s' (IP: %s)", username, clientIP))
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid registration password"})
-		return
-	}
-
-	if !ensureAppAuth(w, r, username) {
-		return
-	}
-
-	// Validate proxy index
-	server.poolMu.Lock()
-	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
-		server.poolMu.Unlock()
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid proxy selection"})
-		return
-	}
-	selectedProxy := server.proxyPool[req.ProxyIndex]
-	server.poolMu.Unlock()
-
-	proxyName := fmt.Sprintf("SG%d", req.ProxyIndex+1)
-
-	// Get client IP
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-
-	// Check if device already exists with this username
-	server.mu.Lock()
-	existingDevice := server.findDeviceByUsername(username)
-	if existingDevice != nil {
-		// Update existing device
-		oldIP := existingDevice.IP
-		existingDevice.IP = clientIP
-		existingDevice.UpstreamProxy = selectedProxy
-		existingDevice.LastSeen = time.Now()
-		server.mu.Unlock()
-
-		// Track device registration to proxy
-		server.trackDeviceRegistration(req.ProxyIndex, username)
-
-		// Auto-confirm session on registration
-		server.confirmDeviceSession(existingDevice)
-
-		go server.saveDeviceConfig(existingDevice)
-		log.Printf("📱 App: Device '%s' updated -> %s (session auto-confirmed)\n", username, proxyName)
-		server.addDeviceLog("info", "config", fmt.Sprintf("[UPDATED] Device re-registered from IP %s (was %s) with %s - session confirmed", clientIP, oldIP, proxyName), existingDevice)
-		server.addDeviceActivity(clientIP, "device_updated", fmt.Sprintf("Re-registered with %s (session confirmed)", proxyName), true, proxyName, "")
-	} else {
-		// Create new device
-		device := &Device{
-			ID:            fmt.Sprintf("device-%s", username),
-			IP:            clientIP,
-			Username:      username,
-			Name:          username,
-			Group:         "Default",
-			UpstreamProxy: selectedProxy,
-			Status:        "active",
-			FirstSeen:     time.Now(),
-			LastSeen:      time.Now(),
+	server.apMu.RLock()
+	totalDevices := len(server.apDevices)
+	onlineDevices := 0
+	confirmedDevices := 0
+	pendingDevices := 0
+	for _, device := range server.apDevices {
+		if device.Status == "online" {
+			onlineDevices++
 		}
-		server.devices[username] = device
-		server.mu.Unlock()
-
-		// Track device registration to proxy
-		server.trackDeviceRegistration(req.ProxyIndex, username)
-
-		// Auto-confirm session on registration
-		server.confirmDeviceSession(device)
-
-		go server.saveDeviceConfig(device)
-		log.Printf("📱 App: New device '%s' registered -> %s (session auto-confirmed)\n", username, proxyName)
-		server.addDeviceLog("info", "config", fmt.Sprintf("[REGISTERED] New device '%s' from IP %s with %s - session confirmed", username, clientIP, proxyName), device)
-		server.addDeviceActivity(clientIP, "device_registered", fmt.Sprintf("New device registered with %s (session confirmed)", proxyName), true, proxyName, "")
+		if device.Confirmed {
+			confirmedDevices++
+		} else {
+			pendingDevices++
+		}
 	}
+	server.apMu.RUnlock()
 
-	json.NewEncoder(w).Encode(AppRegisterResponse{
-		Success:    true,
-		Message:    "Device registered",
-		Username:   username,
-		ProxyName:  proxyName,
-		ProxyIndex: req.ProxyIndex,
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":           server.apConfig.Enabled,
+		"interface":         server.apConfig.Interface,
+		"ip_address":        server.apConfig.IPAddress,
+		"dhcp_range":        fmt.Sprintf("%s - %s", server.apConfig.DHCPStart, server.apConfig.DHCPEnd),
+		"total_devices":     totalDevices,
+		"online_devices":    onlineDevices,
+		"confirmed_devices": confirmedDevices,
+		"pending_devices":   pendingDevices,
 	})
 }
 
-// handleAppChangeProxyAPI updates a device's proxy selection (only for existing registered devices)
-func handleAppChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
+// handleDevicesAPI returns list of legacy devices (empty - system is now AP-based)
+func handleDevicesAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write([]byte("[]"))
+}
 
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
-		return
+// handleAPDevicesAPI returns list of all AP devices
+func handleAPDevicesAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	server.apMu.RLock()
+	devices := make([]*APDevice, 0, len(server.apDevices))
+	for _, device := range server.apDevices {
+		devices = append(devices, device)
 	}
+	server.apMu.RUnlock()
 
-	if r.Method != http.MethodPost {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Method not allowed"})
-		return
-	}
-
-	var req AppRegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid request"})
-		return
-	}
-
-	username := strings.TrimSpace(req.Username)
-	if username == "" {
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Username required"})
-		return
-	}
-
-	server.poolMu.Lock()
-	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
-		server.poolMu.Unlock()
-		json.NewEncoder(w).Encode(AppRegisterResponse{Success: false, Message: "Invalid proxy selection"})
-		return
-	}
-	selectedProxy := server.proxyPool[req.ProxyIndex]
-	server.poolMu.Unlock()
-
-	proxyName := fmt.Sprintf("SG%d", req.ProxyIndex+1)
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-
-	// Only allow changing proxy for existing registered devices
-	server.mu.Lock()
-	device := server.findDeviceByUsername(username)
-	if device == nil {
-		server.mu.Unlock()
-		log.Printf("⚠️ App: Change proxy failed - username '%s' not registered\n", username)
-		server.addLog("warning", fmt.Sprintf("App: Change proxy denied - username '%s' not registered (IP: %s)", username, clientIP))
-		json.NewEncoder(w).Encode(AppRegisterResponse{
-			Success: false,
-			Message: "Username not registered. Please register first using the Register button.",
-		})
-		return
-	}
-
-	// Log the proxy change with old and new proxy info
-	oldProxyIndex := server.getProxyIndexByString(device.UpstreamProxy)
-	oldProxyName := fmt.Sprintf("SG%d", oldProxyIndex+1)
-
-	device.IP = clientIP
-	device.UpstreamProxy = selectedProxy
-	device.LastSeen = time.Now()
-	server.mu.Unlock()
-
-	// Track device registration to proxy
-	server.trackDeviceRegistration(req.ProxyIndex, username)
-
-	// Auto-confirm session on proxy change
-	server.confirmDeviceSession(device)
-
-	go server.saveDeviceConfig(device)
-
-	// Log proxy change with supervisor name if provided
-	supervisorInfo := ""
-	if req.Supervisor != "" {
-		supervisorInfo = fmt.Sprintf(" by Supervisor %s", req.Supervisor)
-	}
-	log.Printf("📱 App: Device '%s' proxy changed: %s -> %s%s (IP: %s) - session confirmed\n", username, oldProxyName, proxyName, supervisorInfo, clientIP)
-	server.addDeviceLog("info", "config", fmt.Sprintf("[PROXY CHANGED] %s: %s -> %s%s - session confirmed", username, oldProxyName, proxyName, supervisorInfo), device)
-	server.addDeviceActivity(clientIP, "proxy_changed", fmt.Sprintf("Changed from %s to %s%s (session confirmed)", oldProxyName, proxyName, supervisorInfo), true, proxyName, "")
-
-	json.NewEncoder(w).Encode(AppRegisterResponse{
-		Success:    true,
-		Message:    "Proxy updated",
-		Username:   username,
-		ProxyName:  proxyName,
-		ProxyIndex: req.ProxyIndex,
+	// Sort by FirstSeen (newest first)
+	sort.Slice(devices, func(i, j int) bool {
+		return devices[i].FirstSeen.After(devices[j].FirstSeen)
 	})
-}
 
-// handleAppAuthenticateAPI issues a short-lived session token keyed by username
-func handleAppAuthenticateAPI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
-		return
+	// Add proxy names
+	type DeviceWithProxyName struct {
+		*APDevice
+		ProxyName string `json:"proxy_name"`
 	}
 
+	result := make([]DeviceWithProxyName, len(devices))
+	for i, device := range devices {
+		result[i] = DeviceWithProxyName{
+			APDevice:  device,
+			ProxyName: server.getProxyName(device.ProxyIndex),
+		}
+	}
+
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleAPDeviceConfirmAPI confirms (approves) or unconfirms an AP device
+func handleAPDeviceConfirmAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Method not allowed"})
-		return
-	}
-
-	var req AppAuthRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Invalid request"})
-		return
-	}
-
-	username := strings.TrimSpace(req.Username)
-	if username == "" {
-		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "Username required"})
-		return
-	}
-
-	server.poolMu.Lock()
-	if len(server.proxyPool) == 0 {
-		server.poolMu.Unlock()
-		json.NewEncoder(w).Encode(AppAuthResponse{Success: false, Message: "No upstream proxies configured"})
-		return
-	}
-	server.poolMu.Unlock()
-
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-
-	server.persistMu.RLock()
-	cfg, hasCfg := server.persistentData.DeviceConfigs[username]
-	server.persistMu.RUnlock()
-
-	proxyIndex := 0
-	if hasCfg && cfg.ProxyIndex >= 0 {
-		proxyIndex = cfg.ProxyIndex
-	}
-
-	server.poolMu.Lock()
-	if proxyIndex >= len(server.proxyPool) {
-		proxyIndex = 0
-	}
-	selectedProxy := server.proxyPool[proxyIndex]
-	proxyName := fmt.Sprintf("SG%d", proxyIndex+1)
-	server.poolMu.Unlock()
-
-	server.mu.Lock()
-	device := server.findDeviceByUsername(username)
-	if device == nil {
-		device = &Device{
-			ID:            fmt.Sprintf("device-%s", username),
-			IP:            clientIP,
-			Username:      username,
-			Name:          username,
-			Group:         "Default",
-			UpstreamProxy: selectedProxy,
-			Status:        "active",
-			FirstSeen:     time.Now(),
-			LastSeen:      time.Now(),
-		}
-		server.devices[username] = device
-	} else {
-		device.IP = clientIP
-		if device.UpstreamProxy == "" {
-			device.UpstreamProxy = selectedProxy
-		}
-		device.LastSeen = time.Now()
-	}
-	server.mu.Unlock()
-
-	// Auto-confirm session on connect/authenticate
-	server.confirmDeviceSession(device)
-
-	go server.saveDeviceConfig(device)
-	session := server.createAppSession(username)
-
-	json.NewEncoder(w).Encode(AppAuthResponse{
-		Success:    true,
-		Message:    "Authenticated",
-		Token:      session.Token,
-		Username:   username,
-		ProxyIndex: proxyIndex,
-		ProxyName:  proxyName,
-	})
-}
-
-// fetchPublicIPThroughProxy fetches the public IP by making a request through the SOCKS5 proxy
-func fetchPublicIPThroughProxy(proxyStr string) (string, error) {
-	if proxyStr == "" {
-		return "", fmt.Errorf("no proxy configured")
-	}
-
-	parts := strings.Split(proxyStr, ":")
-	if len(parts) < 4 {
-		return "", fmt.Errorf("invalid proxy format")
-	}
-
-	auth := &proxy.Auth{User: parts[2], Password: strings.Join(parts[3:], ":")}
-	dialer, err := proxy.SOCKS5("tcp", parts[0]+":"+parts[1], auth, &net.Dialer{Timeout: 10 * time.Second})
-	if err != nil {
-		return "", fmt.Errorf("failed to create SOCKS5 dialer: %v", err)
-	}
-
-	// Create HTTP client with SOCKS5 transport
-	transport := &http.Transport{
-		Dial: dialer.Dial,
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   15 * time.Second,
-	}
-
-	// Try multiple IP check services
-	ipServices := []string{
-		"https://api.ipify.org",
-		"https://icanhazip.com",
-		"https://ifconfig.me/ip",
-	}
-
-	for _, service := range ipServices {
-		resp, err := client.Get(service)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			continue
-		}
-
-		ip := strings.TrimSpace(string(body))
-		if ip != "" && net.ParseIP(ip) != nil {
-			return ip, nil
-		}
-	}
-
-	return "", fmt.Errorf("failed to fetch public IP from all services")
-}
-
-// fetchPublicIPAndGeoThroughProxy fetches the public IP and geolocation through the SOCKS5 proxy
-func fetchPublicIPAndGeoThroughProxy(proxyStr string) (ip, country, city string, err error) {
-	if proxyStr == "" {
-		return "", "", "", fmt.Errorf("no proxy configured")
-	}
-
-	parts := strings.Split(proxyStr, ":")
-	if len(parts) < 4 {
-		return "", "", "", fmt.Errorf("invalid proxy format")
-	}
-
-	auth := &proxy.Auth{User: parts[2], Password: strings.Join(parts[3:], ":")}
-	dialer, err := proxy.SOCKS5("tcp", parts[0]+":"+parts[1], auth, &net.Dialer{Timeout: 10 * time.Second})
-	if err != nil {
-		return "", "", "", fmt.Errorf("failed to create SOCKS5 dialer: %v", err)
-	}
-
-	transport := &http.Transport{Dial: dialer.Dial}
-	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
-
-	// Try ip-api.com first for IP + geolocation in one request
-	resp, err := client.Get("http://ip-api.com/json/?fields=status,message,country,city,query")
-	if err == nil {
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err == nil {
-			var result struct {
-				Status  string `json:"status"`
-				Message string `json:"message"`
-				Country string `json:"country"`
-				City    string `json:"city"`
-				Query   string `json:"query"` // This is the IP
-			}
-			if json.Unmarshal(body, &result) == nil && result.Status == "success" {
-				return result.Query, result.Country, result.City, nil
-			}
-		}
-	}
-
-	// Fallback: get IP from simple services, then lookup geo separately
-	ipServices := []string{
-		"https://api.ipify.org",
-		"https://icanhazip.com",
-		"https://ifconfig.me/ip",
-	}
-
-	for _, service := range ipServices {
-		resp, err := client.Get(service)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			continue
-		}
-
-		fetchedIP := strings.TrimSpace(string(body))
-		if fetchedIP != "" && net.ParseIP(fetchedIP) != nil {
-			// Try to get geolocation for this IP
-			geoCountry, geoCity := fetchGeoForIP(client, fetchedIP)
-			return fetchedIP, geoCountry, geoCity, nil
-		}
-	}
-
-	return "", "", "", fmt.Errorf("failed to fetch public IP from all services")
-}
-
-// fetchGeoForIP looks up geolocation for an IP address
-func fetchGeoForIP(client *http.Client, ip string) (country, city string) {
-	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=status,country,city", ip))
-	if err != nil {
-		return "", ""
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", ""
-	}
-
-	var result struct {
-		Status  string `json:"status"`
-		Country string `json:"country"`
-		City    string `json:"city"`
-	}
-	if json.Unmarshal(body, &result) == nil && result.Status == "success" {
-		return result.Country, result.City
-	}
-	return "", ""
-}
-
-// handleAppWhoAmI reports the public IP as seen through the device's assigned proxy
-func handleAppWhoAmI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
-		return
-	}
-
-	username := strings.TrimSpace(r.Header.Get("X-App-Username"))
-	if username == "" {
-		username = strings.TrimSpace(r.URL.Query().Get("username"))
-	}
-
-	if !ensureAppAuth(w, r, username) {
-		return
-	}
-
-	// Look up the device to get its assigned proxy
-	server.mu.RLock()
-	device := server.findDeviceByUsername(username)
-	var proxyStr string
-	if device != nil {
-		proxyStr = device.UpstreamProxy
-	}
-	server.mu.RUnlock()
-
-	if proxyStr == "" {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"ip":      "",
-			"country": "",
-			"error":   "No proxy assigned - please register first",
-		})
-		return
-	}
-
-	// Fetch public IP and geolocation through the proxy
-	publicIP, country, city, err := fetchPublicIPAndGeoThroughProxy(proxyStr)
-	if err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"ip":      "",
-			"country": "",
-			"city":    "",
-			"error":   fmt.Sprintf("Failed to check IP: %v", err),
-		})
-		return
-	}
-
-	json.NewEncoder(w).Encode(map[string]string{
-		"ip":      publicIP,
-		"country": country,
-		"city":    city,
-	})
-}
-
-// extractIPFromProxyString extracts the IP address embedded in a proxy string
-// Format: host:port:username:password where username may contain ip-X.X.X.X
-func extractIPFromProxyString(proxyStr string) string {
-	// Look for pattern like ip-XXX.XXX.XXX.XXX in the proxy string
-	re := regexp.MustCompile(`ip-(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
-	matches := re.FindStringSubmatch(proxyStr)
-	if len(matches) >= 2 {
-		return matches[1]
-	}
-	return ""
-}
-
-// handleAppCheckIP checks which proxy an IP belongs to
-func handleAppCheckIP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		return
-	}
-
-	// Get IP from query param or JSON body
-	ipToCheck := r.URL.Query().Get("ip")
-	if ipToCheck == "" && r.Method == http.MethodPost {
-		var req struct {
-			IP string `json:"ip"`
-		}
-		json.NewDecoder(r.Body).Decode(&req)
-		ipToCheck = req.IP
-	}
-
-	if ipToCheck == "" {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":    false,
-			"message":    "IP address required",
-			"proxy_name": "",
-			"matched":    false,
-		})
-		return
-	}
-
-	// Search through proxies to find one with matching IP
-	server.poolMu.Lock()
-	var matchedIndex int = -1
-	for i, proxy := range server.proxyPool {
-		proxyIP := extractIPFromProxyString(proxy)
-		if proxyIP == ipToCheck {
-			matchedIndex = i
-			break
-		}
-	}
-	server.poolMu.Unlock()
-
-	if matchedIndex >= 0 {
-		proxyName := fmt.Sprintf("SG%d", matchedIndex+1)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":     true,
-			"matched":     true,
-			"proxy_name":  proxyName,
-			"proxy_index": matchedIndex,
-			"message":     fmt.Sprintf("IP belongs to %s", proxyName),
-		})
-	} else {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":    true,
-			"matched":    false,
-			"proxy_name": "",
-			"message":    "WARNING: IP does not match any configured proxy!",
-		})
-	}
-}
-
-// handleAppValidatePassword validates admin or supervisor password from the Android app
-func handleAppValidatePassword(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"valid":   false,
-			"message": "Method not allowed",
-		})
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req struct {
-		Password string `json:"password"`
-		Type     string `json:"type"` // "admin" or "supervisor"
+		MAC        string `json:"mac"`
+		Confirmed  bool   `json:"confirmed"`
+		CustomName string `json:"custom_name"`
+		ProxyIndex int    `json:"proxy_index"`
+		Group      string `json:"group"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"valid":   false,
-			"message": "Invalid request",
-		})
+		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
 
-	server.persistMu.RLock()
-	defer server.persistMu.RUnlock()
+	mac := strings.ToLower(req.MAC)
 
-	if req.Type == "admin" {
-		// Validate admin password
-		if req.Password == server.persistentData.AdminPassword {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"valid": true,
-				"name":  "Admin",
-			})
-		} else {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"valid":   false,
-				"message": "Invalid admin password",
+	server.apMu.Lock()
+	device, exists := server.apDevices[mac]
+	if !exists {
+		server.apMu.Unlock()
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	device.Confirmed = req.Confirmed
+	if req.Confirmed {
+		device.ConfirmedAt = time.Now()
+		device.ConfirmedBy = "admin" // Could get from session
+
+		// Set custom name if provided
+		if req.CustomName != "" {
+			device.CustomName = req.CustomName
+		}
+
+		// Set group if provided
+		if req.Group != "" {
+			device.Group = req.Group
+		}
+
+		// Assign proxy if provided (during approval)
+		if req.ProxyIndex >= 0 {
+			server.poolMu.Lock()
+			if req.ProxyIndex < len(server.proxyPool) {
+				device.ProxyIndex = req.ProxyIndex
+				device.UpstreamProxy = server.proxyPool[req.ProxyIndex]
+			}
+			server.poolMu.Unlock()
+		}
+
+		displayName := device.CustomName
+		if displayName == "" {
+			displayName = device.Hostname
+		}
+		server.addLog("info", fmt.Sprintf("[AP] Device approved: %s (%s) assigned to proxy #%d", displayName, device.MAC, device.ProxyIndex+1))
+	} else {
+		server.addLog("info", fmt.Sprintf("[AP] Device access revoked: %s (%s)", device.Hostname, device.MAC))
+	}
+	server.apMu.Unlock()
+
+	// Save to persistent data
+	server.persistMu.Lock()
+	if server.persistentData.APDevices == nil {
+		server.persistentData.APDevices = make(map[string]*APDevice)
+	}
+	server.persistentData.APDevices[mac] = device
+	server.persistMu.Unlock()
+
+	// Save immediately
+	server.savePersistentData()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"confirmed": device.Confirmed,
+	})
+}
+
+// handleAPDeviceProxyAPI changes the proxy assignment for an AP device
+func handleAPDeviceProxyAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		MAC        string `json:"mac"`
+		ProxyIndex int    `json:"proxy_index"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	mac := strings.ToLower(req.MAC)
+
+	server.poolMu.Lock()
+	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
+		server.poolMu.Unlock()
+		http.Error(w, "Invalid proxy index", http.StatusBadRequest)
+		return
+	}
+	proxyStr := server.proxyPool[req.ProxyIndex]
+	server.poolMu.Unlock()
+
+	server.apMu.Lock()
+	device, exists := server.apDevices[mac]
+	if !exists {
+		server.apMu.Unlock()
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	oldProxy := device.ProxyIndex
+	device.ProxyIndex = req.ProxyIndex
+	device.UpstreamProxy = proxyStr
+	server.apMu.Unlock()
+
+	// Save to persistent data
+	server.persistMu.Lock()
+	server.persistentData.APDevices[mac] = device
+	server.persistMu.Unlock()
+
+	server.addLog("info", fmt.Sprintf("[AP] Proxy changed for %s (%s): %s -> %s",
+		device.Hostname, device.MAC,
+		server.getProxyName(oldProxy),
+		server.getProxyName(req.ProxyIndex)))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"proxy_index": req.ProxyIndex,
+		"proxy_name":  server.getProxyName(req.ProxyIndex),
+	})
+}
+
+// handleAPDeviceBypassAPI toggles Google bypass for an AP device
+func handleAPDeviceBypassAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		MAC          string `json:"mac"`
+		GoogleBypass bool   `json:"google_bypass"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	mac := strings.ToLower(req.MAC)
+
+	server.apMu.Lock()
+	device, exists := server.apDevices[mac]
+	if !exists {
+		server.apMu.Unlock()
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	device.GoogleBypass = req.GoogleBypass
+	server.apMu.Unlock()
+
+	// Save to persistent data
+	server.persistMu.Lock()
+	server.persistentData.APDevices[mac] = device
+	server.persistMu.Unlock()
+
+	status := "disabled"
+	if req.GoogleBypass {
+		status = "enabled"
+	}
+	server.addLog("info", fmt.Sprintf("[AP] Google bypass %s for %s (%s)",
+		status, device.CustomName, device.MAC))
+
+	server.savePersistentData()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":       true,
+		"google_bypass": req.GoogleBypass,
+	})
+}
+
+// handleAPDeviceUpdateAPI updates device name, group, or notes
+func handleAPDeviceUpdateAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		MAC        string `json:"mac"`
+		CustomName string `json:"custom_name"`
+		Group      string `json:"group"`
+		Notes      string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	mac := strings.ToLower(req.MAC)
+
+	server.apMu.Lock()
+	device, exists := server.apDevices[mac]
+	if !exists {
+		server.apMu.Unlock()
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	device.CustomName = req.CustomName
+	device.Group = req.Group
+	device.Notes = req.Notes
+	server.apMu.Unlock()
+
+	// Save to persistent data
+	server.persistMu.Lock()
+	server.persistentData.APDevices[mac] = device
+	server.persistMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+// handleAPDeviceDeleteAPI removes an AP device from the system
+func handleAPDeviceDeleteAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		MAC string `json:"mac"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	mac := strings.ToLower(req.MAC)
+
+	server.apMu.Lock()
+	device, exists := server.apDevices[mac]
+	if !exists {
+		server.apMu.Unlock()
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	delete(server.apDevices, mac)
+	server.apMu.Unlock()
+
+	// Remove from persistent data
+	server.persistMu.Lock()
+	delete(server.persistentData.APDevices, mac)
+	server.persistMu.Unlock()
+
+	server.addLog("info", fmt.Sprintf("[AP] Device removed: %s (%s)", device.Hostname, device.MAC))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+// ============================================================================
+// BROWSER PROFILES API HANDLERS
+// ============================================================================
+
+// handleBrowserProfilesAPI returns all browser profiles
+func handleBrowserProfilesAPI(w http.ResponseWriter, r *http.Request) {
+	server.browserMu.RLock()
+	profiles := make([]*BrowserProfile, 0, len(server.browserProfiles))
+	for _, p := range server.browserProfiles {
+		// Add proxy name
+		p.ProxyName = server.getProxyName(p.ProxyIndex)
+		profiles = append(profiles, p)
+	}
+	server.browserMu.RUnlock()
+
+	// Sort by name
+	sort.Slice(profiles, func(i, j int) bool {
+		return profiles[i].Name < profiles[j].Name
+	})
+
+	// Count sessions today
+	sessionsToday := 0
+	today := time.Now().Truncate(24 * time.Hour)
+	server.persistMu.RLock()
+	totalSessions := len(server.persistentData.BrowserSessions)
+	for _, s := range server.persistentData.BrowserSessions {
+		if s.StartedAt.After(today) {
+			sessionsToday++
+		}
+	}
+	server.persistMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"profiles":       profiles,
+		"total_sessions": totalSessions,
+		"sessions_today": sessionsToday,
+	})
+}
+
+// handleCreateBrowserProfileAPI creates a new browser profile
+func handleCreateBrowserProfileAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Name       string `json:"name"`
+		ProxyIndex int    `json:"proxy_index"`
+		Color      string `json:"color"`
+		Notes      string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	if req.Name == "" {
+		http.Error(w, "Name is required", http.StatusBadRequest)
+		return
+	}
+
+	// Generate unique ID
+	id := fmt.Sprintf("bp-%d", time.Now().UnixNano())
+
+	// Get proxy string from pool
+	var upstreamProxy string
+	server.poolMu.Lock()
+	if req.ProxyIndex >= 0 && req.ProxyIndex < len(server.proxyPool) {
+		upstreamProxy = server.proxyPool[req.ProxyIndex]
+	}
+	server.poolMu.Unlock()
+
+	profile := &BrowserProfile{
+		ID:            id,
+		Name:          req.Name,
+		ProxyIndex:    req.ProxyIndex,
+		UpstreamProxy: upstreamProxy,
+		Color:         req.Color,
+		Notes:         req.Notes,
+		CreatedAt:     time.Now(),
+		CreatedBy:     "admin",
+	}
+
+	server.browserMu.Lock()
+	server.browserProfiles[id] = profile
+	server.browserMu.Unlock()
+
+	// Save to persistent data
+	server.persistMu.Lock()
+	if server.persistentData.BrowserProfiles == nil {
+		server.persistentData.BrowserProfiles = make(map[string]*BrowserProfile)
+	}
+	server.persistentData.BrowserProfiles[id] = profile
+	server.persistMu.Unlock()
+
+	server.savePersistentData()
+	server.addLog("info", fmt.Sprintf("[Browser] Profile created: %s", profile.Name))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"profile": profile,
+	})
+}
+
+// handleUpdateBrowserProfileAPI updates a browser profile
+func handleUpdateBrowserProfileAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		ProxyIndex int    `json:"proxy_index"`
+		Color      string `json:"color"`
+		Notes      string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	server.browserMu.Lock()
+	profile, exists := server.browserProfiles[req.ID]
+	if !exists {
+		server.browserMu.Unlock()
+		http.Error(w, "Profile not found", http.StatusNotFound)
+		return
+	}
+
+	if req.Name != "" {
+		profile.Name = req.Name
+	}
+	if req.ProxyIndex >= 0 {
+		profile.ProxyIndex = req.ProxyIndex
+		server.poolMu.Lock()
+		if req.ProxyIndex < len(server.proxyPool) {
+			profile.UpstreamProxy = server.proxyPool[req.ProxyIndex]
+		}
+		server.poolMu.Unlock()
+	}
+	if req.Color != "" {
+		profile.Color = req.Color
+	}
+	profile.Notes = req.Notes
+	server.browserMu.Unlock()
+
+	// Save to persistent data
+	server.persistMu.Lock()
+	if server.persistentData.BrowserProfiles == nil {
+		server.persistentData.BrowserProfiles = make(map[string]*BrowserProfile)
+	}
+	server.persistentData.BrowserProfiles[req.ID] = profile
+	server.persistMu.Unlock()
+
+	server.savePersistentData()
+	server.addLog("info", fmt.Sprintf("[Browser] Profile updated: %s", profile.Name))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"profile": profile,
+	})
+}
+
+// handleDeleteBrowserProfileAPI deletes a browser profile
+func handleDeleteBrowserProfileAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	server.browserMu.Lock()
+	profile, exists := server.browserProfiles[req.ID]
+	if !exists {
+		server.browserMu.Unlock()
+		http.Error(w, "Profile not found", http.StatusNotFound)
+		return
+	}
+
+	name := profile.Name
+	delete(server.browserProfiles, req.ID)
+	server.browserMu.Unlock()
+
+	// Remove from persistent data
+	server.persistMu.Lock()
+	delete(server.persistentData.BrowserProfiles, req.ID)
+	server.persistMu.Unlock()
+
+	server.savePersistentData()
+	server.addLog("info", fmt.Sprintf("[Browser] Profile deleted: %s", name))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+// handleBrowserSessionAPI logs a browser session start/stop or returns session list
+func handleBrowserSessionAPI(w http.ResponseWriter, r *http.Request) {
+	// GET - return list of sessions
+	if r.Method == http.MethodGet {
+		limit := 20
+		if l := r.URL.Query().Get("limit"); l != "" {
+			if n, err := strconv.Atoi(l); err == nil && n > 0 {
+				limit = n
+			}
+		}
+
+		server.persistMu.RLock()
+		sessions := server.persistentData.BrowserSessions
+		server.persistMu.RUnlock()
+
+		// Get profile names for each session
+		server.browserMu.RLock()
+		type SessionWithName struct {
+			BrowserSession
+			ProfileName string `json:"profile_name"`
+		}
+		result := make([]SessionWithName, 0)
+		// Return in reverse order (newest first)
+		start := len(sessions) - limit
+		if start < 0 {
+			start = 0
+		}
+		for i := len(sessions) - 1; i >= start; i-- {
+			s := sessions[i]
+			name := s.ProfileID
+			if p, ok := server.browserProfiles[s.ProfileID]; ok {
+				name = p.Name
+			}
+			result = append(result, SessionWithName{
+				BrowserSession: s,
+				ProfileName:    name,
 			})
 		}
+		server.browserMu.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
 		return
 	}
 
-	// Validate supervisor password
-	for _, s := range server.persistentData.Supervisors {
-		if s.Password == req.Password {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"valid": true,
-				"name":  s.Name,
-			})
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request - support both JSON and form data
+	var profileID, action, username string
+	var duration int64
+
+	contentType := r.Header.Get("Content-Type")
+	if strings.Contains(contentType, "application/x-www-form-urlencoded") {
+		r.ParseForm()
+		profileID = r.FormValue("profile_id")
+		action = r.FormValue("action")
+		username = r.FormValue("username")
+		if d := r.FormValue("duration"); d != "" {
+			duration, _ = strconv.ParseInt(d, 10, 64)
+		}
+	} else {
+		var req struct {
+			ProfileID string `json:"profile_id"`
+			Action    string `json:"action"`
+			Username  string `json:"username"`
+			Duration  int64  `json:"duration"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
+		profileID = req.ProfileID
+		action = req.Action
+		username = req.Username
+		duration = req.Duration
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"valid":   false,
-		"message": "Invalid supervisor password",
-	})
-}
-
-// handleAppConfirmConnection confirms that a device is connected to the correct proxy
-func handleAppConfirmConnection(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Method not allowed",
-		})
-		return
-	}
-
-	var req struct {
-		Username  string `json:"username"`
-		ProxyName string `json:"proxy_name"` // The proxy name the device claims to be using
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Invalid request",
-		})
-		return
-	}
-
-	if req.Username == "" {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Username required",
-		})
-		return
-	}
-
-	// Find the device
-	server.mu.Lock()
-	device, exists := server.devices[req.Username]
+	server.browserMu.Lock()
+	profile, exists := server.browserProfiles[profileID]
 	if !exists {
-		// Try by IP
-		clientIP := strings.Split(r.RemoteAddr, ":")[0]
-		device, exists = server.devices[clientIP]
-	}
-	server.mu.Unlock()
-
-	if !exists || device == nil {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Device not found. Please register first.",
-		})
+		server.browserMu.Unlock()
+		http.Error(w, "Profile not found", http.StatusNotFound)
 		return
 	}
 
-	// Get the expected proxy name for this device
-	server.poolMu.Lock()
-	proxyIndex := -1
-	for i, p := range server.proxyPool {
-		if p == device.UpstreamProxy {
-			proxyIndex = i
-			break
+	if action == "start" {
+		profile.LastUsedAt = time.Now()
+		profile.LastUsedBy = username
+		profile.SessionCount++
+
+		// Log session start
+		session := BrowserSession{
+			ID:        fmt.Sprintf("bs-%d", time.Now().UnixNano()),
+			ProfileID: profileID,
+			Username:  username,
+			StartedAt: time.Now(),
 		}
+
+		server.persistMu.Lock()
+		server.persistentData.BrowserSessions = append(server.persistentData.BrowserSessions, session)
+		// Keep only last 500 sessions
+		if len(server.persistentData.BrowserSessions) > 500 {
+			server.persistentData.BrowserSessions = server.persistentData.BrowserSessions[len(server.persistentData.BrowserSessions)-500:]
+		}
+		server.persistMu.Unlock()
+
+		server.addLog("info", fmt.Sprintf("[Browser] Session started: %s by %s", profile.Name, username))
+	} else if action == "stop" {
+		// Update last session with duration if available
+		if duration > 0 {
+			server.persistMu.Lock()
+			for i := len(server.persistentData.BrowserSessions) - 1; i >= 0; i-- {
+				s := &server.persistentData.BrowserSessions[i]
+				if s.ProfileID == profileID && s.Username == username && s.Duration == 0 {
+					s.EndedAt = time.Now()
+					s.Duration = duration
+					break
+				}
+			}
+			server.persistMu.Unlock()
+		}
+		server.addLog("info", fmt.Sprintf("[Browser] Session ended: %s by %s (duration: %ds)", profile.Name, username, duration))
 	}
-	server.poolMu.Unlock()
+	server.browserMu.Unlock()
 
-	expectedProxyName := server.getProxyName(proxyIndex)
-
-	// Verify the proxy matches (if proxy_name was provided)
-	if req.ProxyName != "" && req.ProxyName != expectedProxyName {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":        false,
-			"message":        fmt.Sprintf("Proxy mismatch! Expected %s but you reported %s", expectedProxyName, req.ProxyName),
-			"expected_proxy": expectedProxyName,
-		})
-		return
+	// Update persistent data
+	server.persistMu.Lock()
+	if server.persistentData.BrowserProfiles == nil {
+		server.persistentData.BrowserProfiles = make(map[string]*BrowserProfile)
 	}
+	server.persistentData.BrowserProfiles[profileID] = profile
+	server.persistMu.Unlock()
 
-	// Confirm the session
-	server.confirmDeviceSession(device)
+	server.savePersistentData()
 
-	// Get session timeout for response
-	server.persistMu.RLock()
-	sessionTimeout := server.persistentData.SystemSettings.SessionTimeout
-	server.persistMu.RUnlock()
-
-	clientIP := strings.Split(r.RemoteAddr, ":")[0]
-	log.Printf("✅ Device '%s' confirmed connection to %s (session: %dh)\n", req.Username, expectedProxyName, sessionTimeout)
-	server.addDeviceLog("info", "session", fmt.Sprintf("[SESSION CONFIRMED] %s confirmed connection to %s (valid for %dh)", req.Username, expectedProxyName, sessionTimeout), device)
-	server.addDeviceActivity(clientIP, "session_confirmed", fmt.Sprintf("Session confirmed via %s (valid for %dh)", expectedProxyName, sessionTimeout), true, expectedProxyName, "")
-
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":         true,
-		"confirmed":       true,
-		"message":         fmt.Sprintf("Connection confirmed! Session valid for %d hours.", sessionTimeout),
-		"proxy_name":      expectedProxyName,
-		"timeout_hours":   sessionTimeout,
-		"session_expires": device.SessionStart.Add(time.Duration(sessionTimeout) * time.Hour).Format(time.RFC3339),
+		"success": true,
 	})
 }
 
-// handleAppDeviceSettings returns the current device settings from the server
-// This allows the app to sync settings that were changed from the dashboard
-func handleAppDeviceSettings(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-App-Username")
+// handleClientDownload serves the Windows client executable or instructions
+func handleClientDownload(w http.ResponseWriter, r *http.Request) {
+	// Check if pre-built Windows client exists
+	clientPath := "lumier-client.exe"
+	if _, err := os.Stat(clientPath); err == nil {
+		// Serve the executable
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", "attachment; filename=lumier-client.exe")
+		http.ServeFile(w, r, clientPath)
 		return
 	}
 
-	if r.Method != http.MethodGet {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Method not allowed",
-		})
-		return
-	}
+	// Otherwise, serve instructions/bootstrap script
+	w.Header().Set("Content-Type", "text/plain")
+	instructions := `# Lumier Browser Profile Client - Setup Instructions
 
-	// Get username from query params or header
-	username := r.URL.Query().Get("username")
-	if username == "" {
-		username = r.Header.Get("X-App-Username")
-	}
+## Option 1: Download Pre-built Client
 
-	if username == "" {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Username required",
-		})
-		return
-	}
+If your administrator has compiled the client, download it from:
+` + fmt.Sprintf("%s/lumier-client.exe", r.Host) + `
 
-	// Look up device config
-	server.persistMu.RLock()
-	cfg, hasCfg := server.persistentData.DeviceConfigs[username]
-	sessionTimeout := server.persistentData.SystemSettings.SessionTimeout
-	server.persistMu.RUnlock()
+## Option 2: Build from Source (Requires Go)
 
-	if sessionTimeout <= 0 {
-		sessionTimeout = 2
-	}
+1. Install Go: https://go.dev/dl/
+2. Download the client source code from your administrator
+3. Build for Windows:
+   go build -o lumier-client.exe .
+4. Run lumier-client.exe
 
-	if !hasCfg {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"message": "Device not registered",
-		})
-		return
-	}
+## Option 3: Use PowerShell Script
 
-	// Get proxy name
-	proxyName := server.getProxyName(cfg.ProxyIndex)
+Save this as "lumier-launcher.ps1" and run with PowerShell:
 
-	// Check device session status
-	server.mu.RLock()
-	device := server.findDeviceByUsername(username)
-	var sessionValid bool
-	var sessionExpires string
-	if device != nil {
-		sessionValid = server.isDeviceSessionValid(device)
-		if device.Confirmed && !device.SessionStart.IsZero() {
-			sessionExpires = device.SessionStart.Add(time.Duration(sessionTimeout) * time.Hour).Format(time.RFC3339)
+$ServerURL = "` + "http://" + r.Host + `"
+$ProfilesURL = "$ServerURL/api/browser-profiles"
+
+# Fetch profiles
+$response = Invoke-RestMethod -Uri $ProfilesURL
+$profiles = $response.profiles
+
+if ($profiles.Count -eq 0) {
+    Write-Host "No profiles found on server"
+    exit
+}
+
+Write-Host "Available Profiles:"
+for ($i = 0; $i -lt $profiles.Count; $i++) {
+    Write-Host "  [$($i+1)] $($profiles[$i].name) - $($profiles[$i].proxy_name)"
+}
+
+$choice = Read-Host "Select profile number"
+$idx = [int]$choice - 1
+$profile = $profiles[$idx]
+
+# Launch Firefox with proxy
+$proxyParts = $profile.upstream_proxy -split ":"
+$proxyHost = $proxyParts[0]
+$proxyPort = $proxyParts[1]
+
+# Create Firefox profile directory
+$profileDir = "$env:APPDATA\LumierClient\profiles\$($profile.id)"
+New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+
+# Write Firefox preferences
+$prefs = @"
+user_pref("network.proxy.type", 1);
+user_pref("network.proxy.socks", "$proxyHost");
+user_pref("network.proxy.socks_port", $proxyPort);
+user_pref("network.proxy.socks_version", 5);
+user_pref("network.proxy.socks_remote_dns", true);
+user_pref("media.peerconnection.enabled", false);
+"@
+$prefs | Out-File "$profileDir\user.js" -Encoding ascii
+
+# Find Firefox
+$firefox = "$env:ProgramFiles\Mozilla Firefox\firefox.exe"
+if (-not (Test-Path $firefox)) {
+    $firefox = "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe"
+}
+
+Write-Host "Launching Firefox with profile: $($profile.name)"
+& $firefox -profile $profileDir -no-remote
+
+Write-Host "Session ended"
+
+---
+
+For best results, use the compiled Go client (lumier-client.exe).
+Contact your administrator for the pre-built executable.
+`
+	fmt.Fprint(w, instructions)
+}
+
+// handleBrowserProfilesPage serves the browser profiles management page
+func handleBrowserProfilesPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write(browserProfilesPageHTML)
+}
+
+// ============================================================================
+// CLIENT API HANDLERS (No auth required - for Windows client app)
+
+// handleClientProfilesAPI returns approved devices for the Windows client (no auth)
+func handleClientProfilesAPI(w http.ResponseWriter, r *http.Request) {
+	devices := make([]ClientDevice, 0)
+
+	// Get browser profiles (primary method for Windows client)
+	server.browserMu.RLock()
+	for _, p := range server.browserProfiles {
+		if p.UpstreamProxy != "" {
+			devices = append(devices, ClientDevice{
+				ID:            p.ID, // bp-xxx format
+				Name:          p.Name,
+				ProxyIndex:    p.ProxyIndex,
+				ProxyName:     p.ProxyName,
+				UpstreamProxy: p.UpstreamProxy,
+				DeviceType:    "browser",
+			})
 		}
 	}
-	server.mu.RUnlock()
+	server.browserMu.RUnlock()
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":          true,
-		"username":         username,
-		"proxy_index":      cfg.ProxyIndex,
-		"proxy_name":       proxyName,
-		"custom_name":      cfg.CustomName,
-		"group":            cfg.Group,
-		"notes":            cfg.Notes,
-		"session_valid":    sessionValid,
-		"session_timeout":  sessionTimeout,
-		"session_expires":  sessionExpires,
+	// Get AP devices (confirmed only) - for backward compatibility
+	server.apMu.RLock()
+	for _, d := range server.apDevices {
+		if d.Confirmed && d.UpstreamProxy != "" {
+			name := d.CustomName
+			if name == "" {
+				name = d.Hostname
+			}
+			if name == "" {
+				name = d.MAC
+			}
+			devices = append(devices, ClientDevice{
+				ID:            d.MAC,
+				Name:          name,
+				ProxyIndex:    d.ProxyIndex,
+				ProxyName:     server.getProxyName(d.ProxyIndex),
+				UpstreamProxy: d.UpstreamProxy,
+				Group:         d.Group,
+				DeviceType:    "ap",
+			})
+		}
+	}
+	server.apMu.RUnlock()
+
+	// Sort by name
+	sort.Slice(devices, func(i, j int) bool {
+		return devices[i].Name < devices[j].Name
 	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"devices": devices,
+	})
+}
+
+// handleClientSessionAPI logs sessions from the Windows client (no auth)
+func handleClientSessionAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	r.ParseForm()
+	deviceID := r.FormValue("device_id")
+	deviceName := r.FormValue("device_name")
+	proxyName := r.FormValue("proxy_name")
+	action := r.FormValue("action")
+	username := r.FormValue("username")
+	duration, _ := strconv.ParseInt(r.FormValue("duration"), 10, 64)
+
+	if deviceID == "" || username == "" {
+		http.Error(w, "device_id and username required", http.StatusBadRequest)
+		return
+	}
+
+	if action == "start" {
+		session := BrowserSession{
+			ID:         fmt.Sprintf("bs-%d", time.Now().UnixNano()),
+			ProfileID:  deviceID, // Using ProfileID field to store device ID
+			DeviceName: deviceName,
+			ProxyName:  proxyName,
+			Username:   username,
+			StartedAt:  time.Now(),
+		}
+
+		server.persistMu.Lock()
+		server.persistentData.BrowserSessions = append(server.persistentData.BrowserSessions, session)
+		if len(server.persistentData.BrowserSessions) > 500 {
+			server.persistentData.BrowserSessions = server.persistentData.BrowserSessions[len(server.persistentData.BrowserSessions)-500:]
+		}
+		server.persistMu.Unlock()
+
+		server.addLog("info", fmt.Sprintf("[Browser Client] %s started session with device '%s' (proxy: %s)", username, deviceName, proxyName))
+	} else if action == "stop" {
+		if duration > 0 {
+			server.persistMu.Lock()
+			for i := len(server.persistentData.BrowserSessions) - 1; i >= 0; i-- {
+				s := &server.persistentData.BrowserSessions[i]
+				if s.ProfileID == deviceID && s.Username == username && s.Duration == 0 {
+					s.EndedAt = time.Now()
+					s.Duration = duration
+					break
+				}
+			}
+			server.persistMu.Unlock()
+		}
+		server.addLog("info", fmt.Sprintf("[Browser Client] %s ended session with device '%s' (duration: %ds)", username, deviceName, duration))
+	}
+
+	server.savePersistentData()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
 // handleBulkImportProxiesAPI imports multiple proxies at once
@@ -3136,13 +1404,16 @@ func handleDiagnosticsAPI(w http.ResponseWriter, r *http.Request) {
 		return proxyDiagnostics[i]["index"].(int) < proxyDiagnostics[j]["index"].(int)
 	})
 
-	// Collect device health summary
-	server.mu.RLock()
+	// Collect device health summary from AP devices
+	server.apMu.RLock()
 	var activeDevices, inactiveDevices, errorDevices int
 	var totalDeviceRequests, totalDeviceErrors int64
 	deviceHealthSummary := make([]map[string]interface{}, 0)
 
-	for _, device := range server.devices {
+	for _, device := range server.apDevices {
+		if !device.Confirmed {
+			continue // Skip unconfirmed devices
+		}
 		isActive := time.Since(device.LastSeen) < 5*time.Minute
 		if isActive {
 			activeDevices++
@@ -3156,8 +1427,7 @@ func handleDiagnosticsAPI(w http.ResponseWriter, r *http.Request) {
 		totalDeviceErrors += device.ErrorCount
 
 		// Get proxy name for this device
-		proxyIdx := server.getProxyIndexByString(device.UpstreamProxy)
-		proxyName := server.getProxyName(proxyIdx)
+		proxyName := server.getProxyName(device.ProxyIndex)
 
 		// Calculate device error rate
 		var errorRate float64
@@ -3165,9 +1435,14 @@ func handleDiagnosticsAPI(w http.ResponseWriter, r *http.Request) {
 			errorRate = float64(device.ErrorCount) / float64(device.RequestCount) * 100
 		}
 
+		name := device.CustomName
+		if name == "" {
+			name = device.Hostname
+		}
+
 		deviceHealthSummary = append(deviceHealthSummary, map[string]interface{}{
-			"username":      device.Username,
-			"name":          device.CustomName,
+			"mac":           device.MAC,
+			"name":          name,
 			"ip":            device.IP,
 			"proxy_name":    proxyName,
 			"request_count": device.RequestCount,
@@ -3180,7 +1455,7 @@ func handleDiagnosticsAPI(w http.ResponseWriter, r *http.Request) {
 			"last_error":    device.LastError,
 		})
 	}
-	server.mu.RUnlock()
+	server.apMu.RUnlock()
 
 	// Sort devices by request count (most active first)
 	sort.Slice(deviceHealthSummary, func(i, j int) bool {
@@ -3237,144 +1512,6 @@ func handleTrafficHistoryAPI(w http.ResponseWriter, r *http.Request) {
 	server.persistMu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(history)
-}
-
-func handleChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req changeProxyRequest
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	// Find device by IP (the UI sends IP as device identifier)
-	server.mu.Lock()
-	device := server.findDeviceByIP(req.DeviceIP)
-	server.mu.Unlock()
-	if device == nil {
-		http.Error(w, "device not found", http.StatusNotFound)
-		return
-	}
-	server.poolMu.Lock()
-	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
-		server.poolMu.Unlock()
-		http.Error(w, "invalid proxy index", http.StatusBadRequest)
-		return
-	}
-	newProxy := server.proxyPool[req.ProxyIndex]
-	server.poolMu.Unlock()
-
-	server.mu.Lock()
-	device.UpstreamProxy = newProxy
-	device.LastSeen = time.Now()
-	server.mu.Unlock()
-
-	go server.saveDeviceConfig(device)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
-}
-
-func handleUpdateDeviceAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req updateDeviceRequest
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	// Find device by IP (the UI sends IP as device identifier)
-	server.mu.Lock()
-	device := server.findDeviceByIP(req.DeviceIP)
-	if device == nil {
-		server.mu.Unlock()
-		http.Error(w, "device not found", http.StatusNotFound)
-		return
-	}
-
-	// Get old key for re-keying if username changes
-	oldKey := device.Username
-
-	// Update device fields
-	device.CustomName = req.CustomName
-	device.Group = req.Group
-	device.Notes = req.Notes
-
-	// Handle username change
-	newUsername := strings.TrimSpace(req.Username)
-	usernameChanged := device.Username != newUsername
-
-	if usernameChanged {
-		// Remove device from old key
-		delete(server.devices, oldKey)
-
-		// Update username and name
-		device.Username = newUsername
-		if newUsername != "" {
-			device.Name = newUsername
-		} else {
-			device.Name = fmt.Sprintf("Anonymous-%s", device.IP)
-		}
-
-		// Add device with new key
-		newKey := newUsername
-		if newKey == "" {
-			newKey = device.IP
-		}
-		server.devices[newKey] = device
-	}
-	server.mu.Unlock()
-
-	// Update persistent data for username only
-	server.persistMu.Lock()
-	if usernameChanged && oldKey != "" {
-		delete(server.persistentData.DeviceConfigs, oldKey)
-	}
-	server.persistMu.Unlock()
-
-	go server.saveDeviceConfig(device)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
-}
-
-func handleBulkChangeProxyAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req bulkChangeProxyRequest
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	server.poolMu.Lock()
-	if req.ProxyIndex < 0 || req.ProxyIndex >= len(server.proxyPool) {
-		server.poolMu.Unlock()
-		http.Error(w, "invalid proxy index", http.StatusBadRequest)
-		return
-	}
-	newProxy := server.proxyPool[req.ProxyIndex]
-	server.poolMu.Unlock()
-
-	updated := 0
-	for _, ip := range req.DeviceIPs {
-		server.mu.Lock()
-		device := server.findDeviceByIP(ip)
-		if device != nil {
-			device.UpstreamProxy = newProxy
-			updated++
-			server.mu.Unlock()
-			go server.saveDeviceConfig(device)
-		} else {
-			server.mu.Unlock()
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "updated": updated})
 }
 
 func handleGroupsAPI(w http.ResponseWriter, r *http.Request) {
@@ -3446,14 +1583,14 @@ func handleDeleteGroupAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	server.persistMu.Unlock()
-	// Also update in-memory devices
-	server.mu.Lock()
-	for _, device := range server.devices {
+	// Also update in-memory AP devices
+	server.apMu.Lock()
+	for _, device := range server.apDevices {
 		if device.Group == req.GroupName {
 			device.Group = "Default"
 		}
 	}
-	server.mu.Unlock()
+	server.apMu.Unlock()
 	go server.savePersistentData()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "deleted": deleted})
@@ -3520,18 +1657,18 @@ func handleDeleteProxyAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid proxy index", http.StatusBadRequest)
 		return
 	}
-	// Check if any devices are using this proxy
+	// Check if any AP devices are using this proxy
 	deletedProxy := server.proxyPool[req.ProxyIndex]
 	server.poolMu.Unlock()
 
-	server.mu.RLock()
+	server.apMu.RLock()
 	devicesUsingProxy := 0
-	for _, device := range server.devices {
+	for _, device := range server.apDevices {
 		if device.UpstreamProxy == deletedProxy {
 			devicesUsingProxy++
 		}
 	}
-	server.mu.RUnlock()
+	server.apMu.RUnlock()
 
 	if devicesUsingProxy > 0 {
 		http.Error(w, fmt.Sprintf("Cannot delete: %d device(s) are using this proxy. Reassign them first.", devicesUsingProxy), http.StatusBadRequest)
@@ -3576,80 +1713,13 @@ func handleDeleteProxyAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "deleted": true})
 }
 
-func handleDeleteDeviceAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req deleteDeviceRequest
-	if json.NewDecoder(r.Body).Decode(&req) != nil || (req.DeviceIP == "" && req.Username == "") {
-		http.Error(w, "invalid request - need device_ip or username", http.StatusBadRequest)
-		return
-	}
-
-	// Find device - prefer username lookup for accuracy
-	server.mu.Lock()
-	var device *Device
-	var deviceKey string
-
-	if req.Username != "" {
-		// Try by username first (most accurate)
-		device = server.findDeviceByUsername(req.Username)
-		if device != nil {
-			deviceKey = req.Username
-		}
-	}
-
-	if device == nil && req.DeviceIP != "" {
-		// Fall back to IP lookup
-		device = server.findDeviceByIP(req.DeviceIP)
-		if device != nil {
-			if device.Username != "" {
-				deviceKey = device.Username
-			} else {
-				deviceKey = device.IP
-			}
-		}
-	}
-
-	exists := device != nil
-	if device != nil {
-		delete(server.devices, deviceKey)
-	}
-	server.mu.Unlock()
-
-	// Delete from persistent data
-	server.persistMu.Lock()
-	if req.Username != "" {
-		delete(server.persistentData.DeviceConfigs, req.Username)
-	} else if device != nil && device.Username != "" {
-		delete(server.persistentData.DeviceConfigs, device.Username)
-	}
-	server.persistMu.Unlock()
-
-	go server.savePersistentData()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "deleted": exists})
-}
-
-func saveProxyPool() {
-	server.poolMu.Lock()
-	defer server.poolMu.Unlock()
-	var lines []string
-	for _, proxy := range server.proxyPool {
-		lines = append(lines, proxy)
-	}
-	content := strings.Join(lines, "\n")
-	os.WriteFile("proxies.txt", []byte(content), 0644)
-}
-
 func handleExportAPI(w http.ResponseWriter, r *http.Request) {
-	server.mu.RLock()
-	devices := make([]*Device, 0)
-	for _, d := range server.devices {
+	server.apMu.RLock()
+	devices := make([]*APDevice, 0)
+	for _, d := range server.apDevices {
 		devices = append(devices, d)
 	}
-	server.mu.RUnlock()
+	server.apMu.RUnlock()
 	server.healthMu.RLock()
 	healthData := make([]*ProxyHealth, 0)
 	for _, h := range server.proxyHealth {
@@ -3705,6 +1775,11 @@ func handleActivityPage(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(activityPageHTML))
 }
 
+func handleDeviceMonitorPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write(deviceMonitorPageHTML)
+}
+
 func handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(settingsPageHTML))
@@ -3723,19 +1798,19 @@ func handleSystemStatsAPI(w http.ResponseWriter, r *http.Request) {
 	cpuUsage := server.cpuUsage
 	server.cpuMu.RUnlock()
 
-	server.mu.RLock()
+	server.apMu.RLock()
 	var totalBytesIn, totalBytesOut, totalRequests int64
 	activeDevices := 0
-	for _, d := range server.devices {
+	for _, d := range server.apDevices {
 		totalBytesIn += d.BytesIn
 		totalBytesOut += d.BytesOut
 		totalRequests += d.RequestCount
-		if time.Since(d.LastSeen) < 5*time.Minute {
+		if d.Confirmed && time.Since(d.LastSeen) < 5*time.Minute {
 			activeDevices++
 		}
 	}
-	totalDevices := len(server.devices)
-	server.mu.RUnlock()
+	totalDevices := len(server.apDevices)
+	server.apMu.RUnlock()
 
 	uptime := time.Since(server.startTime)
 
@@ -3755,23 +1830,6 @@ func handleSystemStatsAPI(w http.ResponseWriter, r *http.Request) {
 		"active_devices":   activeDevices,
 		"total_proxies":    len(server.proxyPool),
 	})
-}
-
-func formatUptime(d time.Duration) string {
-	days := int(d.Hours()) / 24
-	hours := int(d.Hours()) % 24
-	mins := int(d.Minutes()) % 60
-	secs := int(d.Seconds()) % 60
-	if days > 0 {
-		return fmt.Sprintf("%dd %dh %dm %ds", days, hours, mins, secs)
-	}
-	if hours > 0 {
-		return fmt.Sprintf("%dh %dm %ds", hours, mins, secs)
-	}
-	if mins > 0 {
-		return fmt.Sprintf("%dm %ds", mins, secs)
-	}
-	return fmt.Sprintf("%ds", secs)
 }
 
 func handleLogsAPI(w http.ResponseWriter, r *http.Request) {
@@ -3853,18 +1911,17 @@ func handleActivityLogAPI(w http.ResponseWriter, r *http.Request) {
 	// Get all logs (up to 1000)
 	allLogs := server.getLogs(1000)
 
-	// Build a set of registered device usernames/IPs for filtering
+	// Build a set of registered device IPs/MACs for filtering
 	registeredDevices := make(map[string]bool)
 	if registeredOnly {
-		server.mu.RLock()
-		for key, device := range server.devices {
-			registeredDevices[key] = true
-			registeredDevices[device.IP] = true
-			if device.Username != "" {
-				registeredDevices[device.Username] = true
+		server.apMu.RLock()
+		for _, device := range server.apDevices {
+			if device.Confirmed {
+				registeredDevices[device.MAC] = true
+				registeredDevices[device.IP] = true
 			}
 		}
-		server.mu.RUnlock()
+		server.apMu.RUnlock()
 	}
 
 	// Build response with filtering
@@ -4202,141 +2259,111 @@ func handleSessionSettingsAPI(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }
 
-// TrustScoreResult contains the fraud score and risk assessment for an IP from a single source
-type TrustScoreResult struct {
-	Score     int    `json:"score"`     // 0-100, lower is better (less risky)
-	Risk      string `json:"risk"`      // "low", "medium", "high", "very high"
-	Available bool   `json:"available"` // Whether score could be fetched
-	Error     string `json:"error"`     // Error message if fetch failed
-}
+// IPQS API Key - IPQualityScore.com
+const ipqsAPIKey = "NukTNg3uaNw1R565afWGc9i2ebC"
 
-// CombinedTrustScore contains fraud scores from multiple sources
-type CombinedTrustScore struct {
-	Scamalytics    TrustScoreResult `json:"scamalytics"`
-	IPQualityScore TrustScoreResult `json:"ipqualityscore"`
-}
-
-// createBrowserRequest creates an HTTP request with realistic browser headers
-func createBrowserRequest(url string) (*http.Request, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// Set comprehensive browser headers to avoid bot detection
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("Sec-Ch-Ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-
-	return req, nil
-}
-
-// getRiskLevel returns the risk level string based on score (0-100, lower is better)
-func getRiskLevel(score int) string {
-	switch {
-	case score <= 25:
-		return "low"
-	case score <= 50:
-		return "medium"
-	case score <= 75:
-		return "high"
-	default:
-		return "very high"
-	}
-}
-
-// getScamalyticsScore fetches the fraud score from Scamalytics for an IP
-func getScamalyticsScore(ip string) TrustScoreResult {
+// getIPQSScore fetches fraud data from IPQualityScore API
+func getIPQSScore(ip string) IPQSResult {
 	// Validate IP format
 	if net.ParseIP(ip) == nil {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "invalid IP"}
+		return IPQSResult{Available: false, Error: "invalid IP"}
 	}
 
-	// Create HTTP client with timeout and follow redirects
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-	}
+	// Create HTTP client with timeout
+	client := &http.Client{Timeout: 15 * time.Second}
 
-	// Fetch the Scamalytics page
-	url := "https://scamalytics.com/ip/" + ip
-	req, err := createBrowserRequest(url)
+	// IPQS API endpoint
+	apiURL := fmt.Sprintf("https://www.ipqualityscore.com/api/json/ip/%s/%s?strictness=1&allow_public_access_points=true",
+		ipqsAPIKey, ip)
+
+	resp, err := client.Get(apiURL)
 	if err != nil {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "request error"}
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "fetch error"}
+		return IPQSResult{Available: false, Error: "fetch error"}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "status " + strconv.Itoa(resp.StatusCode)}
+		return IPQSResult{Available: false, Error: "HTTP " + strconv.Itoa(resp.StatusCode)}
 	}
 
-	// Read response body (handle gzip if needed)
-	var body []byte
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		reader, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			body, _ = io.ReadAll(resp.Body)
-		} else {
-			defer reader.Close()
-			body, err = io.ReadAll(reader)
-			if err != nil {
-				return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "gzip read error"}
-			}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return IPQSResult{Available: false, Error: "read error"}
+	}
+
+	// Parse IPQS response
+	var ipqsResp struct {
+		Success        bool    `json:"success"`
+		Message        string  `json:"message"`
+		FraudScore     float64 `json:"fraud_score"`
+		CountryCode    string  `json:"country_code"`
+		City           string  `json:"city"`
+		ISP            string  `json:"ISP"`
+		ASN            int     `json:"ASN"`
+		Organization   string  `json:"organization"`
+		Proxy          bool    `json:"proxy"`
+		VPN            bool    `json:"vpn"`
+		TOR            bool    `json:"tor"`
+		ActiveVPN      bool    `json:"active_vpn"`
+		ActiveTOR      bool    `json:"active_tor"`
+		RecentAbuse    bool    `json:"recent_abuse"`
+		BotStatus      bool    `json:"bot_status"`
+		ConnectionType string  `json:"connection_type"`
+		AbuseVelocity  string  `json:"abuse_velocity"`
+		IsCrawler      bool    `json:"is_crawler"`
+		Mobile         bool    `json:"mobile"`
+		Host           string  `json:"host"`
+	}
+
+	if err := json.Unmarshal(body, &ipqsResp); err != nil {
+		return IPQSResult{Available: false, Error: "parse error"}
+	}
+
+	if !ipqsResp.Success {
+		errMsg := ipqsResp.Message
+		if errMsg == "" {
+			errMsg = "API error"
 		}
-	} else {
-		body, err = io.ReadAll(resp.Body)
-		if err != nil {
-			return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "read error"}
-		}
+		return IPQSResult{Available: false, Error: errMsg}
 	}
 
-	html := string(body)
-	score := -1
-
-	// Try to find score using various patterns from Scamalytics HTML
-	patterns := []string{
-		`(?i)fraud\s*score[:\s]*(\d+)`,
-		`class="score"[^>]*>(\d+)<`,
-		`data-score="(\d+)"`,
-		`<div[^>]*score[^>]*>(\d+)</div>`,
-		`>(\d+)</div>\s*<div[^>]*class="[^"]*score`,
-		`(?i)score[^>]*>\s*(\d+)\s*<`,
+	// Calculate risk level
+	score := int(ipqsResp.FraudScore)
+	risk := "low"
+	if score >= 90 {
+		risk = "very high"
+	} else if score >= 75 {
+		risk = "high"
+	} else if score >= 50 {
+		risk = "medium"
 	}
 
-	for _, pattern := range patterns {
-		re := regexp.MustCompile(pattern)
-		matches := re.FindStringSubmatch(html)
-		if len(matches) > 1 {
-			if s, err := strconv.Atoi(matches[1]); err == nil && s >= 0 && s <= 100 {
-				score = s
-				break
-			}
-		}
+	return IPQSResult{
+		Available:      true,
+		FraudScore:     score,
+		Risk:           risk,
+		CountryCode:    ipqsResp.CountryCode,
+		City:           ipqsResp.City,
+		ISP:            ipqsResp.ISP,
+		ASN:            ipqsResp.ASN,
+		Organization:   ipqsResp.Organization,
+		Proxy:          ipqsResp.Proxy,
+		VPN:            ipqsResp.VPN,
+		TOR:            ipqsResp.TOR,
+		ActiveVPN:      ipqsResp.ActiveVPN,
+		ActiveTOR:      ipqsResp.ActiveTOR,
+		RecentAbuse:    ipqsResp.RecentAbuse,
+		BotStatus:      ipqsResp.BotStatus,
+		ConnectionType: ipqsResp.ConnectionType,
+		AbuseVelocity:  ipqsResp.AbuseVelocity,
+		IsCrawler:      ipqsResp.IsCrawler,
+		Mobile:         ipqsResp.Mobile,
+		Host:           ipqsResp.Host,
 	}
-
-	if score == -1 {
-		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "parse error"}
-	}
-
-	return TrustScoreResult{Score: score, Risk: getRiskLevel(score), Available: true}
 }
 
 // getIPQualityScore fetches the fraud score from IPQualityScore for an IP
+// Falls back to ip-api.com for basic proxy/VPN detection
 func getIPQualityScore(ip string) TrustScoreResult {
 	// Validate IP format
 	if net.ParseIP(ip) == nil {
@@ -4348,9 +2375,9 @@ func getIPQualityScore(ip string) TrustScoreResult {
 		Timeout: 15 * time.Second,
 	}
 
-	// Fetch the IPQualityScore page
-	url := "https://www.ipqualityscore.com/free-ip-lookup-proxy-vpn-test/lookup/" + ip
-	req, err := createBrowserRequest(url)
+	// Try ip-api.com first (free, no auth needed, includes proxy detection)
+	apiURL := "http://ip-api.com/json/" + ip + "?fields=status,proxy,hosting,query"
+	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "request error"}
 	}
@@ -4365,78 +2392,66 @@ func getIPQualityScore(ip string) TrustScoreResult {
 		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "status " + strconv.Itoa(resp.StatusCode)}
 	}
 
-	// Read response body (handle gzip if needed)
-	var body []byte
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		reader, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			body, _ = io.ReadAll(resp.Body)
-		} else {
-			defer reader.Close()
-			body, err = io.ReadAll(reader)
-			if err != nil {
-				return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "gzip read error"}
-			}
-		}
-	} else {
-		body, err = io.ReadAll(resp.Body)
-		if err != nil {
-			return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "read error"}
-		}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "read error"}
 	}
 
-	html := string(body)
-	score := -1
-
-	// Try to find fraud score from IPQualityScore HTML
-	// They typically show "Fraud Score: XX" or similar
-	patterns := []string{
-		`(?i)fraud\s*score[:\s]*(\d+)`,
-		`(?i)risk\s*score[:\s]*(\d+)`,
-		`"fraud_score"[:\s]*(\d+)`,
-		`data-fraud-score="(\d+)"`,
-		`>(\d+)%</span>\s*(?i)fraud`,
-		`(?i)score[^>]*>(\d+)%<`,
+	// Parse JSON response
+	var result struct {
+		Status  string `json:"status"`
+		Proxy   bool   `json:"proxy"`
+		Hosting bool   `json:"hosting"`
+		Query   string `json:"query"`
 	}
 
-	for _, pattern := range patterns {
-		re := regexp.MustCompile(pattern)
-		matches := re.FindStringSubmatch(html)
-		if len(matches) > 1 {
-			if s, err := strconv.Atoi(matches[1]); err == nil && s >= 0 && s <= 100 {
-				score = s
-				break
-			}
-		}
-	}
-
-	if score == -1 {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "parse error"}
 	}
 
-	return TrustScoreResult{Score: score, Risk: getRiskLevel(score), Available: true}
+	if result.Status != "success" {
+		return TrustScoreResult{Score: -1, Risk: "unknown", Available: false, Error: "lookup failed"}
+	}
+
+	// Calculate a score based on proxy/hosting flags
+	// proxy=true or hosting=true indicates higher risk
+	score := 0
+	risk := "low"
+	if result.Proxy {
+		score = 75 // Known proxy
+		risk = "high"
+	} else if result.Hosting {
+		score = 50 // Datacenter/hosting IP
+		risk = "medium"
+	} else {
+		score = 10 // Residential IP
+		risk = "low"
+	}
+
+	return TrustScoreResult{Score: score, Risk: risk, Available: true}
 }
 
 // getCombinedTrustScore fetches fraud scores from both Scamalytics and IPQualityScore
 func getCombinedTrustScore(ip string) CombinedTrustScore {
 	// Fetch from both sources concurrently
-	var scamResult, ipqsResult TrustScoreResult
+	var ipqsDetailedResult IPQSResult
+	var ipAPIResult TrustScoreResult
 	var wg sync.WaitGroup
 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		scamResult = getScamalyticsScore(ip)
+		ipqsDetailedResult = getIPQSScore(ip)
 	}()
 	go func() {
 		defer wg.Done()
-		ipqsResult = getIPQualityScore(ip)
+		ipAPIResult = getIPQualityScore(ip) // IP-API fallback
 	}()
 	wg.Wait()
 
 	return CombinedTrustScore{
-		Scamalytics:    scamResult,
-		IPQualityScore: ipqsResult,
+		IPQS:           ipqsDetailedResult,
+		IPQualityScore: ipAPIResult,
 	}
 }
 
@@ -4475,35 +2490,21 @@ func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
 		return proxies[i].Index < proxies[j].Index
 	})
 
-	// Check each proxy IP for trust score from both sources
+	// Check each proxy IP for trust score
 	results := make([]map[string]interface{}, 0)
-	scamLowRisk, scamMedRisk, scamHighRisk := 0, 0, 0
 	ipqsLowRisk, ipqsMedRisk, ipqsHighRisk := 0, 0, 0
-	scamTotalScore, ipqsTotalScore := 0, 0
-	scamScoredCount, ipqsScoredCount := 0, 0
+	ipqsTotalScore := 0
+	ipqsScoredCount := 0
+	proxyCount, vpnCount, torCount := 0, 0, 0
 
 	for _, p := range proxies {
 		combined := getCombinedTrustScore(p.IPAddress)
 
-		// Track Scamalytics stats
-		if combined.Scamalytics.Available {
-			scamTotalScore += combined.Scamalytics.Score
-			scamScoredCount++
-			switch combined.Scamalytics.Risk {
-			case "low":
-				scamLowRisk++
-			case "medium":
-				scamMedRisk++
-			case "high", "very high":
-				scamHighRisk++
-			}
-		}
-
-		// Track IPQualityScore stats
-		if combined.IPQualityScore.Available {
-			ipqsTotalScore += combined.IPQualityScore.Score
+		// Track IPQS stats
+		if combined.IPQS.Available {
+			ipqsTotalScore += combined.IPQS.FraudScore
 			ipqsScoredCount++
-			switch combined.IPQualityScore.Risk {
+			switch combined.IPQS.Risk {
 			case "low":
 				ipqsLowRisk++
 			case "medium":
@@ -4511,18 +2512,45 @@ func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
 			case "high", "very high":
 				ipqsHighRisk++
 			}
+			if combined.IPQS.Proxy {
+				proxyCount++
+			}
+			if combined.IPQS.VPN {
+				vpnCount++
+			}
+			if combined.IPQS.TOR {
+				torCount++
+			}
 		}
 
 		results = append(results, map[string]interface{}{
 			"index":      p.Index,
 			"name":       p.Name,
 			"ip_address": p.IPAddress,
-			"scamalytics": map[string]interface{}{
-				"score":     combined.Scamalytics.Score,
-				"risk":      combined.Scamalytics.Risk,
-				"available": combined.Scamalytics.Available,
-				"error":     combined.Scamalytics.Error,
+			"ipqs": map[string]interface{}{
+				"available":       combined.IPQS.Available,
+				"error":           combined.IPQS.Error,
+				"fraud_score":     combined.IPQS.FraudScore,
+				"risk":            combined.IPQS.Risk,
+				"country_code":    combined.IPQS.CountryCode,
+				"city":            combined.IPQS.City,
+				"isp":             combined.IPQS.ISP,
+				"asn":             combined.IPQS.ASN,
+				"organization":    combined.IPQS.Organization,
+				"proxy":           combined.IPQS.Proxy,
+				"vpn":             combined.IPQS.VPN,
+				"tor":             combined.IPQS.TOR,
+				"active_vpn":      combined.IPQS.ActiveVPN,
+				"active_tor":      combined.IPQS.ActiveTOR,
+				"recent_abuse":    combined.IPQS.RecentAbuse,
+				"bot_status":      combined.IPQS.BotStatus,
+				"connection_type": combined.IPQS.ConnectionType,
+				"abuse_velocity":  combined.IPQS.AbuseVelocity,
+				"is_crawler":      combined.IPQS.IsCrawler,
+				"mobile":          combined.IPQS.Mobile,
+				"host":            combined.IPQS.Host,
 			},
+			// Legacy field for backward compatibility
 			"ipqualityscore": map[string]interface{}{
 				"score":     combined.IPQualityScore.Score,
 				"risk":      combined.IPQualityScore.Risk,
@@ -4532,10 +2560,6 @@ func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	scamAvgScore := -1
-	if scamScoredCount > 0 {
-		scamAvgScore = scamTotalScore / scamScoredCount
-	}
 	ipqsAvgScore := -1
 	if ipqsScoredCount > 0 {
 		ipqsAvgScore = ipqsTotalScore / ipqsScoredCount
@@ -4544,19 +2568,15 @@ func handleCheckBlacklistAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":       true,
 		"total_checked": len(proxies),
-		"scamalytics": map[string]interface{}{
-			"low_risk_count":    scamLowRisk,
-			"medium_risk_count": scamMedRisk,
-			"high_risk_count":   scamHighRisk,
-			"average_score":     scamAvgScore,
-			"scored_count":      scamScoredCount,
-		},
-		"ipqualityscore": map[string]interface{}{
+		"ipqs_summary": map[string]interface{}{
 			"low_risk_count":    ipqsLowRisk,
 			"medium_risk_count": ipqsMedRisk,
 			"high_risk_count":   ipqsHighRisk,
 			"average_score":     ipqsAvgScore,
 			"scored_count":      ipqsScoredCount,
+			"proxy_count":       proxyCount,
+			"vpn_count":         vpnCount,
+			"tor_count":         torCount,
 		},
 		"results": results,
 	})
@@ -4578,38 +2598,23 @@ func handleDeviceConnectionsAPI(w http.ResponseWriter, r *http.Request) {
 func handleNetworkOverviewAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	server.mu.RLock()
-	defer server.mu.RUnlock()
+	server.apMu.RLock()
+	defer server.apMu.RUnlock()
 
-	// Gather active devices with their current activity
+	// Gather active AP devices with their current activity
 	activeDevices := make([]map[string]interface{}, 0)
 	now := time.Now()
 
-	for _, device := range server.devices {
-		timeSinceActive := now.Sub(device.LastActive).Minutes()
+	for _, device := range server.apDevices {
+		if !device.Confirmed {
+			continue
+		}
+
 		timeSinceSeen := now.Sub(device.LastSeen).Minutes()
 
 		// Only include devices seen in last 30 minutes
 		if timeSinceSeen > 30 {
 			continue
-		}
-
-		// Get session expiration time
-		sessionHours := server.persistentData.SystemSettings.SessionTimeout
-		if sessionHours == 0 {
-			sessionHours = 2
-		}
-		sessionExpiry := device.SessionStart.Add(time.Duration(sessionHours) * time.Hour)
-		timeUntilExpiry := sessionExpiry.Sub(now)
-		expiryStr := ""
-		if timeUntilExpiry > 0 {
-			if timeUntilExpiry.Hours() >= 1 {
-				expiryStr = fmt.Sprintf("%.0fh %.0fm", timeUntilExpiry.Hours(), float64(int(timeUntilExpiry.Minutes())%60))
-			} else {
-				expiryStr = fmt.Sprintf("%.0fm", timeUntilExpiry.Minutes())
-			}
-		} else {
-			expiryStr = "Expired"
 		}
 
 		// Get recent connections for this device
@@ -4622,15 +2627,15 @@ func handleNetworkOverviewAPI(w http.ResponseWriter, r *http.Request) {
 			recentHosts = append(recentHosts, conn.Host)
 		}
 
-		// Calculate current data rate (bytes per minute over last activity)
+		// Calculate current data rate (bytes per minute over last seen)
 		dataRate := int64(0)
-		if timeSinceActive < 5 && timeSinceActive > 0 {
-			dataRate = int64(float64(device.BytesIn+device.BytesOut) / timeSinceActive)
+		if timeSinceSeen < 5 && timeSinceSeen > 0 {
+			dataRate = int64(float64(device.BytesIn+device.BytesOut) / timeSinceSeen)
 		}
 
 		name := device.CustomName
 		if name == "" {
-			name = device.Username
+			name = device.Hostname
 		}
 		if name == "" {
 			name = device.IP
@@ -4638,13 +2643,11 @@ func handleNetworkOverviewAPI(w http.ResponseWriter, r *http.Request) {
 
 		activeDevices = append(activeDevices, map[string]interface{}{
 			"ip":              device.IP,
-			"username":        device.Username,
+			"mac":             device.MAC,
 			"name":            name,
 			"group":           device.Group,
-			"is_active":       timeSinceActive < 5,
-			"last_active_min": timeSinceActive,
+			"is_active":       timeSinceSeen < 5,
 			"last_seen_min":   timeSinceSeen,
-			"session_expiry":  expiryStr,
 			"bytes_in":        device.BytesIn,
 			"bytes_out":       device.BytesOut,
 			"data_rate":       dataRate,
@@ -4655,11 +2658,11 @@ func handleNetworkOverviewAPI(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Sort by activity (most active first)
+	// Sort by activity (most recently seen first)
 	sort.Slice(activeDevices, func(i, j int) bool {
-		iActive := activeDevices[i]["last_active_min"].(float64)
-		jActive := activeDevices[j]["last_active_min"].(float64)
-		return iActive < jActive
+		iSeen := activeDevices[i]["last_seen_min"].(float64)
+		jSeen := activeDevices[j]["last_seen_min"].(float64)
+		return iSeen < jSeen
 	})
 
 	// Calculate totals
@@ -4683,34 +2686,374 @@ func handleNetworkOverviewAPI(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-const loginPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Login</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.login-container{background:rgba(255,255,255,0.95);padding:40px;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);width:100%;max-width:400px}.logo{text-align:center;margin-bottom:30px}.logo h1{color:#667eea;font-size:2em;margin-bottom:5px}.logo p{color:#666;font-size:0.9em}.form-group{margin-bottom:20px}.form-group label{display:block;font-weight:600;color:#333;margin-bottom:8px}.form-group input{width:100%;padding:14px 16px;border:2px solid #e0e0e0;border-radius:10px;font-size:1em}.form-group input:focus{outline:none;border-color:#667eea}.login-btn{width:100%;padding:14px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:10px;font-size:1.1em;font-weight:600;cursor:pointer}.login-btn:hover{opacity:0.9}.login-btn:disabled{opacity:0.5;cursor:not-allowed}.error-msg{background:#ffebee;color:#c62828;padding:12px;border-radius:8px;margin-bottom:20px;display:none}.error-msg.show{display:block}</style></head>
-<body><div class="login-container"><div class="logo"><h1>🌐 Lumier Dynamics</h1><p>Enterprise Proxy Management v3.0</p></div><div class="error-msg" id="errorMsg"></div><form onsubmit="return handleLogin(event)"><div class="form-group"><label>Username</label><input type="text" id="username" placeholder="Enter username" required autofocus></div><div class="form-group"><label>Password</label><input type="password" id="password" placeholder="Enter password" required></div><button type="submit" class="login-btn" id="loginBtn">Sign In</button></form></div>
-<script>async function handleLogin(e){e.preventDefault();const btn=document.getElementById('loginBtn'),err=document.getElementById('errorMsg');btn.disabled=true;btn.textContent='Signing in...';err.classList.remove('show');try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});if(r.ok)window.location.href='/dashboard';else{err.textContent='Invalid username or password';err.classList.add('show');btn.disabled=false;btn.textContent='Sign In';}}catch(e){err.textContent='Connection error';err.classList.add('show');btn.disabled=false;btn.textContent='Sign In';}return false;}</script></body></html>`
+// ============================================================================
+// SCREENSHOT HANDLERS (Client Remote Screenshots)
+// ============================================================================
 
-const navHTML = `<nav style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:15px 30px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:1.5em">🌐</span><span style="color:white;font-size:1.3em;font-weight:bold">Lumier Dynamics</span></div><div style="display:flex;gap:5px;flex-wrap:wrap"><a href="/dashboard" class="nav-link" id="nav-dashboard">📱 Devices</a><a href="/health" class="nav-link" id="nav-health">💚 Health</a><a href="/diagnostics" class="nav-link" id="nav-diagnostics">🔬 Diagnostics</a><a href="/analytics" class="nav-link" id="nav-analytics">📊 Analytics</a><a href="/activity" class="nav-link" id="nav-activity">📋 Activity</a><a href="/monitoring" class="nav-link" id="nav-monitoring">🖥️ Monitor</a><a href="/settings" class="nav-link" id="nav-settings">⚙️ Settings</a></div><div style="display:flex;align-items:center;gap:15px;color:white"><span id="currentUser">Admin</span><button onclick="logout()" style="background:rgba(255,255,255,0.2);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-weight:500">Logout</button></div></nav>`
+const maxScreenshotsPerDevice = 10
+const maxTotalScreenshots = 50
 
-const baseStyles = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f7fa;min-height:100vh}.nav-link{color:rgba(255,255,255,0.85);text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:500}.nav-link:hover,.nav-link.active{background:rgba(255,255,255,0.2);color:white}.container{max-width:1600px;margin:0 auto;padding:25px}.page-header{margin-bottom:25px}.page-header h1{color:#333;font-size:1.8em;margin-bottom:5px}.page-header p{color:#666}.card{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.card h2{color:#333;font-size:1.3em;margin-bottom:15px;padding-bottom:10px;border-bottom:2px solid #f0f0f0}.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:20px;margin-bottom:25px}.stat-card{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);text-align:center;cursor:pointer;transition:transform 0.2s}.stat-card:hover{transform:translateY(-3px)}.stat-value{font-size:2.2em;font-weight:bold;color:#667eea;margin-bottom:5px}.stat-label{color:#666;font-size:0.85em;text-transform:uppercase;letter-spacing:1px}.btn{padding:10px 18px;border:none;border-radius:8px;cursor:pointer;font-size:0.95em;font-weight:600;transition:all 0.2s}.btn-primary{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white}.btn-primary:hover{opacity:0.9}.btn-secondary{background:#f5f5f5;color:#333;border:2px solid #e0e0e0}.btn-secondary:hover{background:#e8e8e8}.toast{position:fixed;bottom:30px;right:30px;background:#333;color:white;padding:15px 25px;border-radius:10px;z-index:1001;animation:slideIn 0.3s ease}.toast.success{background:#4caf50}.toast.error{background:#f44336}@keyframes slideIn{from{transform:translateX(100px);opacity:0}to{transform:translateX(0);opacity:1}}.loading{text-align:center;padding:40px;color:#666}`
+// loadExistingScreenshots loads any existing screenshots from disk on startup
+func (s *ProxyServer) loadExistingScreenshots() {
+	files, err := os.ReadDir(s.screenshotDir)
+	if err != nil {
+		return
+	}
 
-const baseJS = `async function logout(){await fetch('/api/logout',{method:'POST'});window.location.href='/';}function showToast(msg,type=''){const t=document.createElement('div');t.className='toast '+type;t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),3000);}function formatBytes(b){if(!b)return"0 B";const k=1024,s=["B","KB","MB","GB","TB"];const i=Math.floor(Math.log(b)/Math.log(k));return(b/Math.pow(k,i)).toFixed(1)+" "+s[i];}function formatNumber(n){if(!n)return"0";if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"K";return n.toString();}fetch('/api/session-check').then(r=>r.json()).then(d=>{if(!d.valid)window.location.href='/';else if(document.getElementById('currentUser'))document.getElementById('currentUser').textContent=d.username;});`
+	s.screenshotMu.Lock()
+	defer s.screenshotMu.Unlock()
 
-const dashboardPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Devices</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.toolbar{background:white;padding:15px 20px;border-radius:12px;margin-bottom:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);display:flex;flex-wrap:wrap;gap:15px;align-items:center}.search-box{flex:1;min-width:200px;position:relative}.search-box input{width:100%;padding:10px 15px 10px 40px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.search-box input:focus{outline:none;border-color:#667eea}.search-box::before{content:"🔍";position:absolute;left:12px;top:50%;transform:translateY(-50%)}.filter-group{display:flex;gap:10px;align-items:center}.filter-group label{font-weight:600;color:#555;font-size:0.9em}.filter-group select{padding:8px 12px;border:2px solid #e0e0e0;border-radius:8px}.device-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:20px}.device-card{background:white;border:2px solid #e8e8e8;border-radius:12px;padding:18px;transition:all 0.2s;position:relative}.device-card:hover{border-color:#667eea;box-shadow:0 5px 20px rgba(102,126,234,0.15)}.device-card.selected{border-color:#667eea;background:#f8f9ff}.device-checkbox{position:absolute;top:15px;right:15px;width:20px;height:20px;cursor:pointer}.device-name{font-size:1.15em;font-weight:bold;color:#333;margin-bottom:5px;padding-right:30px;cursor:pointer}.device-name:hover{color:#667eea}.device-group{display:inline-block;background:#e8f5e9;color:#2e7d32;padding:3px 10px;border-radius:12px;font-size:0.8em;font-weight:600;margin-bottom:10px}.device-info{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:0.9em}.info-row{display:flex;justify-content:space-between;padding:3px 0}.info-label{color:#888}.status-badge{padding:3px 10px;border-radius:12px;font-size:0.85em;font-weight:600}.status-active{background:#e8f5e9;color:#2e7d32}.status-inactive{background:#ffebee;color:#c62828}.proxy-selector{margin-top:12px;padding-top:12px;border-top:1px solid #eee;grid-column:1/-1}.proxy-selector label{display:block;font-size:0.85em;color:#666;margin-bottom:6px}.proxy-selector select{width:100%;padding:8px;border:2px solid #e0e0e0;border-radius:6px;margin-bottom:8px}.current-proxy{font-size:0.85em;color:#667eea;font-weight:600}.change-btn{width:100%;padding:8px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;border-radius:6px;cursor:pointer;font-weight:600}.change-btn:hover{opacity:0.9}.pagination{display:flex;justify-content:center;align-items:center;gap:10px;margin-top:20px}.pagination button{padding:8px 16px;border:2px solid #e0e0e0;background:white;border-radius:6px;cursor:pointer;font-weight:600}.pagination button:hover:not(:disabled){border-color:#667eea;color:#667eea}.pagination button:disabled{opacity:0.5;cursor:not-allowed}.bulk-actions{display:flex;gap:10px;align-items:center}.selected-count{background:#667eea;color:white;padding:5px 12px;border-radius:20px;font-size:0.85em;font-weight:600}.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000}.modal{background:white;border-radius:15px;padding:25px;width:90%;max-width:450px}.modal h3{margin-bottom:20px;color:#333}.modal-field{margin-bottom:15px}.modal-field label{display:block;font-weight:600;color:#555;margin-bottom:5px}.modal-field input,.modal-field select,.modal-field textarea{width:100%;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.modal-field textarea{resize:vertical;min-height:80px}.modal-buttons{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}.setup-box{background:#e3f2fd;padding:12px 20px;border-radius:10px;margin-bottom:20px;border-left:4px solid #2196F3}.setup-box code{background:#fff;padding:2px 6px;border-radius:4px;font-family:monospace;color:#d32f2f;font-weight:bold}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📱 Device Management</h1><p>Monitor and manage all connected devices</p></div><div class="setup-box">📱 Phone Setup: Wi-Fi → Proxy Manual → Host: <code id="serverIP">...</code> Port: <code>8888</code> Username: <code>your-device-name</code> (password can be anything)</div><div class="stats-grid"><div class="stat-card" onclick="filterByStatus('all')"><div class="stat-value" id="totalDevices">-</div><div class="stat-label">Total</div></div><div class="stat-card" onclick="filterByStatus('active')"><div class="stat-value" id="activeDevices">-</div><div class="stat-label">Active</div></div><div class="stat-card" onclick="filterByStatus('inactive')"><div class="stat-value" id="inactiveDevices">-</div><div class="stat-label">Inactive</div></div><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Proxies</div></div><div class="stat-card"><div class="stat-value" id="totalRequests">-</div><div class="stat-label">Requests</div></div></div><div class="toolbar"><div class="search-box"><input type="text" id="searchInput" placeholder="Search devices..." oninput="applyFilters()"></div><div class="filter-group"><label>Group:</label><select id="groupFilter" onchange="applyFilters()"><option value="">All</option></select></div><div class="filter-group"><label>Sort:</label><select id="sortBy" onchange="applyFilters()"><option value="name">Name</option><option value="ip">IP</option><option value="lastSeen" selected>Last Seen</option><option value="requests">Requests</option></select></div><div class="filter-group"><label><input type="checkbox" id="showOffline" onchange="loadData()" style="margin-right:5px">Show Offline</label></div><button class="btn btn-secondary" onclick="loadData()">🔄 Refresh</button><button class="btn btn-secondary" onclick="location.href='/api/export'">📤 Export</button><div class="bulk-actions" id="bulkActions" style="display:none"><span class="selected-count"><span id="selectedCount">0</span> selected</span><select id="bulkProxySelect"></select><button class="btn btn-primary" onclick="bulkChangeProxy()">Change</button><button class="btn btn-secondary" onclick="clearSelection()">Clear</button></div></div><div class="card"><h2>Connected Devices</h2><div id="devicesList" class="device-grid"><div class="loading">Loading...</div></div><div class="pagination" id="pagination"></div></div></div><div class="modal-overlay" id="editModal" style="display:none"><div class="modal"><h3>✏️ Edit Device</h3><div class="modal-field"><label>Username (Device ID)</label><input type="text" id="editUsername" placeholder="e.g., phone1, samsung-s23"></div><div class="modal-field"><label>Custom Name</label><input type="text" id="editName" placeholder="e.g., Samsung S23"></div><div class="modal-field"><label>Group</label><select id="editGroup"></select></div><div class="modal-field"><label>Notes</label><textarea id="editNotes" placeholder="Optional notes..."></textarea></div><input type="hidden" id="editDeviceIP"><div class="modal-buttons"><button class="btn btn-secondary" onclick="closeEditModal()">Cancel</button><button class="btn btn-primary" onclick="saveDeviceEdit()">Save</button></div></div></div><script>` + baseJS + `document.getElementById('nav-dashboard').classList.add('active');fetch("/api/server-ip").then(r=>r.text()).then(ip=>document.getElementById("serverIP").textContent=ip);let allDevices=[],allProxies=[],allGroups=[],filteredDevices=[],selectedDevices=new Set(),currentPage=1,statusFilter='all';const PER_PAGE=20;function getDisplayName(d){return d.custom_name||d.name||'Unknown';}function isActive(d){return(Date.now()-new Date(d.last_seen))/60000<5;}function proxyLabel(p,i){let ip=p.user&&p.user.includes('ip-')?p.user.split('ip-')[1]:'unknown';return'#'+(i+1)+' – '+ip;}function filterByStatus(s){statusFilter=s;applyFilters();}function applyFilters(){const search=document.getElementById('searchInput').value.toLowerCase();const group=document.getElementById('groupFilter').value;const sort=document.getElementById('sortBy').value;filteredDevices=allDevices.filter(d=>{if(statusFilter==='active'&&!isActive(d))return false;if(statusFilter==='inactive'&&isActive(d))return false;if(group&&d.group!==group)return false;if(search&&!getDisplayName(d).toLowerCase().includes(search)&&!d.ip.includes(search)&&!(d.username&&d.username.toLowerCase().includes(search)))return false;return true;});filteredDevices.sort((a,b)=>{if(sort==='name')return getDisplayName(a).localeCompare(getDisplayName(b));if(sort==='ip')return a.ip.localeCompare(b.ip);if(sort==='lastSeen')return new Date(b.last_seen)-new Date(a.last_seen);if(sort==='requests')return(b.request_count||0)-(a.request_count||0);return 0;});currentPage=1;renderDevices();}function renderDevices(){const c=document.getElementById('devicesList');if(!filteredDevices.length){c.innerHTML='<div class="loading">No devices found</div>';document.getElementById('pagination').innerHTML='';return;}const pages=Math.ceil(filteredDevices.length/PER_PAGE);const start=(currentPage-1)*PER_PAGE;const pageDevices=filteredDevices.slice(start,start+PER_PAGE);c.innerHTML=pageDevices.map(d=>{const mins=Math.floor((Date.now()-new Date(d.last_seen))/60000);const active=mins<5;const sel=selectedDevices.has(d.ip);const pIdx=allProxies.findIndex(p=>p.full===d.upstream_proxy);const opts=allProxies.map((p,i)=>'<option value="'+i+'" '+(i===pIdx?'selected':'')+'>'+proxyLabel(p,i)+'</option>').join('');const pLabel=pIdx>=0?proxyLabel(allProxies[pIdx],pIdx):'N/A';return'<div class="device-card '+(sel?'selected':'')+'"><input type="checkbox" class="device-checkbox" '+(sel?'checked':'')+' onchange="toggleSel(\''+d.ip+'\',this.checked)"><div class="device-name" onclick="openEditModal(\''+d.ip+'\')">'+escapeHtml(getDisplayName(d))+' ✏️</div><div class="device-group">'+escapeHtml(d.group||'Default')+'</div><div class="device-info"><div class="info-row"><span class="info-label">Status:</span><span class="status-badge '+(active?'status-active':'status-inactive')+'">'+(active?'● Active':'○ Inactive')+'</span></div><div class="info-row"><span class="info-label">IP:</span><span><strong>'+d.ip+'</strong></span></div><div class="info-row"><span class="info-label">User:</span><span style="font-weight:600;color:#667eea">'+(d.username||'<em>anonymous</em>')+'</span></div><div class="info-row"><span class="info-label">Requests:</span><span>'+formatNumber(d.request_count)+'</span></div><div class="info-row"><span class="info-label">Errors:</span><span style="color:'+(d.error_count>0?'#c62828':'#666')+'">'+(d.error_count||0)+'</span></div><div class="info-row"><span class="info-label">Data:</span><span>↓'+formatBytes(d.bytes_in)+'</span></div><div class="info-row"><span class="info-label">Last seen:</span><span>'+(mins<1?'Now':mins+' min')+'</span></div><div class="proxy-selector"><label>Proxy: <span class="current-proxy">'+pLabel+'</span></label><select id="proxy-'+d.ip+'">'+opts+'</select><button class="change-btn" onclick="changeProxy(\''+d.ip+'\')">Change Proxy</button><button class="change-btn" style="background:#ef5350;margin-top:8px" onclick="deleteDevice(\''+d.ip+'\',\''+escapeHtml(d.username||'')+'\')">Delete Device</button></div></div></div>';}).join('');const pag=document.getElementById('pagination');pag.innerHTML=pages>1?'<button onclick="goPage('+(currentPage-1)+')" '+(currentPage===1?'disabled':'')+'>← Prev</button><span>Page '+currentPage+' of '+pages+'</span><button onclick="goPage('+(currentPage+1)+')" '+(currentPage===pages?'disabled':'')+'>Next →</button>':'<span>'+filteredDevices.length+' devices</span>';updateBulk();}function goPage(p){const pages=Math.ceil(filteredDevices.length/PER_PAGE);if(p>=1&&p<=pages){currentPage=p;renderDevices();}}function escapeHtml(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML;}function toggleSel(ip,checked){checked?selectedDevices.add(ip):selectedDevices.delete(ip);updateBulk();renderDevices();}function clearSelection(){selectedDevices.clear();updateBulk();renderDevices();}function updateBulk(){const b=document.getElementById('bulkActions');b.style.display=selectedDevices.size>0?'flex':'none';document.getElementById('selectedCount').textContent=selectedDevices.size;}function changeProxy(ip){const idx=parseInt(document.getElementById('proxy-'+ip).value);fetch('/api/change-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,proxy_index:idx})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Proxy changed','success');loadData();}});}function bulkChangeProxy(){const idx=parseInt(document.getElementById('bulkProxySelect').value);fetch('/api/bulk-change-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ips:Array.from(selectedDevices),proxy_index:idx})}).then(r=>r.json()).then(d=>{if(d.ok){showToast(d.updated+' devices updated','success');selectedDevices.clear();loadData();}});}function openEditModal(ip){const d=allDevices.find(x=>x.ip===ip);if(!d)return;document.getElementById('editDeviceIP').value=ip;document.getElementById('editUsername').value=d.username||'';document.getElementById('editName').value=d.custom_name||'';document.getElementById('editNotes').value=d.notes||'';document.getElementById('editGroup').innerHTML=allGroups.map(g=>'<option value="'+g+'" '+(g===d.group?'selected':'')+'>'+g+'</option>').join('');document.getElementById('editModal').style.display='flex';}function closeEditModal(){document.getElementById('editModal').style.display='none';}function saveDeviceEdit(){const ip=document.getElementById('editDeviceIP').value;fetch('/api/update-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,username:document.getElementById('editUsername').value,custom_name:document.getElementById('editName').value,group:document.getElementById('editGroup').value,notes:document.getElementById('editNotes').value})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Device updated','success');closeEditModal();loadData();}});}function loadGroups(){return fetch('/api/groups').then(r=>r.json()).then(g=>{allGroups=g;document.getElementById('groupFilter').innerHTML='<option value="">All</option>'+g.map(x=>'<option value="'+x+'">'+x+'</option>').join('');});}function loadData(){const showOffline=document.getElementById('showOffline').checked;Promise.all([fetch('/api/stats').then(r=>r.json()),fetch('/api/devices'+(showOffline?'?include_offline=true':'')).then(r=>r.json()),fetch('/api/proxies').then(r=>r.json()),loadGroups()]).then(([stats,devices,proxies])=>{document.getElementById('totalDevices').textContent=stats.total_devices||0;document.getElementById('activeDevices').textContent=stats.active_devices||0;document.getElementById('inactiveDevices').textContent=(stats.total_devices-stats.active_devices)||0;document.getElementById('totalProxies').textContent=stats.total_proxies||0;document.getElementById('totalRequests').textContent=formatNumber(stats.total_requests||0);allDevices=devices||[];allProxies=proxies||[];document.getElementById('bulkProxySelect').innerHTML=allProxies.map((p,i)=>'<option value="'+i+'">'+proxyLabel(p,i)+'</option>').join('');applyFilters();});}function deleteDevice(ip,username){const name=username||ip;if(!confirm('Delete device "'+name+'" ('+ip+')? This will remove all saved settings for this device.')){return;}fetch('/api/delete-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_ip:ip,username:username})}).then(r=>{if(r.ok)return r.json();throw new Error('Failed');}).then(d=>{if(d.ok){showToast('Device deleted','success');loadData();}}).catch(()=>showToast('Failed to delete device','error'));}loadData();setInterval(loadData,15000);</script></body></html>`
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(strings.ToLower(file.Name()), ".jpg") {
+			continue
+		}
 
-const healthPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Proxy Health</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.health-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:20px}.proxy-card{background:white;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);border-left:4px solid #ccc}.proxy-card.healthy{border-left-color:#4caf50}.proxy-card.degraded{border-left-color:#ff9800}.proxy-card.unhealthy{border-left-color:#f44336}.proxy-card.unknown{border-left-color:#9e9e9e}.proxy-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}.proxy-name{font-size:1.2em;font-weight:bold;color:#333}.proxy-status{padding:5px 12px;border-radius:20px;font-size:0.85em;font-weight:600}.proxy-status.healthy{background:#e8f5e9;color:#2e7d32}.proxy-status.degraded{background:#fff3e0;color:#e65100}.proxy-status.unhealthy{background:#ffebee;color:#c62828}.proxy-status.unknown{background:#f5f5f5;color:#666}.proxy-stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}.proxy-stat{padding:10px;background:#f8f9fa;border-radius:8px}.proxy-stat-value{font-size:1.3em;font-weight:bold;color:#667eea}.proxy-stat-label{font-size:0.8em;color:#666;text-transform:uppercase}.progress-bar{height:8px;background:#e0e0e0;border-radius:4px;overflow:hidden;margin-top:10px}.progress-fill{height:100%;border-radius:4px;transition:width 0.3s}.progress-fill.good{background:#4caf50}.progress-fill.warning{background:#ff9800}.progress-fill.bad{background:#f44336}.last-error{margin-top:10px;padding:10px;background:#ffebee;border-radius:8px;font-size:0.85em;color:#c62828;word-break:break-all}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>💚 Proxy Health Monitor</h1><p>Real-time health status of all upstream proxies</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Total Proxies</div></div><div class="stat-card"><div class="stat-value" id="healthyProxies" style="color:#4caf50">-</div><div class="stat-label">Healthy</div></div><div class="stat-card"><div class="stat-value" id="degradedProxies" style="color:#ff9800">-</div><div class="stat-label">Degraded</div></div><div class="stat-card"><div class="stat-value" id="unhealthyProxies" style="color:#f44336">-</div><div class="stat-label">Unhealthy</div></div><div class="stat-card"><div class="stat-value" id="avgSuccessRate">-</div><div class="stat-label">Avg Success</div></div></div><div class="card"><h2>Proxy Status</h2><button class="btn btn-secondary" onclick="loadHealth()" style="float:right;margin-top:-45px">🔄 Refresh</button><div id="healthGrid" class="health-grid"><div class="loading">Loading...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-health').classList.add('active');function loadHealth(){fetch('/api/proxy-health').then(r=>r.json()).then(data=>{let healthy=0,degraded=0,unhealthy=0,totalRate=0;data.forEach(p=>{if(p.status==='healthy')healthy++;else if(p.status==='degraded')degraded++;else if(p.status==='unhealthy')unhealthy++;totalRate+=p.success_rate||0;});document.getElementById('totalProxies').textContent=data.length;document.getElementById('healthyProxies').textContent=healthy;document.getElementById('degradedProxies').textContent=degraded;document.getElementById('unhealthyProxies').textContent=unhealthy;document.getElementById('avgSuccessRate').textContent=data.length?(totalRate/data.length).toFixed(1)+'%':'-';document.getElementById('healthGrid').innerHTML=data.map(p=>{const rate=p.success_rate||0;const rateClass=rate>=95?'good':rate>=80?'warning':'bad';return'<div class="proxy-card '+p.status+'"><div class="proxy-header"><span class="proxy-name">#'+(p.index+1)+' – '+p.ip_address+'</span><span class="proxy-status '+p.status+'">'+p.status.toUpperCase()+'</span></div><div class="proxy-stats"><div class="proxy-stat"><div class="proxy-stat-value">'+formatNumber(p.total_requests)+'</div><div class="proxy-stat-label">Requests</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+rate.toFixed(1)+'%</div><div class="proxy-stat-label">Success Rate</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+formatNumber(p.success_count)+'</div><div class="proxy-stat-label">Success</div></div><div class="proxy-stat"><div class="proxy-stat-value" style="color:#c62828">'+formatNumber(p.failure_count)+'</div><div class="proxy-stat-label">Failures</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+(p.device_count||0)+'</div><div class="proxy-stat-label">Registered</div></div><div class="proxy-stat"><div class="proxy-stat-value">'+p.active_devices+'</div><div class="proxy-stat-label">Active</div></div></div><div class="progress-bar"><div class="progress-fill '+rateClass+'" style="width:'+rate+'%"></div></div>'+(p.last_error?'<div class="last-error">Last error: '+p.last_error+'</div>':'')+'</div>';}).join('');});}loadHealth();setInterval(loadHealth,30000);</script></body></html>`
+		info, err := file.Info()
+		if err != nil {
+			continue
+		}
 
-const diagnosticsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Diagnostics</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.diag-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:20px}.diag-card{background:white;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(0,0,0,0.05);border-left:4px solid #ccc}.diag-card.healthy{border-left-color:#4caf50}.diag-card.degraded{border-left-color:#ff9800}.diag-card.broken{border-left-color:#f44336}.diag-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.diag-name{font-size:1.1em;font-weight:bold;color:#333}.diag-badge{padding:4px 10px;border-radius:15px;font-size:0.75em;font-weight:600;text-transform:uppercase}.diag-badge.healthy{background:#e8f5e9;color:#2e7d32}.diag-badge.degraded{background:#fff3e0;color:#e65100}.diag-badge.broken{background:#ffebee;color:#c62828}.diag-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px}.diag-stat{padding:8px;background:#f8f9fa;border-radius:6px;text-align:center}.diag-stat-value{font-size:1.1em;font-weight:bold;color:#667eea}.diag-stat-label{font-size:0.7em;color:#888;text-transform:uppercase}.diag-issue{padding:10px;background:#fff3e0;border-radius:8px;font-size:0.85em;color:#e65100;margin-top:10px}.diag-issue.broken{background:#ffebee;color:#c62828}.device-table{width:100%;border-collapse:collapse}.device-table th,.device-table td{padding:12px;text-align:left;border-bottom:1px solid #eee}.device-table th{background:#f5f5f5;font-weight:600;color:#555;font-size:0.85em;text-transform:uppercase}.device-table tr:hover{background:#f8f9ff}.usage-bar{height:20px;background:#e0e0e0;border-radius:10px;overflow:hidden;position:relative}.usage-bar-fill{height:100%;border-radius:10px;transition:width 0.3s}.usage-bar-label{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-size:0.75em;font-weight:600;color:#333}.tabs{display:flex;gap:5px;margin-bottom:20px}.tab{padding:10px 20px;background:#f5f5f5;border:none;border-radius:8px 8px 0 0;cursor:pointer;font-weight:600;color:#666}.tab.active{background:white;color:#667eea;box-shadow:0 -2px 10px rgba(0,0,0,0.05)}.tab-content{display:none}.tab-content.active{display:block}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>🔬 Diagnostics</h1><p>Proxy usage statistics and device health overview</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalProxies">-</div><div class="stat-label">Total Proxies</div></div><div class="stat-card"><div class="stat-value" id="healthyCount" style="color:#4caf50">-</div><div class="stat-label">Healthy</div></div><div class="stat-card"><div class="stat-value" id="degradedCount" style="color:#ff9800">-</div><div class="stat-label">Degraded</div></div><div class="stat-card"><div class="stat-value" id="brokenCount" style="color:#f44336">-</div><div class="stat-label">Broken</div></div><div class="stat-card"><div class="stat-value" id="successRate">-</div><div class="stat-label">Success Rate</div></div></div><div class="tabs"><button class="tab active" onclick="showTab('proxies')">🌐 Proxy Status</button><button class="tab" onclick="showTab('usage')">📊 Usage Stats</button><button class="tab" onclick="showTab('devices')">📱 Device Health</button><button class="tab" onclick="showTab('trustscore')">🛡️ IP Trust Score</button></div><div class="card"><button class="btn btn-secondary" onclick="loadDiagnostics()" style="float:right;margin-top:-10px;margin-bottom:10px">🔄 Refresh</button><div id="proxies" class="tab-content active"><h2>Proxy Status</h2><p style="color:#666;margin-bottom:15px">Proxy health based on success rates</p><div id="diagGrid" class="diag-grid"><div class="loading">Loading...</div></div></div><div id="usage" class="tab-content"><h2>Proxy Usage Statistics</h2><p style="color:#666;margin-bottom:15px">Request distribution across all proxies</p><div id="usageStats"><div class="loading">Loading...</div></div></div><div id="devices" class="tab-content"><h2>Device Health Summary</h2><p style="color:#666;margin-bottom:15px">Top devices by activity with error rates</p><div id="deviceHealth"><div class="loading">Loading...</div></div></div><div id="trustscore" class="tab-content"><h2>IP Trust Score</h2><p style="color:#666;margin-bottom:15px">Check proxy IP fraud scores from Scamalytics and IPQualityScore. Lower scores indicate more trustworthy IPs (0-100 scale).</p><div style="margin-bottom:20px"><button class="btn btn-primary" id="checkTrustBtn" onclick="checkTrustScore()">🔍 Check All Proxy IPs</button><span id="trustStatus" style="margin-left:15px;color:#666"></span></div><div id="trustSummary" style="display:none;margin-bottom:20px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:20px"><div style="background:#f8f9fa;padding:15px;border-radius:10px"><h4 style="margin:0 0 10px;color:#667eea">📊 Scamalytics</h4><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center"><div><div style="font-size:1.3em;font-weight:bold;color:#667eea" id="scamAvg">-</div><div style="font-size:0.75em;color:#888">Avg Score</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#4caf50" id="scamLow">-</div><div style="font-size:0.75em;color:#888">Low Risk</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#ff9800" id="scamMed">-</div><div style="font-size:0.75em;color:#888">Medium</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#f44336" id="scamHigh">-</div><div style="font-size:0.75em;color:#888">High Risk</div></div></div></div><div style="background:#f8f9fa;padding:15px;border-radius:10px"><h4 style="margin:0 0 10px;color:#9c27b0">📊 IPQualityScore</h4><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center"><div><div style="font-size:1.3em;font-weight:bold;color:#9c27b0" id="ipqsAvg">-</div><div style="font-size:0.75em;color:#888">Avg Score</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#4caf50" id="ipqsLow">-</div><div style="font-size:0.75em;color:#888">Low Risk</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#ff9800" id="ipqsMed">-</div><div style="font-size:0.75em;color:#888">Medium</div></div><div><div style="font-size:1.3em;font-weight:bold;color:#f44336" id="ipqsHigh">-</div><div style="font-size:0.75em;color:#888">High Risk</div></div></div></div></div><div style="text-align:center;margin-top:10px;font-size:0.9em;color:#666"><span id="trustTotal">0</span> proxies checked</div></div><div id="trustResults"><div style="padding:30px;text-align:center;color:#888">Click the button above to check trust scores for all proxy IPs.</div></div></div></div></div><script>` + baseJS + `document.getElementById('nav-diagnostics').classList.add('active');function checkTrustScore(){const btn=document.getElementById('checkTrustBtn');const status=document.getElementById('trustStatus');btn.disabled=true;btn.textContent='Checking...';status.textContent='Fetching scores from Scamalytics and IPQualityScore...';fetch('/api/check-blacklist').then(r=>r.json()).then(data=>{btn.disabled=false;btn.textContent='🔍 Check All Proxy IPs';status.textContent='Last checked: '+new Date().toLocaleTimeString();document.getElementById('trustSummary').style.display='block';document.getElementById('trustTotal').textContent=data.total_checked;const scam=data.scamalytics||{};const ipqs=data.ipqualityscore||{};document.getElementById('scamAvg').textContent=scam.average_score>=0?scam.average_score:'-';document.getElementById('scamLow').textContent=scam.low_risk_count||0;document.getElementById('scamMed').textContent=scam.medium_risk_count||0;document.getElementById('scamHigh').textContent=scam.high_risk_count||0;document.getElementById('ipqsAvg').textContent=ipqs.average_score>=0?ipqs.average_score:'-';document.getElementById('ipqsLow').textContent=ipqs.low_risk_count||0;document.getElementById('ipqsMed').textContent=ipqs.medium_risk_count||0;document.getElementById('ipqsHigh').textContent=ipqs.high_risk_count||0;if(!data.results||!data.results.length){document.getElementById('trustResults').innerHTML='<div style="padding:30px;text-align:center;color:#888">No proxy IPs to check.</div>';return;}function getScoreDisplay(src){if(!src||!src.available)return{score:'-',color:'#666',badge:'background:#f5f5f5;color:#666',risk:'N/A',error:src?src.error:''};const score=src.score;const risk=src.risk||'unknown';const color=risk==='low'?'#4caf50':risk==='medium'?'#ff9800':risk==='high'||risk==='very high'?'#c62828':'#666';const badge=risk==='low'?'background:#e8f5e9;color:#2e7d32':risk==='medium'?'background:#fff3e0;color:#e65100':risk==='high'||risk==='very high'?'background:#ffebee;color:#c62828':'background:#f5f5f5;color:#666';return{score:score,color:color,badge:badge,risk:risk.toUpperCase(),error:''};}document.getElementById('trustResults').innerHTML='<table class="device-table"><thead><tr><th>Proxy</th><th>IP Address</th><th style="text-align:center">Scamalytics</th><th style="text-align:center">IPQualityScore</th></tr></thead><tbody>'+data.results.map(r=>{const s=getScoreDisplay(r.scamalytics);const i=getScoreDisplay(r.ipqualityscore);return'<tr><td><strong>'+r.name+'</strong></td><td style="font-family:monospace">'+r.ip_address+'</td><td style="text-align:center"><div style="font-weight:bold;font-size:1.3em;color:'+s.color+'">'+s.score+'</div><span style="padding:2px 8px;border-radius:10px;font-size:0.75em;font-weight:600;'+s.badge+'">'+s.risk+'</span>'+(r.scamalytics&&r.scamalytics.error?' <div style="color:#999;font-size:0.7em;margin-top:3px">'+r.scamalytics.error+'</div>':'')+'</td><td style="text-align:center"><div style="font-weight:bold;font-size:1.3em;color:'+i.color+'">'+i.score+'</div><span style="padding:2px 8px;border-radius:10px;font-size:0.75em;font-weight:600;'+i.badge+'">'+i.risk+'</span>'+(r.ipqualityscore&&r.ipqualityscore.error?' <div style="color:#999;font-size:0.7em;margin-top:3px">'+r.ipqualityscore.error+'</div>':'')+'</td></tr>';}).join('')+'</tbody></table><p style="margin-top:15px;color:#888;font-size:0.85em">Scores: 0-25 Low Risk | 26-50 Medium | 51-75 High | 76-100 Very High (lower is better)</p>';}).catch(e=>{btn.disabled=false;btn.textContent='🔍 Check All Proxy IPs';status.textContent='Error: '+e.message;});}function showTab(id){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));document.getElementById(id).classList.add('active');event.target.classList.add('active');}function loadDiagnostics(){fetch('/api/diagnostics').then(r=>r.json()).then(data=>{const s=data.summary;document.getElementById('totalProxies').textContent=s.total_proxies;document.getElementById('healthyCount').textContent=s.healthy_proxies;document.getElementById('degradedCount').textContent=s.degraded_proxies;document.getElementById('brokenCount').textContent=s.broken_proxies;document.getElementById('successRate').textContent=s.overall_success_rate.toFixed(1)+'%';const diagGrid=document.getElementById('diagGrid');if(!data.proxies.length){diagGrid.innerHTML='<div class="loading">No proxy data available yet.</div>';return;}diagGrid.innerHTML=data.proxies.map(p=>{const issueClass=p.issue_type==='none'?'healthy':p.issue_type;const badgeText=p.issue_type==='none'?'Healthy':p.issue_type.charAt(0).toUpperCase()+p.issue_type.slice(1);return'<div class="diag-card '+issueClass+'"><div class="diag-header"><span class="diag-name">'+(p.name||'Proxy #'+(p.index+1))+'</span><span class="diag-badge '+issueClass+'">'+badgeText+'</span></div><div style="color:#888;font-size:0.85em;margin-bottom:10px">'+p.ip_address+'</div><div class="diag-stats"><div class="diag-stat"><div class="diag-stat-value">'+formatNumber(p.total_requests)+'</div><div class="diag-stat-label">Requests</div></div><div class="diag-stat"><div class="diag-stat-value">'+p.success_rate.toFixed(1)+'%</div><div class="diag-stat-label">Success</div></div><div class="diag-stat"><div class="diag-stat-value">'+(p.device_count||0)+'</div><div class="diag-stat-label">Registered</div></div></div>'+(p.issue_details?'<div class="diag-issue '+(p.issue_type==='broken'?'broken':'')+'">'+p.issue_details+'</div>':'')+'</div>';}).join('');const maxReqs=Math.max(...data.proxies.map(p=>p.total_requests));document.getElementById('usageStats').innerHTML='<table class="device-table"><thead><tr><th>Proxy</th><th>Requests</th><th>Usage</th><th>Data In</th><th>Data Out</th></tr></thead><tbody>'+data.proxies.map(p=>{const pct=maxReqs>0?(p.total_requests/maxReqs*100):0;const color=pct>66?'#4caf50':pct>33?'#ff9800':'#f44336';return'<tr><td><strong>'+(p.name||'Proxy #'+(p.index+1))+'</strong><br><span style="color:#888;font-size:0.85em">'+p.ip_address+'</span></td><td>'+formatNumber(p.total_requests)+'</td><td style="width:200px"><div class="usage-bar"><div class="usage-bar-fill" style="width:'+pct+'%;background:'+color+'"></div><div class="usage-bar-label">'+pct.toFixed(0)+'%</div></div></td><td>'+formatBytes(p.bytes_in)+'</td><td>'+formatBytes(p.bytes_out)+'</td></tr>';}).join('')+'</tbody></table>';const devices=data.devices.slice(0,20);document.getElementById('deviceHealth').innerHTML=devices.length?'<table class="device-table"><thead><tr><th>Device</th><th>Proxy</th><th>Requests</th><th>Errors</th><th>Error Rate</th><th>Data</th><th>Status</th></tr></thead><tbody>'+devices.map(d=>{const name=d.name||d.username||d.ip;const errColor=d.error_rate>5?'#c62828':d.error_rate>1?'#e65100':'#666';return'<tr><td><strong>'+name+'</strong><br><span style="color:#888;font-size:0.85em">'+d.ip+'</span></td><td>'+(d.proxy_name||'-')+'</td><td>'+formatNumber(d.request_count)+'</td><td style="color:'+errColor+'">'+formatNumber(d.error_count)+'</td><td style="color:'+errColor+'">'+d.error_rate.toFixed(2)+'%</td><td>↓'+formatBytes(d.bytes_in)+' ↑'+formatBytes(d.bytes_out)+'</td><td><span style="color:'+(d.is_active?'#4caf50':'#999')+'">'+(d.is_active?'● Active':'○ Inactive')+'</span></td></tr>';}).join('')+'</tbody></table>':'<div class="loading">No device data available.</div>';});}loadDiagnostics();setInterval(loadDiagnostics,30000);</script></body></html>`
+		// Parse device ID from filename (format: deviceID_timestamp.jpg)
+		parts := strings.SplitN(strings.TrimSuffix(file.Name(), ".jpg"), "_", 2)
+		deviceID := ""
+		if len(parts) > 0 {
+			deviceID = parts[0]
+		}
 
-const analyticsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Analytics</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.chart-container{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px;overflow:visible}.chart-container h2{margin-bottom:20px}.chart{width:100%;position:relative}.chart-bars{display:flex;align-items:flex-end;height:200px;gap:2px;padding:0 10px;border-bottom:2px solid #e0e0e0}.chart-bar{flex:1;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);border-radius:4px 4px 0 0;min-width:2px;max-width:40px;position:relative;transition:height 0.3s}.chart-bar:hover{opacity:0.8}.chart-bar .tooltip{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:#333;color:white;padding:5px 10px;border-radius:4px;font-size:0.8em;white-space:nowrap;opacity:0;transition:opacity 0.2s;pointer-events:none;z-index:10}.chart-bar:hover .tooltip{opacity:1}.chart-labels{display:flex;padding:15px 10px 5px;justify-content:space-between}.chart-label{font-size:0.85em;color:#555;font-weight:500}.time-range{text-align:center;color:#888;font-size:0.9em;margin-top:5px}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📊 Traffic Analytics</h1><p>Historical traffic data and trends</p></div><div class="stats-grid"><div class="stat-card"><div class="stat-value" id="totalData">-</div><div class="stat-label">Total Data</div></div><div class="stat-card"><div class="stat-value" id="totalReqs">-</div><div class="stat-label">Total Requests</div></div><div class="stat-card"><div class="stat-value" id="peakDevices">-</div><div class="stat-label">Peak Devices</div></div><div class="stat-card"><div class="stat-value" id="errorRate">-</div><div class="stat-label">Error Rate</div></div></div><div class="chart-container"><h2>📈 Traffic Over Time</h2><button class="btn btn-secondary" onclick="loadAnalytics()" style="float:right;margin-top:-45px">🔄 Refresh</button><div class="chart"><div class="chart-bars" id="trafficBars"></div><div class="chart-labels" id="trafficLabels"></div><div class="time-range" id="trafficRange"></div></div></div><div class="chart-container"><h2>📊 Active Devices Over Time</h2><div class="chart"><div class="chart-bars" id="deviceBars"></div><div class="chart-labels" id="deviceLabels"></div><div class="time-range" id="deviceRange"></div></div></div></div><script>` + baseJS + `document.getElementById('nav-analytics').classList.add('active');function formatDateTime(d){const date=new Date(d);const day=date.getDate();const month=date.toLocaleString('default',{month:'short'});const time=date.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});return month+' '+day+', '+time;}function loadAnalytics(){fetch('/api/traffic-history').then(r=>r.json()).then(data=>{if(!data||!data.length){document.getElementById('trafficBars').innerHTML='<div class="loading">No data yet. Traffic data is collected every 5 minutes.</div>';return;}const totalBytes=data.reduce((a,d)=>a+(d.total_bytes_in||0)+(d.total_bytes_out||0),0);const totalReqs=data.length>0?data[data.length-1].total_requests:0;const peakDevices=Math.max(...data.map(d=>d.active_devices||0));const totalErrors=data.length>0?data[data.length-1].error_count:0;const errorRate=totalReqs>0?((totalErrors/totalReqs)*100).toFixed(2)+'%':'0%';document.getElementById('totalData').textContent=formatBytes(totalBytes);document.getElementById('totalReqs').textContent=formatNumber(totalReqs);document.getElementById('peakDevices').textContent=peakDevices;document.getElementById('errorRate').textContent=errorRate;const maxBytes=Math.max(...data.map(d=>(d.total_bytes_in||0)+(d.total_bytes_out||0)));const maxDevices=Math.max(...data.map(d=>d.active_devices||0));document.getElementById('trafficBars').innerHTML=data.map(d=>{const bytes=(d.total_bytes_in||0)+(d.total_bytes_out||0);const h=maxBytes>0?(bytes/maxBytes*180):5;return'<div class="chart-bar" style="height:'+h+'px"><span class="tooltip">'+formatDateTime(d.timestamp)+'<br>'+formatBytes(bytes)+'</span></div>';}).join('');const first=new Date(data[0].timestamp);const last=new Date(data[data.length-1].timestamp);document.getElementById('trafficLabels').innerHTML='<span class="chart-label">'+formatDateTime(first)+'</span><span class="chart-label">'+formatDateTime(last)+'</span>';document.getElementById('trafficRange').textContent='Showing '+data.length+' data points over '+(Math.round((last-first)/(1000*60*60)))+' hours';document.getElementById('deviceBars').innerHTML=data.map(d=>{const h=maxDevices>0?(d.active_devices/maxDevices*180):5;return'<div class="chart-bar" style="height:'+h+'px;background:linear-gradient(135deg,#4caf50 0%,#2e7d32 100%)"><span class="tooltip">'+formatDateTime(d.timestamp)+'<br>'+d.active_devices+' devices</span></div>';}).join('');document.getElementById('deviceLabels').innerHTML='<span class="chart-label">'+formatDateTime(first)+'</span><span class="chart-label">'+formatDateTime(last)+'</span>';document.getElementById('deviceRange').textContent='Peak: '+peakDevices+' devices';});}loadAnalytics();setInterval(loadAnalytics,60000);</script></body></html>`
+		s.screenshots = append(s.screenshots, Screenshot{
+			ID:          strings.TrimSuffix(file.Name(), ".jpg"),
+			DeviceID:    deviceID,
+			Filename:    file.Name(),
+			CaptureTime: info.ModTime(),
+			SizeBytes:   info.Size(),
+		})
+	}
 
-const activityPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Activity Log</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.activity-container{background:white;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);overflow:hidden}.activity-header{background:#333;color:white;padding:15px 20px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}.activity-header h2{margin:0;font-size:1.1em}.filters{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.filters select,.filters input{padding:8px 12px;border:none;border-radius:6px;font-size:0.9em;background:rgba(255,255,255,0.9)}.activity-content{height:600px;overflow-y:auto;font-family:'Monaco','Menlo','Ubuntu Mono',monospace;font-size:0.85em}.log-entry{padding:10px 20px;border-bottom:1px solid #f0f0f0;display:grid;grid-template-columns:140px 80px 120px 120px 1fr;gap:15px;align-items:center}.log-entry:nth-child(odd){background:#fafafa}.log-entry:hover{background:#f0f5ff}.log-time{color:#888;white-space:nowrap;font-size:0.9em}.log-level{font-weight:600;text-transform:uppercase;font-size:0.75em;padding:3px 8px;border-radius:4px;text-align:center}.log-level.info{background:#e3f2fd;color:#1976d2}.log-level.error{background:#ffebee;color:#c62828}.log-level.warn,.log-level.warning{background:#fff3e0;color:#e65100}.log-category{font-size:0.8em;color:#666;background:#f5f5f5;padding:3px 8px;border-radius:4px;text-align:center}.log-device{font-size:0.85em;color:#667eea;font-weight:500}.log-msg{color:#333;word-break:break-word}.auto-refresh{display:flex;align-items:center;gap:8px;font-size:0.9em;color:white}.auto-refresh input{width:18px;height:18px;cursor:pointer}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>📋 Activity Log</h1><p>Detailed device and system activity log with filtering</p></div><div class="stats-grid"><div class="stat-card" onclick="filterLevel('')" style="cursor:pointer"><div class="stat-value" id="totalLogs">-</div><div class="stat-label">Total Logs</div></div><div class="stat-card" onclick="filterLevel('info')" style="cursor:pointer"><div class="stat-value" id="infoLogs" style="color:#1976d2">-</div><div class="stat-label">Info</div></div><div class="stat-card" onclick="filterLevel('warn')" style="cursor:pointer"><div class="stat-value" id="warnLogs" style="color:#e65100">-</div><div class="stat-label">Warnings</div></div><div class="stat-card" onclick="filterLevel('error')" style="cursor:pointer"><div class="stat-value" id="errorLogs" style="color:#c62828">-</div><div class="stat-label">Errors</div></div></div><div class="activity-container"><div class="activity-header"><h2>📋 Live Activity Feed</h2><div class="filters"><select id="filterCategory" onchange="loadActivity()"><option value="">All Categories</option><option value="connection">Connection</option><option value="session">Session</option><option value="config">Config</option><option value="proxy">Proxy</option><option value="auth">Auth</option><option value="error">Error</option></select><select id="filterLevelSelect" onchange="loadActivity()"><option value="">All Levels</option><option value="info">Info</option><option value="warn">Warning</option><option value="error">Error</option></select><input type="text" id="filterDevice" placeholder="Filter by device/user..." style="width:180px" onkeyup="debounceLoad()"><button class="btn btn-secondary" onclick="loadActivity()" style="padding:8px 15px;font-size:0.85em">🔄 Refresh</button></div><label class="auto-refresh" style="margin-right:10px"><input type="checkbox" id="registeredOnly" onchange="loadActivity()"> Registered only</label><label class="auto-refresh"><input type="checkbox" id="autoRefresh" checked> Auto-refresh</label></div><div class="activity-content" id="activityContent"><div class="loading">Loading activity log...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-activity').classList.add('active');let debounceTimer;function debounceLoad(){clearTimeout(debounceTimer);debounceTimer=setTimeout(loadActivity,300);}function filterLevel(level){document.getElementById('filterLevelSelect').value=level;loadActivity();}function loadActivity(){const category=document.getElementById('filterCategory').value;const level=document.getElementById('filterLevelSelect').value;const device=document.getElementById('filterDevice').value.trim();const registeredOnly=document.getElementById('registeredOnly').checked;let url='/api/activity-log?limit=500';if(category)url+='&category='+encodeURIComponent(category);if(level)url+='&level='+encodeURIComponent(level);if(device)url+='&device='+encodeURIComponent(device);if(registeredOnly)url+='&registered_only=true';fetch(url).then(r=>r.json()).then(data=>{document.getElementById('totalLogs').textContent=data.total_count||0;document.getElementById('infoLogs').textContent=data.info_count||0;document.getElementById('warnLogs').textContent=data.warn_count||0;document.getElementById('errorLogs').textContent=data.error_count||0;const container=document.getElementById('activityContent');if(!data.logs||!data.logs.length){container.innerHTML='<div style="padding:40px;text-align:center;color:#666">No activity logs yet. Device activity will appear here.</div>';return;}container.innerHTML=data.logs.slice().reverse().map(log=>{const time=new Date(log.timestamp).toLocaleString();const deviceInfo=log.username||log.device_name||log.device_ip||'-';const category=log.category||'-';return'<div class="log-entry"><span class="log-time">'+time+'</span><span class="log-level '+log.level+'">'+log.level+'</span><span class="log-category">'+category+'</span><span class="log-device" title="'+(log.device_ip||'')+'">'+deviceInfo+'</span><span class="log-msg">'+escapeHtml(log.message)+'</span></div>';}).join('');if(document.getElementById('autoRefresh').checked){container.scrollTop=0;}});}function escapeHtml(t){if(!t)return'';const d=document.createElement('div');d.textContent=t;return d.innerHTML;}loadActivity();setInterval(()=>{if(document.getElementById('autoRefresh').checked)loadActivity();},5000);</script></body></html>`
+	// Sort by capture time (newest first)
+	sort.Slice(s.screenshots, func(i, j int) bool {
+		return s.screenshots[i].CaptureTime.After(s.screenshots[j].CaptureTime)
+	})
 
-const settingsPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Settings</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.settings-section{background:white;border-radius:12px;padding:25px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:20px}.settings-section h2{margin-bottom:20px;padding-bottom:10px;border-bottom:2px solid #f0f0f0}.form-group{margin-bottom:20px}.form-group label{display:block;font-weight:600;color:#333;margin-bottom:8px}.form-group input{width:100%;max-width:400px;padding:12px;border:2px solid #e0e0e0;border-radius:8px;font-size:1em}.form-group input:focus{outline:none;border-color:#667eea}.form-group small{display:block;color:#666;margin-top:5px;font-size:0.85em}.success-msg{background:#e8f5e9;color:#2e7d32;padding:12px;border-radius:8px;margin-bottom:20px;display:none}.success-msg.show{display:block}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>⚙️ Settings</h1><p>Configure your Lumier Dynamics system</p></div><div class="settings-section"><h2>🔐 Change Password</h2><div class="success-msg" id="pwSuccess">Password changed successfully!</div><form onsubmit="return changePassword(event)"><div class="form-group"><label>Current Password</label><input type="password" id="oldPassword" required></div><div class="form-group"><label>New Password</label><input type="password" id="newPassword" required><small>Choose a strong password with at least 8 characters</small></div><div class="form-group"><label>Confirm New Password</label><input type="password" id="confirmPassword" required></div><button type="submit" class="btn btn-primary">Change Password</button></form></div><div class="settings-section"><h2>📱 Device Groups</h2><p style="margin-bottom:15px;color:#666">Manage device groups for better organization</p><div id="groupsList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px"><input type="text" id="newGroupName" placeholder="New group name..." style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;flex:1;max-width:300px"><button class="btn btn-primary" onclick="addGroup()">Add Group</button></div></div><div class="settings-section"><h2>🌐 Proxy Management</h2><p style="margin-bottom:15px;color:#666">Manage and organize upstream SOCKS5 proxies</p><table id="proxyTable" style="width:100%;border-collapse:collapse;margin-bottom:20px"><thead><tr style="background:#f5f5f5"><th style="padding:12px;text-align:left;border-bottom:2px solid #e0e0e0">#</th><th style="padding:12px;text-align:left;border-bottom:2px solid #e0e0e0">Name</th><th style="padding:12px;text-align:left;border-bottom:2px solid #e0e0e0">IP Address</th><th style="padding:12px;text-align:center;border-bottom:2px solid #e0e0e0">Order</th><th style="padding:12px;text-align:center;border-bottom:2px solid #e0e0e0">Actions</th></tr></thead><tbody id="proxyTableBody"></tbody></table><div style="display:flex;gap:10px;flex-wrap:wrap"><input type="text" id="newProxyString" placeholder="host:port:username:password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;flex:1;min-width:300px;max-width:500px"><button class="btn btn-primary" onclick="addProxy()">Add Proxy</button></div><p style="margin-top:10px;color:#888;font-size:0.85em">Format: host:port:username:password (e.g., proxy.example.com:1080:user:pass)</p><div style="margin-top:20px;padding-top:20px;border-top:1px solid #eee"><h3 style="margin-bottom:15px;font-size:1.1em">📥 Bulk Import Proxies</h3><p style="margin-bottom:10px;color:#666;font-size:0.9em">Paste multiple proxies (one per line) in format: host:port:username:password</p><textarea id="bulkProxies" placeholder="brd.superproxy.io:22228:brd-customer-xxx-ip-1.2.3.4:password&#10;brd.superproxy.io:22228:brd-customer-xxx-ip-5.6.7.8:password&#10;..." style="width:100%;height:150px;padding:10px;border:2px solid #e0e0e0;border-radius:8px;font-family:monospace;font-size:0.9em"></textarea><div style="margin-top:10px;display:flex;gap:10px;align-items:center"><button class="btn btn-primary" onclick="bulkImportProxies()">Import Proxies</button><span id="bulkImportResult" style="color:#666;font-size:0.9em"></span></div></div></div><div class="settings-section"><h2>👤 Supervisor Management</h2><p style="margin-bottom:15px;color:#666">Manage supervisor accounts for the Android app (used for Change Proxy authentication)</p><div style="margin-bottom:20px"><h3 style="font-size:1em;margin-bottom:10px">🔐 Admin Password (for Register Device)</h3><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><input type="password" id="adminPassword" placeholder="Admin password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:250px"><button class="btn btn-primary" onclick="updateAdminPassword()">Update Admin Password</button><button class="btn btn-secondary" onclick="togglePasswordVisibility('adminPassword')" style="padding:10px">👁️</button></div></div><div style="margin-bottom:15px"><h3 style="font-size:1em;margin-bottom:10px">👥 Supervisors (for Change Proxy)</h3><div id="supervisorsList" style="margin-bottom:15px"></div><div style="display:flex;gap:10px;flex-wrap:wrap"><input type="text" id="newSupervisorName" placeholder="Name" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:150px"><input type="password" id="newSupervisorPassword" placeholder="Password" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:200px"><button class="btn btn-primary" onclick="addSupervisor()">Add Supervisor</button></div></div></div><div class="settings-section"><h2>⏱️ Session Settings</h2><p style="margin-bottom:15px;color:#666">Configure session timeout for device connections. Devices must re-confirm their connection after the timeout expires.</p><div style="display:flex;gap:15px;align-items:center;flex-wrap:wrap;margin-bottom:15px"><div style="display:flex;align-items:center;gap:10px"><label style="font-weight:600;color:#333">Session Timeout:</label><input type="number" id="sessionTimeout" min="1" max="48" value="2" style="padding:10px;border:2px solid #e0e0e0;border-radius:8px;width:80px;text-align:center;font-weight:600"><span style="color:#666">hours</span></div><button class="btn btn-primary" onclick="saveSessionSettings()">Save Settings</button></div><p style="color:#888;font-size:0.85em">Range: 1-48 hours. Default: 2 hours. Devices will need to confirm their proxy connection again after this time.</p></div><div class="settings-section"><h2>ℹ️ System Information</h2><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px"><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Version:</strong> 3.0.0</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Server IP:</strong> <span id="sysServerIP">...</span></div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Proxy Port:</strong> 8888</div><div style="background:#f8f9fa;padding:15px;border-radius:8px"><strong>Dashboard Port:</strong> 8080</div></div></div></div><script>` + baseJS + `document.getElementById('nav-settings').classList.add('active');fetch('/api/server-ip').then(r=>r.text()).then(ip=>document.getElementById('sysServerIP').textContent=ip);function loadGroups(){fetch('/api/groups').then(r=>r.json()).then(groups=>{document.getElementById('groupsList').innerHTML=groups.map(g=>{const isDefault=g==='Default';return'<span style="display:inline-flex;align-items:center;gap:8px;background:#e3f2fd;color:#1976d2;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">'+g+(isDefault?'':' <button onclick="deleteGroup(\''+g+'\')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center" title="Delete group">&times;</button>')+'</span>';}).join('');});}loadGroups();function deleteGroup(name){if(!confirm('Delete group "'+name+'"? Devices in this group will be moved to Default.')){return;}fetch('/api/delete-group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_name:name})}).then(r=>{if(r.ok)return r.json();throw new Error('Failed to delete');}).then(d=>{if(d.ok){showToast('Group deleted','success');loadGroups();}}).catch(()=>showToast('Failed to delete group','error'));}function addGroup(){const name=document.getElementById('newGroupName').value.trim();if(!name){showToast('Please enter a group name','error');return;}fetch('/api/add-group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_name:name})}).then(r=>r.json()).then(d=>{if(d.ok){showToast(d.added?'Group added':'Group already exists',d.added?'success':'');document.getElementById('newGroupName').value='';loadGroups();}});}function changePassword(e){e.preventDefault();const oldPw=document.getElementById('oldPassword').value;const newPw=document.getElementById('newPassword').value;const confirmPw=document.getElementById('confirmPassword').value;if(newPw!==confirmPw){showToast('Passwords do not match','error');return false;}if(newPw.length<6){showToast('Password must be at least 6 characters','error');return false;}fetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_password:oldPw,new_password:newPw})}).then(r=>{if(r.ok){document.getElementById('pwSuccess').classList.add('show');document.getElementById('oldPassword').value='';document.getElementById('newPassword').value='';document.getElementById('confirmPassword').value='';setTimeout(()=>document.getElementById('pwSuccess').classList.remove('show'),3000);}else{showToast('Current password is incorrect','error');}});return false;}let allProxies=[];function loadProxies(){fetch('/api/proxies').then(r=>r.json()).then(proxies=>{allProxies=proxies;const tbody=document.getElementById('proxyTableBody');if(!proxies.length){tbody.innerHTML='<tr><td colspan="5" style="padding:20px;text-align:center;color:#666">No proxies configured. Add your first proxy below.</td></tr>';return;}tbody.innerHTML=proxies.map((p,i)=>{let ip=p.user&&p.user.includes('ip-')?p.user.split('ip-')[1]:p.host;const name=p.custom_name||'SG'+String(i+1).padStart(2,'0');return'<tr style="border-bottom:1px solid #eee"><td style="padding:12px;font-weight:600;color:#667eea">'+(i+1)+'</td><td style="padding:12px"><input type="text" value="'+escapeAttr(name)+'" style="padding:8px 12px;border:2px solid #e0e0e0;border-radius:6px;font-weight:600;width:100px" onchange="updateProxyName('+i+',this.value)" placeholder="SG'+String(i+1).padStart(2,'0')+'"></td><td style="padding:12px;font-family:monospace;color:#333">'+ip+'</td><td style="padding:12px;text-align:center"><button onclick="moveProxy('+i+',-1)" style="background:#e3f2fd;border:none;border-radius:4px;padding:6px 10px;cursor:pointer;margin-right:5px" '+(i===0?'disabled':'')+' title="Move Up">↑</button><button onclick="moveProxy('+i+',1)" style="background:#e3f2fd;border:none;border-radius:4px;padding:6px 10px;cursor:pointer" '+(i===proxies.length-1?'disabled':'')+' title="Move Down">↓</button></td><td style="padding:12px;text-align:center"><button onclick="deleteProxy('+i+')" style="background:#ef5350;color:white;border:none;border-radius:6px;padding:6px 12px;cursor:pointer" title="Delete">🗑️</button></td></tr>';}).join('');});}function escapeAttr(s){return s.replace(/"/g,'&quot;');}function updateProxyName(idx,name){fetch('/api/update-proxy-name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx,name:name})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Proxy renamed to '+name,'success');}else{showToast('Failed to rename','error');}});}function moveProxy(idx,dir){const newOrder=allProxies.map((_,i)=>i);const targetIdx=idx+dir;if(targetIdx<0||targetIdx>=allProxies.length)return;[newOrder[idx],newOrder[targetIdx]]=[newOrder[targetIdx],newOrder[idx]];fetch('/api/reorder-proxies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order:newOrder})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Proxies reordered','success');loadProxies();}else{showToast('Failed to reorder','error');}});}loadProxies();function addProxy(){const proxy=document.getElementById('newProxyString').value.trim();if(!proxy){showToast('Please enter a proxy string','error');return;}fetch('/api/add-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_string:proxy})}).then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error(t);});return r.json();}).then(d=>{if(d.ok){showToast(d.added?'Proxy added':'Proxy already exists',d.added?'success':'');document.getElementById('newProxyString').value='';loadProxies();}}).catch(e=>showToast(e.message||'Failed to add proxy','error'));}function deleteProxy(idx){if(!confirm('Delete this proxy? Make sure no devices are using it.')){return;}fetch('/api/delete-proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy_index:idx})}).then(r=>{if(!r.ok)return r.text().then(t=>{throw new Error(t);});return r.json();}).then(d=>{if(d.ok){showToast('Proxy deleted','success');loadProxies();}}).catch(e=>showToast(e.message||'Failed to delete proxy','error'));}function bulkImportProxies(){const proxies=document.getElementById('bulkProxies').value.trim();if(!proxies){showToast('Please paste proxy strings','error');return;}document.getElementById('bulkImportResult').textContent='Importing...';fetch('/api/bulk-import-proxies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxies:proxies})}).then(r=>r.json()).then(d=>{if(d.success){const msg='Added '+d.added+' proxies'+(d.skipped>0?', skipped '+d.skipped:'');document.getElementById('bulkImportResult').innerHTML='<span style="color:#4caf50">✓ '+msg+'</span>';showToast(msg,'success');document.getElementById('bulkProxies').value='';loadProxies();}else{document.getElementById('bulkImportResult').innerHTML='<span style="color:#c62828">✗ Import failed</span>';showToast('Import failed','error');}}).catch(e=>{document.getElementById('bulkImportResult').innerHTML='<span style="color:#c62828">✗ Error</span>';showToast('Import error','error');});}function loadSupervisors(){fetch('/api/supervisors').then(r=>r.json()).then(data=>{document.getElementById('adminPassword').value=data.admin_password||'';const list=document.getElementById('supervisorsList');if(!data.supervisors||!data.supervisors.length){list.innerHTML='<p style="color:#666">No supervisors configured.</p>';return;}list.innerHTML=data.supervisors.map(s=>'<div style="display:inline-flex;align-items:center;gap:8px;background:#e8f5e9;color:#2e7d32;padding:8px 15px;border-radius:20px;margin:5px;font-weight:500">'+s.name+' <button onclick="editSupervisor(\''+s.name+'\',\''+s.password+'\')" style="background:#1976d2;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:12px" title="Edit">✎</button> <button onclick="deleteSupervisor(\''+s.name+'\')" style="background:#ef5350;color:white;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:14px;line-height:1" title="Delete">&times;</button></div>').join('');});}loadSupervisors();function togglePasswordVisibility(id){const input=document.getElementById(id);input.type=input.type==='password'?'text':'password';}function updateAdminPassword(){const pw=document.getElementById('adminPassword').value.trim();if(!pw){showToast('Please enter a password','error');return;}fetch('/api/admin-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Admin password updated','success');}else{showToast('Failed to update','error');}});}function addSupervisor(){const name=document.getElementById('newSupervisorName').value.trim();const pw=document.getElementById('newSupervisorPassword').value.trim();if(!name||!pw){showToast('Name and password required','error');return;}fetch('/api/add-supervisor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,password:pw})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Supervisor added','success');document.getElementById('newSupervisorName').value='';document.getElementById('newSupervisorPassword').value='';loadSupervisors();}else{showToast(d.message||'Failed to add','error');}});}function editSupervisor(name,pw){const newName=prompt('Supervisor name:',name);if(!newName)return;const newPw=prompt('Password:',pw);if(!newPw)return;fetch('/api/update-supervisor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_name:name,name:newName,password:newPw})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Supervisor updated','success');loadSupervisors();}else{showToast(d.message||'Failed to update','error');}});}function deleteSupervisor(name){if(!confirm('Delete supervisor "'+name+'"?'))return;fetch('/api/delete-supervisor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Supervisor deleted','success');loadSupervisors();}else{showToast(d.message||'Failed to delete','error');}});}function loadSessionSettings(){fetch('/api/session-settings').then(r=>r.json()).then(d=>{document.getElementById('sessionTimeout').value=d.session_timeout_hours||2;});}loadSessionSettings();function saveSessionSettings(){const timeout=parseInt(document.getElementById('sessionTimeout').value)||2;fetch('/api/session-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_timeout_hours:timeout})}).then(r=>r.json()).then(d=>{if(d.ok){showToast('Session settings saved','success');loadSessionSettings();}else{showToast('Failed to save settings','error');}});}</script></body></html>`
+	log.Printf("Loaded %d existing screenshots", len(s.screenshots))
+}
 
-const monitoringPageHTML = `<!DOCTYPE html><html><head><title>Lumier Dynamics - Network Monitor</title><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>` + baseStyles + `.monitor-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:15px;margin-bottom:25px}.monitor-stat{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);text-align:center}.monitor-stat .value{font-size:2em;font-weight:bold}.monitor-stat .label{color:#666;font-size:0.85em;text-transform:uppercase;margin-top:5px}.devices-section{background:white;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.05);overflow:hidden;margin-bottom:20px}.devices-header{background:#667eea;color:white;padding:15px 20px;display:flex;justify-content:space-between;align-items:center}.devices-header h2{margin:0;font-size:1.1em}.device-card{padding:15px 20px;border-bottom:1px solid #f0f0f0;display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:15px;align-items:center;cursor:pointer;transition:background 0.2s}.device-card:hover{background:#f8f9ff}.device-card.active{border-left:4px solid #4caf50}.device-card.inactive{border-left:4px solid #ccc}.device-info{display:flex;flex-direction:column;gap:3px}.device-name{font-weight:600;color:#333}.device-ip{font-size:0.85em;color:#888;font-family:monospace}.device-status{display:flex;flex-direction:column;gap:3px}.status-indicator{font-size:0.85em;display:flex;align-items:center;gap:6px}.status-dot{width:8px;height:8px;border-radius:50%}.device-data{text-align:right}.data-value{font-weight:600;color:#667eea}.data-label{font-size:0.75em;color:#888}.device-expiry{text-align:right}.expiry-time{font-weight:600;font-size:1.1em}.expiry-label{font-size:0.75em;color:#888}.connections-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center}.connections-modal.show{display:flex}.modal-content{background:white;border-radius:12px;width:90%;max-width:700px;max-height:80vh;overflow:hidden}.modal-header{background:#333;color:white;padding:15px 20px;display:flex;justify-content:space-between;align-items:center}.modal-header h3{margin:0}.modal-close{background:none;border:none;color:white;font-size:1.5em;cursor:pointer;padding:0 10px}.modal-body{padding:20px;max-height:60vh;overflow-y:auto}.conn-table{width:100%;border-collapse:collapse}.conn-table th,.conn-table td{padding:10px;text-align:left;border-bottom:1px solid #eee}.conn-table th{background:#f5f5f5;font-weight:600;color:#555;font-size:0.85em}</style></head><body>` + navHTML + `<div class="container"><div class="page-header"><h1>🖥️ Network Monitor</h1><p>Real-time network activity and device overview</p></div><div class="monitor-stats"><div class="monitor-stat"><div class="value" style="color:#667eea" id="totalDevices">-</div><div class="label">Online Devices</div></div><div class="monitor-stat"><div class="value" style="color:#4caf50" id="activeNow">-</div><div class="label">Active Now</div></div><div class="monitor-stat"><div class="value" style="color:#2196F3" id="totalDataIn">-</div><div class="label">Data In</div></div><div class="monitor-stat"><div class="value" style="color:#9c27b0" id="totalDataOut">-</div><div class="label">Data Out</div></div><div class="monitor-stat"><div class="value" style="color:#ff9800" id="uptimeValue">-</div><div class="label">Uptime</div></div></div><div class="devices-section"><div class="devices-header"><h2>📱 Device Activity (Last 30 min)</h2><button class="btn btn-secondary" onclick="loadOverview()" style="padding:6px 12px;font-size:0.85em">🔄 Refresh</button></div><div id="devicesList"><div style="padding:40px;text-align:center;color:#666">Loading devices...</div></div></div></div><div class="connections-modal" id="connModal" onclick="if(event.target===this)closeModal()"><div class="modal-content"><div class="modal-header"><h3 id="modalTitle">Device Connections</h3><button class="modal-close" onclick="closeModal()">&times;</button></div><div class="modal-body"><div id="connList">Loading...</div></div></div></div><script>` + baseJS + `document.getElementById('nav-monitoring').classList.add('active');function loadOverview(){fetch('/api/network-overview').then(r=>r.json()).then(data=>{document.getElementById('totalDevices').textContent=data.total_devices;document.getElementById('activeNow').textContent=data.active_count;document.getElementById('totalDataIn').textContent=formatBytes(data.total_bytes_in);document.getElementById('totalDataOut').textContent=formatBytes(data.total_bytes_out);const list=document.getElementById('devicesList');if(!data.devices||!data.devices.length){list.innerHTML='<div style="padding:40px;text-align:center;color:#666">No active devices in the last 30 minutes.</div>';return;}list.innerHTML=data.devices.map(d=>{const statusClass=d.is_active?'active':'inactive';const statusColor=d.is_active?'#4caf50':'#999';const statusText=d.is_active?'Active':'Idle';const expiryColor=d.session_expiry==='Expired'?'#c62828':d.session_expiry.includes('m')&&!d.session_expiry.includes('h')?'#ff9800':'#333';const hosts=d.recent_hosts&&d.recent_hosts.length?d.recent_hosts.slice(0,3).join(', '):'No recent activity';return'<div class="device-card '+statusClass+'" onclick="showConnections(\''+d.ip+'\',\''+d.name+'\')"><div class="device-info"><span class="device-name">'+d.name+'</span><span class="device-ip">'+d.ip+'</span><span style="font-size:0.8em;color:#888;margin-top:3px">'+hosts+'</span></div><div class="device-status"><span class="status-indicator"><span class="status-dot" style="background:'+statusColor+'"></span>'+statusText+'</span><span style="font-size:0.85em;color:#888">'+(d.is_active?'Active now':Math.round(d.last_active_min)+' min ago')+'</span></div><div class="device-data"><div class="data-value">'+formatBytes(d.bytes_in+d.bytes_out)+'</div><div class="data-label">Total Data</div><div style="font-size:0.85em;color:#888;margin-top:5px">'+formatNumber(d.request_count)+' reqs</div></div><div class="device-expiry"><div class="expiry-time" style="color:'+expiryColor+'">'+d.session_expiry+'</div><div class="expiry-label">Session Expiry</div></div></div>';}).join('');});fetch('/api/system-stats').then(r=>r.json()).then(d=>{document.getElementById('uptimeValue').textContent=d.uptime_formatted;});}function showConnections(ip,name){document.getElementById('modalTitle').textContent=name+' - Recent Connections';document.getElementById('connList').innerHTML='<div style="text-align:center;padding:20px">Loading...</div>';document.getElementById('connModal').classList.add('show');fetch('/api/device-connections?device_ip='+encodeURIComponent(ip)).then(r=>r.json()).then(conns=>{if(!conns||!conns.length){document.getElementById('connList').innerHTML='<div style="text-align:center;color:#666;padding:20px">No recent connections recorded.</div>';return;}document.getElementById('connList').innerHTML='<table class="conn-table"><thead><tr><th>Time</th><th>Host</th><th>Protocol</th><th>Data</th></tr></thead><tbody>'+conns.map(c=>{const time=new Date(c.timestamp).toLocaleTimeString();return'<tr><td>'+time+'</td><td style="font-family:monospace">'+c.host+'</td><td>'+c.protocol+'</td><td>↓'+formatBytes(c.bytes_in)+' ↑'+formatBytes(c.bytes_out)+'</td></tr>';}).join('')+'</tbody></table>';});}function closeModal(){document.getElementById('connModal').classList.remove('show');}loadOverview();setInterval(loadOverview,5000);</script></body></html>`
+func handleScreenshotsPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write(screenshotsPageHTML)
+}
+
+// handleActiveDevicesAPI returns only devices with active browser sessions (Duration == 0)
+func handleActiveDevicesAPI(w http.ResponseWriter, r *http.Request) {
+	type ActiveDevice struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		ProxyName string `json:"proxy_name"`
+		Username  string `json:"username"`
+	}
+
+	var activeDevices []ActiveDevice
+	seen := make(map[string]bool)
+
+	server.persistMu.RLock()
+	for _, s := range server.persistentData.BrowserSessions {
+		// Duration == 0 means session is still active
+		if s.Duration == 0 && !seen[s.ProfileID] {
+			seen[s.ProfileID] = true
+			activeDevices = append(activeDevices, ActiveDevice{
+				ID:        s.ProfileID,
+				Name:      s.DeviceName,
+				ProxyName: s.ProxyName,
+				Username:  s.Username,
+			})
+		}
+	}
+	server.persistMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"devices": activeDevices,
+	})
+}
+
+// handleScreenshotRequest - Dashboard requests a screenshot from a specific device
+func handleScreenshotRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	deviceID := r.URL.Query().Get("device_id")
+	if deviceID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Missing device_id parameter",
+		})
+		return
+	}
+
+	server.screenshotMu.Lock()
+	server.screenshotRequests[deviceID] = &ScreenshotRequest{
+		DeviceID:    deviceID,
+		RequestedAt: time.Now(),
+		RequestedBy: "dashboard",
+	}
+	server.screenshotMu.Unlock()
+
+	server.addLog("info", fmt.Sprintf("Screenshot requested for device: %s", deviceID))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"device_id": deviceID,
+	})
+}
+
+// handleClientScreenshotPending - Client checks if there's a pending screenshot request
+func handleClientScreenshotPending(w http.ResponseWriter, r *http.Request) {
+	deviceID := r.URL.Query().Get("device_id")
+	if deviceID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"pending": false})
+		return
+	}
+
+	server.screenshotMu.Lock()
+	req, exists := server.screenshotRequests[deviceID]
+	if exists {
+		// Check if request is still valid (within 60 seconds)
+		if time.Since(req.RequestedAt) > 60*time.Second {
+			delete(server.screenshotRequests, deviceID)
+			exists = false
+		} else {
+			// Found a pending request - remove it so client only captures once
+			delete(server.screenshotRequests, deviceID)
+			server.addLog("info", fmt.Sprintf("Screenshot pending found for device: %s", deviceID))
+		}
+	}
+	server.screenshotMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"pending": exists,
+	})
+}
+
+// handleClientScreenshotUpload - Client uploads a screenshot
+func handleClientScreenshotUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse multipart form (max 10MB)
+	err := r.ParseMultipartForm(10 << 20)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to parse form: " + err.Error(),
+		})
+		return
+	}
+
+	deviceID := r.FormValue("device_id")
+	deviceName := r.FormValue("device_name")
+	username := r.FormValue("username")
+	widthStr := r.FormValue("width")
+	heightStr := r.FormValue("height")
+
+	if deviceID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Missing device_id",
+		})
+		return
+	}
+
+	file, _, err := r.FormFile("screenshot")
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Missing screenshot file: " + err.Error(),
+		})
+		return
+	}
+	defer file.Close()
+
+	// Generate filename
+	now := time.Now()
+	id := fmt.Sprintf("%s_%s", deviceID, now.Format("20060102_150405"))
+	filename := id + ".jpg"
+	filePath := filepath.Join(server.screenshotDir, filename)
+
+	// Save file
+	outFile, err := os.Create(filePath)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to create file: " + err.Error(),
+		})
+		return
+	}
+	defer outFile.Close()
+
+	written, err := io.Copy(outFile, file)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Failed to save file: " + err.Error(),
+		})
+		return
+	}
+
+	width, _ := strconv.Atoi(widthStr)
+	height, _ := strconv.Atoi(heightStr)
+
+	// Create screenshot record
+	ss := Screenshot{
+		ID:          id,
+		DeviceID:    deviceID,
+		DeviceName:  deviceName,
+		Username:    username,
+		Filename:    filename,
+		CaptureTime: now,
+		Width:       width,
+		Height:      height,
+		SizeBytes:   written,
+	}
+
+	// Add to list and remove pending request
+	server.screenshotMu.Lock()
+	delete(server.screenshotRequests, deviceID)
+	server.screenshots = append([]Screenshot{ss}, server.screenshots...)
+
+	// Prune old screenshots for this device
+	deviceCount := 0
+	filtered := []Screenshot{}
+	for _, s := range server.screenshots {
+		if s.DeviceID == deviceID {
+			deviceCount++
+			if deviceCount > maxScreenshotsPerDevice {
+				os.Remove(filepath.Join(server.screenshotDir, s.Filename))
+				continue
+			}
+		}
+		filtered = append(filtered, s)
+	}
+	server.screenshots = filtered
+
+	// Prune if total exceeds limit
+	for len(server.screenshots) > maxTotalScreenshots {
+		oldest := server.screenshots[len(server.screenshots)-1]
+		os.Remove(filepath.Join(server.screenshotDir, oldest.Filename))
+		server.screenshots = server.screenshots[:len(server.screenshots)-1]
+	}
+	server.screenshotMu.Unlock()
+
+	server.addLog("info", fmt.Sprintf("Screenshot uploaded from %s (%s): %dx%d", deviceName, deviceID, width, height))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
+func handleScreenshotList(w http.ResponseWriter, r *http.Request) {
+	deviceID := r.URL.Query().Get("device_id")
+
+	server.screenshotMu.RLock()
+	var filtered []Screenshot
+	for _, s := range server.screenshots {
+		if deviceID == "" || s.DeviceID == deviceID {
+			filtered = append(filtered, s)
+		}
+	}
+	server.screenshotMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"screenshots": filtered,
+		"count":       len(filtered),
+	})
+}
+
+func handleScreenshotImage(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "Missing id parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Find the screenshot
+	server.screenshotMu.RLock()
+	var found *Screenshot
+	for i := range server.screenshots {
+		if server.screenshots[i].ID == id {
+			found = &server.screenshots[i]
+			break
+		}
+	}
+	server.screenshotMu.RUnlock()
+
+	if found == nil {
+		http.Error(w, "Screenshot not found", http.StatusNotFound)
+		return
+	}
+
+	filePath := filepath.Join(server.screenshotDir, found.Filename)
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "max-age=3600")
+	http.ServeFile(w, r, filePath)
+}
+
+func handleScreenshotDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "Missing id parameter", http.StatusBadRequest)
+		return
+	}
+
+	server.screenshotMu.Lock()
+	var found bool
+	var filename string
+	for i := range server.screenshots {
+		if server.screenshots[i].ID == id {
+			filename = server.screenshots[i].Filename
+			server.screenshots = append(server.screenshots[:i], server.screenshots[i+1:]...)
+			found = true
+			break
+		}
+	}
+	server.screenshotMu.Unlock()
+
+	if !found {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   "Screenshot not found",
+		})
+		return
+	}
+
+	// Delete file
+	os.Remove(filepath.Join(server.screenshotDir, filename))
+
+	server.addLog("info", fmt.Sprintf("Screenshot deleted: %s", filename))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+	})
+}
+
